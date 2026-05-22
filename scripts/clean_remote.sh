@@ -33,6 +33,7 @@ done
 require_commands ssh awk ps rm
 manifest_file=$(normalize_path "$manifest_file")
 load_manifest "$manifest_file"
+REMOTE_DIRNAME=${REMOTE_DIRNAME:-$DEFAULT_REMOTE_DIRNAME}
 
 failures=0
 
@@ -44,19 +45,23 @@ remote_dirname=$1
 port=$2
 app_dir="$HOME/$remote_dirname"
 server_bin="$app_dir/bin/load_server"
+bundle_prefix="${remote_dirname%%_*}"
+if [[ -z "$bundle_prefix" ]]; then
+    bundle_prefix="$remote_dirname"
+fi
 had_state=0
 
 find_bundle_pids() {
-    ps -u "$USER" -o pid= -o args= | awk -v server_bin="$server_bin" '
-        index($0, server_bin) {
+    ps -u "$USER" -o pid= -o args= | awk -v home="$HOME" -v bundle_prefix="$bundle_prefix" '
+        index($0, "/bin/load_server") && index($0, home "/" bundle_prefix) {
             print $1
         }
     '
 }
 
 find_port_pids() {
-    ps -u "$USER" -o pid= -o args= | awk -v server_bin="$server_bin" -v port="$port" '
-        index($0, server_bin) && index($0, "--port " port) {
+    ps -u "$USER" -o pid= -o args= | awk -v home="$HOME" -v bundle_prefix="$bundle_prefix" -v port="$port" '
+        index($0, "/bin/load_server") && index($0, home "/" bundle_prefix) && index($0, "--port " port) {
             print $1
         }
     '
@@ -78,10 +83,30 @@ if [[ -d "$app_dir" ]]; then
     had_state=1
 fi
 
+if compgen -G "$HOME/${bundle_prefix}*" >/dev/null; then
+    had_state=1
+fi
+
 kill_matching_pids < <(find_port_pids || true)
 kill_matching_pids < <(find_bundle_pids || true)
 
-rm -rf "$app_dir"
+for _ in 1 2 3; do
+    remaining_pid=$(find_bundle_pids | head -n 1 || true)
+    [[ -z "$remaining_pid" ]] && break
+    kill "$remaining_pid" 2>/dev/null || true
+    if kill -0 "$remaining_pid" 2>/dev/null; then
+        kill -9 "$remaining_pid" 2>/dev/null || true
+    fi
+done
+
+for candidate_dir in "$HOME/${bundle_prefix}"*; do
+    [[ -e "$candidate_dir" ]] || continue
+    rm -rf "$candidate_dir" 2>/dev/null || true
+    if [[ -d "$candidate_dir" ]]; then
+        find "$candidate_dir" -depth -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+        rm -rf "$candidate_dir" 2>/dev/null || true
+    fi
+done
 
 remaining_pid=$(find_bundle_pids | head -n 1 || true)
 if [[ -n "$remaining_pid" ]]; then
@@ -89,7 +114,7 @@ if [[ -n "$remaining_pid" ]]; then
     exit 1
 fi
 
-if [[ -d "$app_dir" ]]; then
+if compgen -G "$HOME/${bundle_prefix}*" >/dev/null; then
     echo "directory-remains"
     exit 2
 fi

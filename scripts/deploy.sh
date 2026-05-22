@@ -111,8 +111,6 @@ cp "$REPO_ROOT/bin/load_server" "$bundle_dir/bin/load_server"
 staging_host=$(head -n 1 "$HOSTS_FILE")
 launch_status_file="$RUN_DIR/launch_status.tsv"
 
-scp -r "$bundle_dir" "$staging_host:~/" >/dev/null
-
 write_manifest "$manifest_file" \
     HOSTS_FILE "$HOSTS_FILE" \
     HOST_COUNT "$HOST_COUNT" \
@@ -123,6 +121,42 @@ write_manifest "$manifest_file" \
     STAGING_HOST "$staging_host" \
     REMOTE_DIRNAME "$remote_dirname" \
     LAUNCH_STATUS_FILE "$launch_status_file"
+
+upload_bundle_once() {
+    local target_dirname=$1
+
+    ssh "${SSH_OPTIONS[@]}" "$staging_host" bash -s -- "$target_dirname" <<'REMOTE'
+set -euo pipefail
+
+target_dirname=$1
+target_dir="$HOME/$target_dirname"
+
+mkdir -p "$target_dir/bin"
+REMOTE
+
+    scp "$bundle_dir/bin/load_server" "$staging_host:~/$target_dirname/bin/load_server" >/dev/null
+}
+
+if ! upload_bundle_once "$remote_dirname"; then
+    fallback_remote_dirname="${remote_dirname}_${EPOCHSECONDS}"
+    printf 'Initial bundle upload failed for %s. Retrying with %s\n' "$remote_dirname" "$fallback_remote_dirname" >&2
+    remote_dirname=$fallback_remote_dirname
+    if ! upload_bundle_once "$remote_dirname"; then
+        printf 'Bundle upload failed on staging host %s. Check remote home permissions/quota, then retry.\n' "$staging_host" >&2
+        exit 1
+    fi
+
+    write_manifest "$manifest_file" \
+        HOSTS_FILE "$HOSTS_FILE" \
+        HOST_COUNT "$HOST_COUNT" \
+        PORT "$PORT" \
+        PORT_HEX "$PORT_HEX" \
+        PORT_RANGE_START "$PORT_RANGE_START" \
+        PORT_RANGE_END "$PORT_RANGE_END" \
+        STAGING_HOST "$staging_host" \
+        REMOTE_DIRNAME "$remote_dirname" \
+        LAUNCH_STATUS_FILE "$launch_status_file"
+fi
 
 launch_remote() {
     local host=$1

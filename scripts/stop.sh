@@ -32,6 +32,7 @@ done
 require_commands ssh awk ps
 manifest_file=$(normalize_path "$manifest_file")
 load_manifest "$manifest_file"
+REMOTE_DIRNAME=${REMOTE_DIRNAME:-$DEFAULT_REMOTE_DIRNAME}
 
 failures=0
 

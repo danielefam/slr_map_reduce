@@ -12,7 +12,7 @@ REMOTE_DIRNAME ?= slr_map_reduce_bundle
 
 TARGETS := $(BIN_DIR)/load_server $(BIN_DIR)/load_client
 
-.PHONY: all clean directories smoke select-hosts select-port deploy status stop clean-remote redeploy run-client experiment
+.PHONY: all clean directories smoke select-hosts select-port deploy status status-report stop clean-remote redeploy run-client experiment
 
 all: directories $(TARGETS)
 
@@ -39,6 +39,9 @@ deploy: all
 
 status:
 	bash scripts/status.sh --manifest $(MANIFEST)
+
+status-report:
+	bash scripts/status.sh --manifest $(MANIFEST) --report-only
 
 stop:
 	bash scripts/stop.sh --manifest $(MANIFEST)

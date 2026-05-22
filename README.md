@@ -77,6 +77,14 @@ When `--hosts` is provided, deployment now continues with the reachable subset o
 make status
 ```
 
+`make status` is strict and exits non-zero if any host is not healthy (for example all `stopped` after cleanup).
+
+For a reporting-only check that always exits zero:
+
+```bash
+make status-report
+```
+
 ## Run the Client
 
 ```bash

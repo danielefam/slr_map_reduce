@@ -7,6 +7,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/common.sh"
 
 manifest_file=$DEFAULT_MANIFEST_FILE
+report_only=0
 
 while (( $# > 0 )); do
     case "$1" in
@@ -14,11 +15,18 @@ while (( $# > 0 )); do
             manifest_file=$2
             shift 2
             ;;
+        --report-only|--no-fail)
+            report_only=1
+            shift
+            ;;
         --help)
             cat <<'EOF'
-Usage: status.sh [--manifest FILE]
+Usage: status.sh [--manifest FILE] [--report-only]
 
 Check whether the distributed load servers are still running and listening.
+
+By default, exit non-zero when any host is not healthy.
+Use --report-only (alias: --no-fail) to always exit zero after printing status.
 EOF
             exit 0
             ;;
@@ -32,6 +40,7 @@ done
 require_commands ssh awk ps
 manifest_file=$(normalize_path "$manifest_file")
 load_manifest "$manifest_file"
+REMOTE_DIRNAME=${REMOTE_DIRNAME:-$DEFAULT_REMOTE_DIRNAME}
 
 failures=0
 
@@ -96,5 +105,9 @@ REMOTE
     fi
     unset rc
 done < "$HOSTS_FILE"
+
+if (( report_only )); then
+    exit 0
+fi
 
 (( failures == 0 ))
