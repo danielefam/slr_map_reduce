@@ -49,7 +49,7 @@ load_manifest "$manifest_file"
 printf '=== %s ===\n' "$(date -Is)" | tee -a "$output_file"
 
 set +e
-"$REPO_ROOT/bin/load_client" --hosts "$HOSTS_FILE" --port "$PORT" "${client_args[@]}" | tee -a "$output_file"
+"$REPO_ROOT/bin/load_client" --hosts "$HOSTS_FILE" --port "$PORT" --expect-host-count "$HOST_COUNT" "${client_args[@]}" | tee -a "$output_file"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 

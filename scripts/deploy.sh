@@ -13,6 +13,7 @@ api_url=$DEFAULT_API_BASE_URL
 start_port=$DEFAULT_PORT_START
 end_port=$DEFAULT_PORT_END
 remote_dirname=$DEFAULT_REMOTE_DIRNAME
+explicit_hosts=0
 
 while (( $# > 0 )); do
     case "$1" in
@@ -69,6 +70,7 @@ manifest_file=$(normalize_path "$manifest_file")
 if [[ -n "$hosts_file" ]]; then
     hosts_file=$(normalize_path "$hosts_file")
     candidate_hosts_file=$hosts_file
+    explicit_hosts=1
 else
     candidate_hosts_file="$RUN_DIR/hosts-candidates.txt"
     hosts_file=$DEFAULT_HOSTS_FILE
@@ -78,7 +80,24 @@ else
     fi
 fi
 
-bash "$SCRIPT_DIR/select_port.sh" --hosts "$candidate_hosts_file" --selected-hosts-output "$hosts_file" --required-host-count "$host_count" --output "$manifest_file" --start-port "$start_port" --end-port "$end_port"
+if (( explicit_hosts )); then
+    bash "$SCRIPT_DIR/select_port.sh" \
+        --hosts "$candidate_hosts_file" \
+        --selected-hosts-output "$hosts_file" \
+        --minimum-host-count 1 \
+        --allow-partial \
+        --output "$manifest_file" \
+        --start-port "$start_port" \
+        --end-port "$end_port"
+else
+    bash "$SCRIPT_DIR/select_port.sh" \
+        --hosts "$candidate_hosts_file" \
+        --selected-hosts-output "$hosts_file" \
+        --required-host-count "$host_count" \
+        --output "$manifest_file" \
+        --start-port "$start_port" \
+        --end-port "$end_port"
+fi
 
 load_manifest "$manifest_file"
 
