@@ -1,0 +1,7 @@
+HTTP/2 200 
+server: nginx
+date: Sat, 25 Apr 2026 12:47:18 GMT
+content-type: application/json; charset=utf-8
+access-control-allow-origin: http://137.194.210.208
+strict-transport-security: max-age=31536000
+
