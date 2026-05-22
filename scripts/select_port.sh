@@ -11,7 +11,9 @@ manifest_file=$DEFAULT_MANIFEST_FILE
 start_port=$DEFAULT_PORT_START
 end_port=$DEFAULT_PORT_END
 required_host_count=0
+minimum_host_count=0
 selected_hosts_output=
+allow_partial=0
 
 while (( $# > 0 )); do
     case "$1" in
@@ -27,9 +29,17 @@ while (( $# > 0 )); do
             required_host_count=$2
             shift 2
             ;;
+        --minimum-host-count)
+            minimum_host_count=$2
+            shift 2
+            ;;
         --selected-hosts-output)
             selected_hosts_output=$2
             shift 2
+            ;;
+        --allow-partial)
+            allow_partial=1
+            shift
             ;;
         --start-port)
             start_port=$2
@@ -42,7 +52,8 @@ while (( $# > 0 )); do
         --help)
             cat <<'EOF'
 Usage: select_port.sh [--hosts FILE] [--output FILE] [--required-host-count N]
-                      [--selected-hosts-output FILE] [--start-port N] [--end-port N]
+                      [--minimum-host-count N] [--selected-hosts-output FILE]
+                      [--start-port N] [--end-port N] [--allow-partial]
 
 Probe the selected hosts over SSH, collect their listening TCP ports,
 and persist the first common free port inside the manifest file.
@@ -87,6 +98,19 @@ if (( required_host_count < 1 )); then
     exit 1
 fi
 
+if (( allow_partial )); then
+    if (( minimum_host_count == 0 )); then
+        minimum_host_count=1
+    fi
+else
+    minimum_host_count=$required_host_count
+fi
+
+if (( minimum_host_count < 1 || minimum_host_count > required_host_count )); then
+    printf 'Invalid minimum host count: %s\n' "$minimum_host_count" >&2
+    exit 1
+fi
+
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -110,13 +134,17 @@ for host in "${hosts[@]}"; do
     printf '%s\n' "$host" >> "$selected_hosts_tmp"
     (( reachable_count += 1 ))
 
-    if (( reachable_count >= required_host_count )); then
+    if (( ! allow_partial && reachable_count >= required_host_count )); then
         break
     fi
 done
 
-if (( reachable_count < required_host_count )); then
-    printf 'Only %d reachable hosts found, but %d required\n' "$reachable_count" "$required_host_count" >&2
+if (( reachable_count < minimum_host_count )); then
+    if (( allow_partial )); then
+        printf 'Only %d reachable hosts found, but %d minimum required\n' "$reachable_count" "$minimum_host_count" >&2
+    else
+        printf 'Only %d reachable hosts found, but %d required\n' "$reachable_count" "$required_host_count" >&2
+    fi
     exit 1
 fi
 

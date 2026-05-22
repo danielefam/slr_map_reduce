@@ -11,6 +11,7 @@ This project deploys one TCP server on each of 100 Linux hosts, using exactly on
 - `scripts/deploy.sh`: builds locally, copies the server bundle once through the first selected host, then launches the server on each selected host.
 - `scripts/status.sh`: checks whether the distributed servers are running and listening.
 - `scripts/stop.sh`: stops the distributed servers.
+- `scripts/clean_remote.sh`: stops the distributed servers for the current manifest and removes the current shared remote bundle, logs, and pid files.
 - `scripts/run_client.sh`: runs the local aggregator client using the stored manifest.
 - `scripts/smoke_local.sh`: local one-host smoke test.
 
@@ -68,6 +69,8 @@ If you already have a hosts file, skip dynamic selection and deploy directly wit
 bash scripts/deploy.sh --hosts run/hosts.txt --manifest run/manifest.env
 ```
 
+When `--hosts` is provided, deployment now continues with the reachable subset of that file as long as at least one host is reachable. The filtered reachable host list is written back through the manifest so `status`, `stop`, and `run-client` operate on the same set.
+
 ## Check Status
 
 ```bash
@@ -87,6 +90,24 @@ The client exits with status `0` only when every host replies successfully. If s
 ```bash
 make stop
 ```
+
+`make stop` is a lightweight shutdown that targets the current manifest hosts and port.
+
+## Clean Remote Deployment State
+
+```bash
+make clean-remote
+```
+
+This stops the current deployment and removes the current remote bundle directory, logs, and pid files. Use it before redeploying updated server binaries when you want to avoid stale remote state.
+
+## Clean and Redeploy
+
+```bash
+make redeploy
+```
+
+This runs the remote cleanup first, then performs a fresh deploy.
 
 ## Runtime Files
 

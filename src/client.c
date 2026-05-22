@@ -369,10 +369,15 @@ int main(int argc, char **argv) {
     if (success_count == 0) {
         fprintf(stderr, "No hosts returned a valid response\n");
         free_host_list(&hosts);
-        return 1;
+        return 2;
     }
 
         size_t total_hosts = hosts.count;
+        size_t failed_count = total_hosts - success_count;
+
+        if (failed_count > 0) {
+            fprintf(stderr, "Warning: %zu/%zu host(s) did not reply\n", failed_count, total_hosts);
+        }
 
         printf("Average load across %zu/%zu hosts: 1m=%.2f 5m=%.2f 15m=%.2f\n",
            success_count,
@@ -382,5 +387,5 @@ int main(int argc, char **argv) {
            sum_15 / success_count);
 
     free_host_list(&hosts);
-        return success_count == total_hosts ? 0 : 1;
+        return 0;
 }

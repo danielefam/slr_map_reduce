@@ -49,7 +49,7 @@ load_manifest "$manifest_file"
 printf '=== %s ===\n' "$(date -Is)" | tee -a "$output_file"
 
 set +e
-"$REPO_ROOT/bin/load_client" --hosts "$HOSTS_FILE" --port "$PORT" "${client_args[@]}" | tee -a "$output_file"
+"$REPO_ROOT/bin/load_client" --hosts "$HOSTS_FILE" --port "$PORT" --expect-host-count "$HOST_COUNT" "${client_args[@]}" | tee -a "$output_file"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 
@@ -63,4 +63,10 @@ if (( tee_status != 0 )); then
 fi
 
 printf 'Saved results to %s\n' "$output_file" >&2
-exit "$client_status"
+
+# Exit code 2 means zero hosts replied — that is a real failure.
+# Partial success (some hosts unreachable) exits 0 from the client.
+if (( client_status == 2 )); then
+    exit 1
+fi
+exit 0
