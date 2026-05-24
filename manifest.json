@@ -1,0 +1,17 @@
+{
+  "nfs": "",
+  "files": [],
+  "n": 100,
+  "commands": [
+    "nohup python3 -m http.server 8080 </dev/null >/tmp/httpserver.log 2>&1 & echo $! > /tmp/httpserver.pid"
+  ],
+  "collect_commands": [
+    "hostname",
+    "uptime",
+    "free -m | head -2"
+  ],
+  "cleanup_commands": [
+    "kill $(cat /tmp/httpserver.pid) 2>/dev/null || true",
+    "rm -f /tmp/httpserver.pid /tmp/httpserver.log"
+  ]
+}
