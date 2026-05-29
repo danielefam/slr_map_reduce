@@ -27,7 +27,7 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
     ├── collect/        # Collects stats from remote hosts via SSH
     ├── cleanup/        # Runs cleanup commands and removes NFS files
     ├── mapreduce/      # Client-side MapReduce orchestrator
-    └── worker/         # HTTP worker server (map / shuffle / reduce)
+    └── worker/         # HTTP worker server (map / reduce)
 ```
 
 ---
@@ -46,14 +46,17 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 ```bash
 ./mapreduce.sh -input /path/to/data.txt -output result.txt -n 10 -port 9090
+# or, for a directory of WET/WET.gz files on NFS:
+./mapreduce.sh -input-dir /cal/commoncrawl -output result.txt -n 10 -port 9090
 ```
 
-| Flag      | Default      | Description                     |
-| --------- | ------------ | ------------------------------- |
-| `-input`  | _(required)_ | Path to the input text file     |
-| `-output` | `result.txt` | Path for the merged output file |
-| `-n`      | `10`         | Number of worker nodes to use   |
-| `-port`   | `9090`       | HTTP port for worker servers    |
+| Flag          | Default      | Description                                                              |
+| ------------- | ------------ | ------------------------------------------------------------------------ |
+| `-input`      | _(optional)_ | Path to the input text file (one of `-input` or `-input-dir` required)  |
+| `-input-dir`  | _(optional)_ | Directory of `.wet`/`.wet.gz` files on NFS (alternative to `-input`)    |
+| `-output`     | `result.txt` | Path for the merged output file                                          |
+| `-n`          | `10`         | Number of worker nodes to use                                            |
+| `-port`       | `9090`       | HTTP port for worker servers                                             |
 
 The output file contains one `word<TAB>count` line per word, sorted by
 descending count then alphabetically.
@@ -76,8 +79,7 @@ up on exit.
 {
   "nfs": "",
   "files": [],
-  "n": 10,
-  "worker_port": "9090",
+  "n": 100,
   "commands": [
     "nohup python3 -m http.server 8080 </dev/null >/tmp/httpserver.log 2>&1 & echo $! > /tmp/httpserver.pid"
   ],
@@ -145,20 +147,30 @@ cleanup -m manifest.json -h hosts.txt
 An HTTP server that holds the state for one MapReduce job. Started on each
 remote node by the `mapreduce` orchestrator.
 
-| Endpoint        | Method | Description                                                                  |
-| --------------- | ------ | ---------------------------------------------------------------------------- |
-| `/health`       | GET    | Readiness probe — returns `200 ok` when ready                                |
-| `/data`         | POST   | Receive a raw text chunk (the worker's input partition)                      |
-| `/map`          | POST   | Run the map function on the local input; body is `{"id": N, "peers": [...]}` |
-| `/shuffle/recv` | POST   | Accept a batch of `[{"key":…,"value":…}]` KV pairs from a peer               |
-| `/shuffle`      | POST   | Push locally-mapped KVs to the correct peer via FNV-32a hash partitioning    |
-| `/reduce`       | POST   | Run the reduce function on all accumulated intermediate KVs                  |
-| `/result`       | GET    | Download the reduce output as `key\tvalue` lines                             |
+| Endpoint        | Method | Description                                                                                    |
+| --------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| `/health`       | GET    | Readiness probe — returns `200 ok` when ready                                                  |
+| `/data`         | POST   | Receive a raw text chunk (the worker's input partition)                                        |
+| `/load`         | POST   | Accept a JSON array of NFS file paths; reads each file (`.gz` decompressed) as input data     |
+| `/map`          | POST   | Run the map function on the local input; body is `{"id": N, "peers": [...]}`                  |
+| `/intermediate` | GET    | Serve the pre-partitioned map output bucket for a reducer (`?reducer=N&n=N`) — written at map time, served in O(1) without scanning |
+| `/reduce`       | POST   | Pull intermediate KVs from all peers via `/intermediate`, then run the reduce function locally |
+| `/result`       | GET    | Download the reduce output as `key\tvalue` lines                                               |
 
 ### `mapreduce` (orchestrator)
 
-Coordinates the full pipeline from the client machine. Builds and deploys the
-worker binary, then drives each phase.
+Coordinates the full pipeline from the client machine:
+
+1. Read N hosts from `hosts.txt`
+2. Build the worker binary (`GOOS=linux GOARCH=amd64`)
+3. SCP the binary to each node
+4. SSH each node to start the worker HTTP server (`nohup`)
+5. Wait for all workers to pass the health check
+6. Distribute input — either split a local file into 64 MB chunks and `POST /data` to each worker, or assign `.wet`/`.wet.gz` files round-robin and `POST /load` (workers read from NFS)
+7. Broadcast `POST /map` with each worker's ID and the full peer list — each worker partitions its intermediate KVs into N bucket files (`map-bucket-{n}-{idx}.jsonl`) using `FNV-32a(key) % N`
+8. Broadcast `POST /reduce` — each worker fetches its pre-partitioned bucket file from every peer via `GET /intermediate?reducer=id&n=N` (O(1) file read per peer) and runs reduce locally
+9. `GET /result` from every worker, merge word counts, sort (descending count, then alphabetical), write output file
+10. SSH cleanup: kill worker processes and remove temporary files
 
 ---
 
@@ -216,7 +228,7 @@ sequenceDiagram
     participant W1 as Worker 1
     participant Wn as Worker N-1
 
-    Note over Orchestrator: Split input into ≤64 MB chunks on line boundaries
+    Note over Orchestrator: Split input into ≤64 MB chunks on line boundaries<br/>(or assign NFS .wet/.wet.gz files round-robin)
 
     par Distribute data (parallel)
         Orchestrator->>W0: POST /data  (chunk 0)
@@ -229,18 +241,7 @@ sequenceDiagram
         Orchestrator->>W1: POST /map  {"id":1, "peers":[...]}
         Orchestrator->>Wn: POST /map  {"id":N-1, "peers":[...]}
     end
-    W0-->>Orchestrator: 200
-    W1-->>Orchestrator: 200
-    Wn-->>Orchestrator: 200
-
-    par Shuffle phase (parallel)
-        Orchestrator->>W0: POST /shuffle
-        Orchestrator->>W1: POST /shuffle
-        Orchestrator->>Wn: POST /shuffle
-        Note over W0,Wn: Each worker hashes its keys (FNV-32a % N)<br/>and pushes KV batches peer-to-peer
-        W0->>W1: POST /shuffle/recv
-        W1->>W0: POST /shuffle/recv
-    end
+    Note over W0,Wn: Each worker partitions intermediate KVs into N bucket files<br/>(map-bucket-{n}-{idx}.jsonl) keyed by FNV-32a(key) % N
     W0-->>Orchestrator: 200
     W1-->>Orchestrator: 200
     Wn-->>Orchestrator: 200
@@ -249,6 +250,11 @@ sequenceDiagram
         Orchestrator->>W0: POST /reduce
         Orchestrator->>W1: POST /reduce
         Orchestrator->>Wn: POST /reduce
+        Note over W0,Wn: Each worker fetches its pre-partitioned bucket from all peers<br/>via GET /intermediate?reducer=id&n=N (O(1) file read, no scan),<br/>then reduces locally
+        W0->>W1: GET /intermediate?reducer=0&n=N
+        W0->>Wn: GET /intermediate?reducer=0&n=N
+        W1->>W0: GET /intermediate?reducer=1&n=N
+        W1->>Wn: GET /intermediate?reducer=1&n=N
     end
     W0-->>Orchestrator: 200
     W1-->>Orchestrator: 200
@@ -268,9 +274,9 @@ sequenceDiagram
 
 ---
 
-### 3. Worker Shuffle Detail
+### 3. Intermediate Data Pull Detail
 
-This diagram zooms in on the peer-to-peer shuffle step for a 3-worker example.
+This diagram zooms in on how intermediate data flows during the reduce phase for a 3-worker example.
 
 ```mermaid
 sequenceDiagram
@@ -278,31 +284,27 @@ sequenceDiagram
     participant W1 as Worker 1
     participant W2 as Worker 2
 
-    Note over W0,W2: Orchestrator triggers POST /shuffle on all workers simultaneously
+    Note over W0,W2: Orchestrator triggers POST /reduce on all workers simultaneously
 
-    W0->>W0: Partition own map output by FNV-32a(key) % 3
-    W1->>W1: Partition own map output by FNV-32a(key) % 3
-    W2->>W2: Partition own map output by FNV-32a(key) % 3
-
-    par W0 sends to peers
-        W0->>W1: POST /shuffle/recv  [keys hashing to node 1]
-        W0->>W2: POST /shuffle/recv  [keys hashing to node 2]
-        W0->>W0: merge self-destined keys locally
+    par W0 pulls its reducer bucket (id=0) from all peers
+        W0->>W0: GET /intermediate?reducer=0&n=3 (self)
+        W0->>W1: GET /intermediate?reducer=0&n=3
+        W0->>W2: GET /intermediate?reducer=0&n=3
     end
 
-    par W1 sends to peers
-        W1->>W0: POST /shuffle/recv  [keys hashing to node 0]
-        W1->>W2: POST /shuffle/recv  [keys hashing to node 2]
-        W1->>W1: merge self-destined keys locally
+    par W1 pulls its reducer bucket (id=1) from all peers
+        W1->>W0: GET /intermediate?reducer=1&n=3
+        W1->>W1: GET /intermediate?reducer=1&n=3 (self)
+        W1->>W2: GET /intermediate?reducer=1&n=3
     end
 
-    par W2 sends to peers
-        W2->>W0: POST /shuffle/recv  [keys hashing to node 0]
-        W2->>W1: POST /shuffle/recv  [keys hashing to node 1]
-        W2->>W2: merge self-destined keys locally
+    par W2 pulls its reducer bucket (id=2) from all peers
+        W2->>W0: GET /intermediate?reducer=2&n=3
+        W2->>W1: GET /intermediate?reducer=2&n=3
+        W2->>W2: GET /intermediate?reducer=2&n=3 (self)
     end
 
-    Note over W0,W2: Each worker now holds all values for the keys<br/>assigned to it — ready for the reduce phase
+    Note over W0,W2: Each peer serves its pre-partitioned bucket file directly (written at map time).<br/>No full-scan: FNV-32a(key) % N routing was done once during POST /map.<br/>After fetching: each worker owns all values for its disjoint key set — ready to reduce
 ```
 
 ---
@@ -316,18 +318,19 @@ Input file
 ┌───────┬───────┬───────┐
 │Chunk 0│Chunk 1│Chunk N│  ── POST /data ──▶  Workers
 └───────┴───────┴───────┘
+(or: .wet/.wet.gz files assigned round-robin ── POST /load ──▶ Workers)
 
 Workers: Map phase
     Each worker applies wordCountMap line-by-line:
     "hello world hello" → [(hello,1),(world,1),(hello,1)]
-    Output: map[key][]value stored in-memory
+    Output: N pre-partitioned bucket files on disk (map-bucket-{n}-{idx}.jsonl)
+    Keys routed by FNV-32a(key) % N — partitioning done once, at map time
 
-Workers: Shuffle phase  (peer-to-peer, no orchestrator involvement)
-    key → target = FNV-32a(key) % N
-    Batch-push KVs to the owning worker via POST /shuffle/recv
-    After shuffle: each worker owns all values for a disjoint key set
-
-Workers: Reduce phase
+Workers: Reduce phase  (pull-based, no orchestrator involvement)
+    Each worker i queries every peer (including itself) for its bucket:
+      GET /intermediate?reducer=i&n=N
+    Peers serve map-bucket-{n}-{i}.jsonl directly — O(1), no scan
+    After fetching: each worker owns all values for a disjoint key set
     wordCountReduce(key, values) = len(values)
     Output: sorted []KeyValue
 
@@ -378,10 +381,12 @@ The `mapreduce` orchestrator cross-compiles the worker automatically
 
 ## Error Handling & Fault Tolerance
 
-| Scenario                         | Behaviour                                                          |
-| -------------------------------- | ------------------------------------------------------------------ |
-| Worker not reachable at startup  | `waitHealthy` retries up to 30 times with 2 s delay before failing |
-| SCP / SSH failure                | `deployWorker` reports the first error and aborts the pipeline     |
-| Worker returns non-200           | Orchestrator logs the error body and aborts the phase              |
-| Shuffle send failure             | Worker responds 500 to the `/shuffle` call; orchestrator aborts    |
-| `run.sh` receives SIGINT/SIGTERM | `trap cleanup EXIT` ensures remote processes are killed            |
+| Scenario                           | Behaviour                                                                                                          |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Worker not reachable at startup    | `waitHealthy` retries up to 30 times with 2 s delay before failing (30 s client timeout per probe)                |
+| SCP / SSH failure                  | `deployWorker` reports the first error and aborts the pipeline                                                     |
+| Worker returns non-200             | Orchestrator logs the error body and aborts the phase                                                              |
+| Map/reduce phase times out         | 60 min HTTP client timeout per worker; worker returns error, orchestrator aborts                                   |
+| Data upload times out              | 30 min HTTP client timeout for `/load` requests                                                                    |
+| `/intermediate` fetch failure      | 10 min HTTP client timeout per fetch; worker responds 500 to `/reduce` call; orchestrator aborts                  |
+| `run.sh` receives SIGINT/SIGTERM   | `trap cleanup EXIT` ensures remote processes are killed                                                            |

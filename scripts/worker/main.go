@@ -2,13 +2,12 @@
 //
 // Endpoints:
 //
-//	GET  /health        — readiness probe
-//	POST /data          — receive raw text data chunk
-//	POST /map           — start map phase
-//	POST /shuffle/recv  — receive intermediate KV pairs from a peer
-//	POST /shuffle       — start shuffle: push map output to correct peers
-//	POST /reduce        — start reduce phase
-//	GET  /result        — download reduce output
+//	GET  /health              — readiness probe
+//	POST /data                — receive raw text data chunk
+//	POST /map                 — start map phase
+//	GET  /intermediate        — serve map output for a given reducer bucket
+//	POST /reduce              — start reduce phase (pulls from peers via /intermediate)
+//	GET  /result              — download reduce output
 //
 // Usage:
 //
@@ -17,7 +16,7 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -27,7 +26,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 // state holds all runtime data for one MapReduce job.
@@ -60,11 +62,11 @@ func newServer(mapFn MapFunc, reduceFn ReduceFunc, workDir string) *server {
 	return &server{state: &state{}, mapFn: mapFn, reduceFn: reduceFn, workDir: workDir}
 }
 
-// mapFile returns the path for the map-phase output file.
-func (s *server) mapFile() string { return filepath.Join(s.workDir, "map-output.jsonl") }
-
-// shuffleFile returns the path for the shuffle-received data file.
-func (s *server) shuffleFile() string { return filepath.Join(s.workDir, "shuffle-recv.jsonl") }
+// bucketFile returns the path for the pre-partitioned intermediate file
+// for reducer idx out of n total reducers.
+func (s *server) bucketFile(n, idx int) string {
+	return filepath.Join(s.workDir, fmt.Sprintf("map-bucket-%d-%d.jsonl", n, idx))
+}
 
 // writeKVLines writes kvs to path as JSON lines, overwriting any existing file.
 func writeKVLines(path string, kvs []KeyValue) error {
@@ -82,62 +84,37 @@ func writeKVLines(path string, kvs []KeyValue) error {
 	return nil
 }
 
-// appendKVLines appends kvs to path as JSON lines, creating the file if needed.
-func appendKVLines(path string, kvs []KeyValue) error {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	for _, kv := range kvs {
-		if err := enc.Encode(kv); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// readKVLines reads all JSON-line KV pairs from path and returns them grouped by key.
-// Returns an empty map (not an error) if the file does not exist.
-func readKVLines(path string) (map[string][]string, error) {
+// readKVFlat reads JSON-line KV pairs from path and returns them as a flat slice.
+// Returns nil (not an error) if the file does not exist.
+func readKVFlat(path string) ([]KeyValue, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return make(map[string][]string), nil
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	out := make(map[string][]string)
+	var out []KeyValue
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
 	for scanner.Scan() {
 		var kv KeyValue
 		if err := json.Unmarshal(scanner.Bytes(), &kv); err != nil {
-			return nil, fmt.Errorf("readKVLines %s: %w", path, err)
+			return nil, fmt.Errorf("readKVFlat %s: %w", path, err)
 		}
-		out[kv.Key] = append(out[kv.Key], kv.Value)
+		out = append(out, kv)
 	}
 	return out, scanner.Err()
 }
 
-// flattenKV converts the grouped intermediate map into a flat []KeyValue slice.
-func flattenKV(intermediate map[string][]string) []KeyValue {
-	var out []KeyValue
-	for k, vals := range intermediate {
-		for _, v := range vals {
-			out = append(out, KeyValue{Key: k, Value: v})
-		}
-	}
-	return out
-}
-
-// removeIntermediate deletes both intermediate files, ignoring not-found errors.
+// removeIntermediate deletes all pre-partitioned map bucket files.
 func (s *server) removeIntermediate() {
-	_ = os.Remove(s.mapFile())
-	_ = os.Remove(s.shuffleFile())
+	matches, _ := filepath.Glob(filepath.Join(s.workDir, "map-bucket-*.jsonl"))
+	for _, f := range matches {
+		_ = os.Remove(f)
+	}
 }
 
 // handler returns an http.Handler with all worker routes registered.
@@ -145,9 +122,9 @@ func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /data", s.handleData)
+	mux.HandleFunc("POST /load", s.handleLoad)
 	mux.HandleFunc("POST /map", s.handleMap)
-	mux.HandleFunc("POST /shuffle/recv", s.handleShuffleRecv)
-	mux.HandleFunc("POST /shuffle", s.handleShuffle)
+	mux.HandleFunc("GET /intermediate", s.handleIntermediate)
 	mux.HandleFunc("POST /reduce", s.handleReduce)
 	mux.HandleFunc("GET /result", s.handleResult)
 	return mux
@@ -196,6 +173,52 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleLoad accepts a JSON array of file paths, reads them (decompressing .gz files),
+// and sets the worker's input data. Used when input lives on a shared NFS mount.
+func (s *server) handleLoad(w http.ResponseWriter, r *http.Request) {
+	var paths []string
+	if err := json.NewDecoder(r.Body).Decode(&paths); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var buf strings.Builder
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			http.Error(w, "open file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var reader io.Reader = f
+		if strings.HasSuffix(path, ".gz") {
+			gr, err := gzip.NewReader(f)
+			if err != nil {
+				f.Close()
+				http.Error(w, "gzip open "+path+": "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer gr.Close()
+			reader = gr
+		}
+		data, err := io.ReadAll(reader)
+		f.Close()
+		if err != nil {
+			http.Error(w, "read file "+path+": "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		buf.Write(data)
+		buf.WriteByte('\n')
+	}
+
+	s.state.mu.Lock()
+	s.state.inputData = buf.String()
+	s.state.output = nil
+	s.state.mu.Unlock()
+
+	s.removeIntermediate()
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	var req mapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -209,40 +232,81 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	s.state.peers = req.Peers
 	s.state.mu.Unlock()
 
+	n := len(req.Peers)
 	intermediate := runMap(data, s.mapFn)
-	if err := writeKVLines(s.mapFile(), flattenKV(intermediate)); err != nil {
-		http.Error(w, "write map output: "+err.Error(), http.StatusInternalServerError)
-		return
+
+	// Partition intermediate KVs into n bucket files (one per reducer) so that
+	// /intermediate?reducer=X can serve its file directly without scanning all output.
+	buckets := make([][]KeyValue, n)
+	for key, values := range intermediate {
+		idx := targetNode(key, n)
+		for _, v := range values {
+			buckets[idx] = append(buckets[idx], KeyValue{Key: key, Value: v})
+		}
+	}
+	for i, kvs := range buckets {
+		if err := writeKVLines(s.bucketFile(n, i), kvs); err != nil {
+			http.Error(w, "write map bucket: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"keys":%d}`, len(intermediate))
 }
 
-// handleShuffleRecv accepts a batch of KV pairs from a peer and appends them
-// to the local shuffle file.
-func (s *server) handleShuffleRecv(w http.ResponseWriter, r *http.Request) {
-	var batch []KeyValue
-	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
-		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+// handleIntermediate serves the pre-partitioned bucket file for the requested
+// reducer. Query params: reducer (0-based index), n (total workers).
+func (s *server) handleIntermediate(w http.ResponseWriter, r *http.Request) {
+	reducer, err1 := strconv.Atoi(r.URL.Query().Get("reducer"))
+	n, err2 := strconv.Atoi(r.URL.Query().Get("n"))
+	if err1 != nil || err2 != nil || n <= 0 || reducer < 0 || reducer >= n {
+		http.Error(w, "bad request: need integer params reducer in [0,n) and n>0", http.StatusBadRequest)
 		return
 	}
 
-	s.state.mu.Lock()
-	err := appendKVLines(s.shuffleFile(), batch)
-	s.state.mu.Unlock()
-
+	kvs, err := readKVFlat(s.bucketFile(n, reducer))
 	if err != nil {
-		http.Error(w, "write shuffle data: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "read map bucket: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	if kvs == nil {
+		kvs = []KeyValue{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(kvs); err != nil {
+		log.Printf("encode intermediate: %v", err)
+	}
 }
 
-// handleShuffle drives the shuffle step: for each intermediate key, compute the
-// target node via fnv32(key)%N, batch the KVs, and POST them to the target's
-// /shuffle/recv endpoint. Blocks until all sends are acknowledged.
-func (s *server) handleShuffle(w http.ResponseWriter, _ *http.Request) {
+// intermediateClient is used for fetching pre-partitioned map buckets from peers.
+// A 10-minute timeout is generous enough for large buckets over a LAN.
+var intermediateClient = &http.Client{Timeout: 10 * time.Minute}
+
+// fetchIntermediate GETs /intermediate from peer, requesting the KV pairs destined
+// for reducerID out of n total workers.
+func fetchIntermediate(peer string, reducerID, n int) ([]KeyValue, error) {
+	url := fmt.Sprintf("http://%s/intermediate?reducer=%d&n=%d", peer, reducerID, n)
+	resp, err := intermediateClient.Get(url) //nolint:gosec
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("peer %s returned %d: %s", peer, resp.StatusCode, b)
+	}
+	var kvs []KeyValue
+	if err := json.NewDecoder(resp.Body).Decode(&kvs); err != nil {
+		return nil, fmt.Errorf("decode intermediate from %s: %w", peer, err)
+	}
+	return kvs, nil
+}
+
+// handleReduce pulls intermediate data from all peers via /intermediate, then runs
+// the reduce function over the merged KV pairs.
+func (s *server) handleReduce(w http.ResponseWriter, _ *http.Request) {
 	s.state.mu.Lock()
 	peers := s.state.peers
 	id := s.state.workerID
@@ -253,100 +317,37 @@ func (s *server) handleShuffle(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	localMap, err := readKVLines(s.mapFile())
-	if err != nil {
-		http.Error(w, "read map output: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	n := len(peers)
-	buckets := make([][]KeyValue, n)
-	for key, values := range localMap {
-		target := targetNode(key, n)
-		for _, v := range values {
-			buckets[target] = append(buckets[target], KeyValue{Key: key, Value: v})
-		}
-	}
-
-	// Send buckets to all peers concurrently (skip self).
-	var wg sync.WaitGroup
+	var mu sync.Mutex
+	intermediate := make(map[string][]string)
 	errs := make([]error, n)
+	var wg sync.WaitGroup
 	for i, peer := range peers {
-		if i == id {
-			continue // self-destined keys are written below
-		}
-		if len(buckets[i]) == 0 {
-			continue
-		}
 		wg.Add(1)
-		go func(idx int, addr string, batch []KeyValue) {
+		go func(idx int, addr string) {
 			defer wg.Done()
-			errs[idx] = sendBatch(addr, batch)
-		}(i, peer, buckets[i])
+			kvs, err := fetchIntermediate(addr, id, n)
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			mu.Lock()
+			for _, kv := range kvs {
+				intermediate[kv.Key] = append(intermediate[kv.Key], kv.Value)
+			}
+			mu.Unlock()
+		}(i, peer)
 	}
 	wg.Wait()
 
 	for i, err := range errs {
 		if err != nil {
-			http.Error(w, fmt.Sprintf("send to peer %s failed: %v", peers[i], err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("fetch from peer %s: %v", peers[i], err), http.StatusInternalServerError)
 			return
 		}
 	}
 
-	// Write self-destined keys to the shuffle file and delete the map file.
-	s.state.mu.Lock()
-	if len(buckets[id]) > 0 {
-		err = appendKVLines(s.shuffleFile(), buckets[id])
-	}
-	s.state.mu.Unlock()
-	if err != nil {
-		http.Error(w, "write self shuffle data: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	_ = os.Remove(s.mapFile())
-
-	w.WriteHeader(http.StatusOK)
-}
-
-// sendBatch POSTs a batch of KV pairs to peer's /shuffle/recv endpoint.
-func sendBatch(peer string, batch []KeyValue) error {
-	body, err := json.Marshal(batch)
-	if err != nil {
-		return err
-	}
-	url := "http://" + peer + "/shuffle/recv"
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("peer returned %d: %s", resp.StatusCode, b)
-	}
-	return nil
-}
-
-func (s *server) handleReduce(w http.ResponseWriter, _ *http.Request) {
-	// Read from the shuffle-received file (normal flow) and also from the
-	// map-output file if it still exists (e.g. when shuffle was skipped in tests).
-	intermediate, err := readKVLines(s.shuffleFile())
-	if err != nil {
-		http.Error(w, "read shuffle data: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	mapOut, err := readKVLines(s.mapFile())
-	if err != nil {
-		http.Error(w, "read map output: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	for k, vals := range mapOut {
-		intermediate[k] = append(intermediate[k], vals...)
-	}
-
 	output := runReduce(intermediate, s.reduceFn)
-	_ = os.Remove(s.shuffleFile())
-	_ = os.Remove(s.mapFile())
 
 	s.state.mu.Lock()
 	s.state.output = output

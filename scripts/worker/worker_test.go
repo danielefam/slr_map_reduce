@@ -86,7 +86,7 @@ func TestHandleData(t *testing.T) {
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello world\n"))
 }
 
-// TestSingleWorkerPipeline runs the full map→shuffle→reduce→result cycle on one worker.
+// TestSingleWorkerPipeline runs the full map→reduce→result cycle on one worker.
 func TestSingleWorkerPipeline(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
@@ -97,7 +97,6 @@ func TestSingleWorkerPipeline(t *testing.T) {
 	peer := strings.TrimPrefix(ts.URL, "http://")
 	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
 	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 
 	got := getResult(t, ts.URL)
@@ -141,12 +140,7 @@ func TestMultiWorkerPipeline(t *testing.T) {
 		mustPost(t, ts.URL+"/map", "application/json", req)
 	}
 
-	// Shuffle phase (sequential is correct: hash routing is idempotent).
-	for _, ts := range servers {
-		mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
-	}
-
-	// Reduce phase.
+	// Reduce phase: each worker pulls intermediate data from all peers.
 	for _, ts := range servers {
 		mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 	}
@@ -177,28 +171,40 @@ func TestMultiWorkerPipeline(t *testing.T) {
 	}
 }
 
-func TestShuffleRecvMerges(t *testing.T) {
+// TestIntermediateEndpoint verifies that GET /intermediate returns only the KV pairs
+// whose keys hash to the requested reducer bucket, and that every bucket is served.
+func TestIntermediateEndpoint(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello\n"))
+	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello world\nhello go\n"))
+
+	// Use n=3 peers so the map phase writes 3 bucket files; the two extra
+	// addresses are never contacted during this test (no reduce phase runs).
+	const n = 3
+	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer, "unused1:9090", "unused2:9090"}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq)
 
-	// Manually inject additional KV pairs via /shuffle/recv.
-	extra := []KeyValue{{Key: "hello", Value: "1"}, {Key: "new", Value: "1"}}
-	body, _ := json.Marshal(extra)
-	mustPost(t, ts.URL+"/shuffle/recv", "application/json", body)
-
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
-
-	got := getResult(t, ts.URL)
-	if got["hello"] != 2 {
-		t.Errorf("hello: want 2, got %d", got["hello"])
-	}
-	if got["new"] != 1 {
-		t.Errorf("new: want 1, got %d", got["new"])
+	for r := 0; r < n; r++ {
+		url := fmt.Sprintf("%s/intermediate?reducer=%d&n=%d", ts.URL, r, n)
+		resp, err := http.Get(url) //nolint:gosec
+		if err != nil {
+			t.Fatalf("GET /intermediate reducer=%d: %v", r, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("reducer %d: want 200, got %d", r, resp.StatusCode)
+		}
+		var kvs []KeyValue
+		if err := json.NewDecoder(resp.Body).Decode(&kvs); err != nil {
+			t.Fatalf("decode reducer %d: %v", r, err)
+		}
+		for _, kv := range kvs {
+			if got := targetNode(kv.Key, n); got != r {
+				t.Errorf("reducer %d: key %q hashes to bucket %d", r, kv.Key, got)
+			}
+		}
 	}
 }
 
@@ -212,14 +218,12 @@ func TestDataResetsState(t *testing.T) {
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("apple apple\n"))
 	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
 	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 
 	// Second job with different data — /data must reset state.
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("banana\n"))
 	mapReq2, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq2)
-	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
 	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 
 	got := getResult(t, ts.URL)
@@ -231,23 +235,25 @@ func TestDataResetsState(t *testing.T) {
 	}
 }
 
-func TestHandleShuffleNoMapPhase(t *testing.T) {
+// TestHandleReduceNoMapPhase verifies that /reduce returns 400 when the map phase
+// has not been run (no peer list is available).
+func TestHandleReduceNoMapPhase(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/shuffle", "application/octet-stream", bytes.NewReader(nil))
+	resp, err := http.Post(ts.URL+"/reduce", "application/octet-stream", bytes.NewReader(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("shuffle without map: want 400, got %d", resp.StatusCode)
+		t.Errorf("reduce without map: want 400, got %d", resp.StatusCode)
 	}
 }
 
-// TestConcurrentShufflePipeline mirrors the production broadcastPost behaviour by
-// firing all /shuffle requests concurrently and verifying the merged word counts.
-func TestConcurrentShufflePipeline(t *testing.T) {
+// TestConcurrentReducePipeline mirrors the production broadcastPost behaviour by
+// firing all /reduce requests concurrently and verifying the merged word counts.
+func TestConcurrentReducePipeline(t *testing.T) {
 	const n = 4
 	servers := make([]*httptest.Server, n)
 	peers := make([]string, n)
@@ -272,17 +278,7 @@ func TestConcurrentShufflePipeline(t *testing.T) {
 		mustPost(t, ts.URL+"/map", "application/json", req)
 	}
 
-	// All shuffles run concurrently, just like the real orchestrator's broadcastPost.
-	var shuffleWg sync.WaitGroup
-	for _, ts := range servers {
-		shuffleWg.Add(1)
-		go func(s *httptest.Server) {
-			defer shuffleWg.Done()
-			mustPost(t, s.URL+"/shuffle", "application/octet-stream", nil)
-		}(ts)
-	}
-	shuffleWg.Wait()
-
+	// All reduces run concurrently; each worker pulls /intermediate from all peers.
 	var reduceWg sync.WaitGroup
 	for _, ts := range servers {
 		reduceWg.Add(1)
@@ -322,7 +318,7 @@ func TestConcurrentShufflePipeline(t *testing.T) {
 }
 
 // TestWorkersReceiveEmptyData verifies that workers with no input (empty chunk) don't
-// produce spurious output and don't break the shuffle/reduce cycle.
+// produce spurious output and don't break the reduce cycle.
 func TestWorkersReceiveEmptyData(t *testing.T) {
 	const n = 3
 	servers := make([]*httptest.Server, n)
@@ -342,16 +338,6 @@ func TestWorkersReceiveEmptyData(t *testing.T) {
 		req, _ := json.Marshal(mapRequest{ID: i, Peers: peers})
 		mustPost(t, ts.URL+"/map", "application/json", req)
 	}
-
-	var wg sync.WaitGroup
-	for _, ts := range servers {
-		wg.Add(1)
-		go func(s *httptest.Server) {
-			defer wg.Done()
-			mustPost(t, s.URL+"/shuffle", "application/octet-stream", nil)
-		}(ts)
-	}
-	wg.Wait()
 
 	for _, ts := range servers {
 		mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
@@ -386,7 +372,6 @@ func TestUnicodeInput(t *testing.T) {
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(input))
 	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
 	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 
 	got := getResult(t, ts.URL)
@@ -412,7 +397,6 @@ func TestHighFrequencyWord(t *testing.T) {
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(sb.String()))
 	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
 	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 
 	got := getResult(t, ts.URL)
@@ -439,7 +423,6 @@ func TestLargeInput(t *testing.T) {
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(input))
 	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
 	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
 	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
 
 	got := getResult(t, ts.URL)

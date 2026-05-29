@@ -1,8 +1,7 @@
 {
   "nfs": "",
   "files": [],
-  "n": 10,
-  "worker_port": "9090",
+  "n": 100,
   "commands": [
     "nohup python3 -m http.server 8080 </dev/null >/tmp/httpserver.log 2>&1 & echo $! > /tmp/httpserver.pid"
   ],
@@ -14,3 +13,4 @@
     "rm -f /tmp/mr-worker.pid /tmp/mr-worker.log /tmp/mr-worker"
   ]
 }
+

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Orchestrates the full workflow:
-#   1. Fetch 100 available hosts
+#   1. Fetch N available hosts
 #   2. Start an HTTP server on each host
 #   3. Collect memory + CPU load stats, saving them to stats.txt
 #   4. Kill the HTTP servers and clean up
@@ -11,6 +11,7 @@ SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)"
 MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifest.json"
 HOSTS="hosts.txt"
 STATS="stats.txt"
+N=100  # number of cluster nodes; must match "n" in manifest.json
 
 cleanup() {
   echo ""
@@ -19,8 +20,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Step 1: Fetching 100 hosts ==="
-(cd "$SCRIPTS" && go run ./make_hosts -n 100 -f "../$HOSTS")
+echo "=== Step 1: Fetching $N hosts ==="
+(cd "$SCRIPTS" && go run ./make_hosts -n "$N" -f "../$HOSTS")
 
 echo ""
 echo "=== Step 2: Starting HTTP servers ==="
