@@ -2,6 +2,11 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -107,5 +112,136 @@ func TestChunkForWorker_EmptyChunks(t *testing.T) {
 	got := chunkForWorker(nil, 0)
 	if len(got) != 0 {
 		t.Errorf("nil chunks: want empty, got %q", got)
+	}
+}
+
+func TestReadHosts(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    []string
+	}{
+		{
+			name:    "normal hosts",
+			content: "host1.example.com\nhost2.example.com\nhost3.example.com\n",
+			want:    []string{"host1.example.com", "host2.example.com", "host3.example.com"},
+		},
+		{
+			name:    "blank lines ignored",
+			content: "host1.example.com\n\nhost2.example.com\n\n",
+			want:    []string{"host1.example.com", "host2.example.com"},
+		},
+		{
+			name:    "leading and trailing spaces trimmed",
+			content: "  host1.example.com  \n  host2.example.com\n",
+			want:    []string{"host1.example.com", "host2.example.com"},
+		},
+		{
+			name:    "empty file",
+			content: "",
+			want:    nil,
+		},
+		{
+			name:    "only whitespace lines",
+			content: "   \n   \n",
+			want:    nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "hosts*.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString(tt.content); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+
+			got, err := readHosts(f.Name())
+			if err != nil {
+				t.Fatalf("readHosts: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d]: got %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestReadHostsNotFound(t *testing.T) {
+	_, err := readHosts(filepath.Join(t.TempDir(), "nonexistent.txt"))
+	if err == nil {
+		t.Error("want error for missing file, got nil")
+	}
+}
+
+func TestFirstErr(t *testing.T) {
+	err1 := fmt.Errorf("error one")
+	err2 := fmt.Errorf("error two")
+	tests := []struct {
+		name string
+		errs []error
+		want error
+	}{
+		{"all nil", []error{nil, nil, nil}, nil},
+		{"empty slice", nil, nil},
+		{"first is error", []error{err1, nil, nil}, err1},
+		{"last is error", []error{nil, nil, err2}, err2},
+		{"multiple errors returns first", []error{err1, err2}, err1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstErr(tt.errs); got != tt.want {
+				t.Errorf("firstErr = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCollectResults verifies that results from multiple mock workers are merged,
+// counted correctly, and written sorted by descending count then alphabetical key.
+func TestCollectResults(t *testing.T) {
+	makeHandler := func(result string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, result)
+		})
+	}
+
+	ts1 := httptest.NewServer(makeHandler("apple\t3\nbanana\t1\n"))
+	defer ts1.Close()
+	ts2 := httptest.NewServer(makeHandler("apple\t2\ncherry\t5\n"))
+	defer ts2.Close()
+
+	peer1 := strings.TrimPrefix(ts1.URL, "http://")
+	peer2 := strings.TrimPrefix(ts2.URL, "http://")
+	outFile := filepath.Join(t.TempDir(), "result.txt")
+
+	if err := collectResults([]string{peer1, peer2}, outFile); err != nil {
+		t.Fatalf("collectResults: %v", err)
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	// Merged: apple=5, cherry=5, banana=1.
+	// Sorted: descending count, then alphabetical key → apple, cherry, banana.
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 3 lines, got %d:\n%s", len(lines), data)
+	}
+	want := []string{"apple\t5", "cherry\t5", "banana\t1"}
+	for i, line := range lines {
+		if line != want[i] {
+			t.Errorf("line[%d]: want %q, got %q", i, want[i], line)
+		}
 	}
 }

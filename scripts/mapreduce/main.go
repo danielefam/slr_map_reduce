@@ -449,6 +449,7 @@ func cleanupWorkers(hosts []string) {
 			_, err := sshRun(host, []string{
 				"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true",
 				"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log " + workerBinary,
+				"rm -rf /tmp/mr-worker-*",
 			})
 			if err != nil {
 				log.Printf("[%s] cleanup warning: %v", host, err)

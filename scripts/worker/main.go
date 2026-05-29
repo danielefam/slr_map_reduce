@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -23,6 +24,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -38,9 +41,6 @@ type state struct {
 	workerID int
 	peers    []string // "host:port" for all workers including self
 
-	// intermediate: key → list of values (populated by map + shuffle recv)
-	intermediate map[string][]string
-
 	// final reduce output
 	output []KeyValue
 }
@@ -51,10 +51,93 @@ type server struct {
 	state    *state
 	mapFn    MapFunc
 	reduceFn ReduceFunc
+	// workDir is the directory where intermediate files are written.
+	workDir string
 }
 
-func newServer(mapFn MapFunc, reduceFn ReduceFunc) *server {
-	return &server{state: &state{}, mapFn: mapFn, reduceFn: reduceFn}
+// newServer creates a worker server that stores intermediate files under workDir.
+func newServer(mapFn MapFunc, reduceFn ReduceFunc, workDir string) *server {
+	return &server{state: &state{}, mapFn: mapFn, reduceFn: reduceFn, workDir: workDir}
+}
+
+// mapFile returns the path for the map-phase output file.
+func (s *server) mapFile() string { return filepath.Join(s.workDir, "map-output.jsonl") }
+
+// shuffleFile returns the path for the shuffle-received data file.
+func (s *server) shuffleFile() string { return filepath.Join(s.workDir, "shuffle-recv.jsonl") }
+
+// writeKVLines writes kvs to path as JSON lines, overwriting any existing file.
+func writeKVLines(path string, kvs []KeyValue) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, kv := range kvs {
+		if err := enc.Encode(kv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendKVLines appends kvs to path as JSON lines, creating the file if needed.
+func appendKVLines(path string, kvs []KeyValue) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, kv := range kvs {
+		if err := enc.Encode(kv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readKVLines reads all JSON-line KV pairs from path and returns them grouped by key.
+// Returns an empty map (not an error) if the file does not exist.
+func readKVLines(path string) (map[string][]string, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return make(map[string][]string), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	out := make(map[string][]string)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
+	for scanner.Scan() {
+		var kv KeyValue
+		if err := json.Unmarshal(scanner.Bytes(), &kv); err != nil {
+			return nil, fmt.Errorf("readKVLines %s: %w", path, err)
+		}
+		out[kv.Key] = append(out[kv.Key], kv.Value)
+	}
+	return out, scanner.Err()
+}
+
+// flattenKV converts the grouped intermediate map into a flat []KeyValue slice.
+func flattenKV(intermediate map[string][]string) []KeyValue {
+	var out []KeyValue
+	for k, vals := range intermediate {
+		for _, v := range vals {
+			out = append(out, KeyValue{Key: k, Value: v})
+		}
+	}
+	return out
+}
+
+// removeIntermediate deletes both intermediate files, ignoring not-found errors.
+func (s *server) removeIntermediate() {
+	_ = os.Remove(s.mapFile())
+	_ = os.Remove(s.shuffleFile())
 }
 
 // handler returns an http.Handler with all worker routes registered.
@@ -74,9 +157,14 @@ func main() {
 	port := flag.String("port", "9090", "port to listen on")
 	flag.Parse()
 
-	srv := newServer(wordCountMap, wordCountReduce)
+	workDir, err := os.MkdirTemp("", "mr-worker-*")
+	if err != nil {
+		log.Fatalf("create work dir: %v", err)
+	}
+
+	srv := newServer(wordCountMap, wordCountReduce, workDir)
 	addr := ":" + *port
-	log.Printf("worker listening on %s", addr)
+	log.Printf("worker listening on %s (workDir: %s)", addr, workDir)
 	if err := http.ListenAndServe(addr, srv.handler()); err != nil {
 		log.Fatal(err)
 	}
@@ -101,9 +189,10 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 	}
 	s.state.mu.Lock()
 	s.state.inputData = string(body)
-	s.state.intermediate = nil
 	s.state.output = nil
 	s.state.mu.Unlock()
+
+	s.removeIntermediate()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -118,16 +207,20 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	data := s.state.inputData
 	s.state.workerID = req.ID
 	s.state.peers = req.Peers
-	intermediate := runMap(data, s.mapFn)
-	s.state.intermediate = intermediate
 	s.state.mu.Unlock()
+
+	intermediate := runMap(data, s.mapFn)
+	if err := writeKVLines(s.mapFile(), flattenKV(intermediate)); err != nil {
+		http.Error(w, "write map output: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"keys":%d}`, len(intermediate))
 }
 
-// handleShuffleRecv accepts a batch of KV pairs from a peer and merges them
-// into the local intermediate store.
+// handleShuffleRecv accepts a batch of KV pairs from a peer and appends them
+// to the local shuffle file.
 func (s *server) handleShuffleRecv(w http.ResponseWriter, r *http.Request) {
 	var batch []KeyValue
 	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
@@ -136,14 +229,13 @@ func (s *server) handleShuffleRecv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.state.mu.Lock()
-	if s.state.intermediate == nil {
-		s.state.intermediate = make(map[string][]string)
-	}
-	for _, kv := range batch {
-		s.state.intermediate[kv.Key] = append(s.state.intermediate[kv.Key], kv.Value)
-	}
+	err := appendKVLines(s.shuffleFile(), batch)
 	s.state.mu.Unlock()
 
+	if err != nil {
+		http.Error(w, "write shuffle data: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -154,15 +246,16 @@ func (s *server) handleShuffle(w http.ResponseWriter, _ *http.Request) {
 	s.state.mu.Lock()
 	peers := s.state.peers
 	id := s.state.workerID
-	// Take ownership of the local map output and replace s.state.intermediate
-	// with a fresh map so that concurrent /shuffle/recv calls write into the new
-	// map without racing against our iteration below.
-	localMap := s.state.intermediate
-	s.state.intermediate = make(map[string][]string)
 	s.state.mu.Unlock()
 
 	if len(peers) == 0 {
 		http.Error(w, "no peers: run map phase first", http.StatusBadRequest)
+		return
+	}
+
+	localMap, err := readKVLines(s.mapFile())
+	if err != nil {
+		http.Error(w, "read map output: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -180,7 +273,7 @@ func (s *server) handleShuffle(w http.ResponseWriter, _ *http.Request) {
 	errs := make([]error, n)
 	for i, peer := range peers {
 		if i == id {
-			continue // self-destined keys are merged below
+			continue // self-destined keys are written below
 		}
 		if len(buckets[i]) == 0 {
 			continue
@@ -200,12 +293,17 @@ func (s *server) handleShuffle(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
-	// Merge self-destined keys into the received-data map.
+	// Write self-destined keys to the shuffle file and delete the map file.
 	s.state.mu.Lock()
-	for _, kv := range buckets[id] {
-		s.state.intermediate[kv.Key] = append(s.state.intermediate[kv.Key], kv.Value)
+	if len(buckets[id]) > 0 {
+		err = appendKVLines(s.shuffleFile(), buckets[id])
 	}
 	s.state.mu.Unlock()
+	if err != nil {
+		http.Error(w, "write self shuffle data: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = os.Remove(s.mapFile())
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -230,11 +328,25 @@ func sendBatch(peer string, batch []KeyValue) error {
 }
 
 func (s *server) handleReduce(w http.ResponseWriter, _ *http.Request) {
-	s.state.mu.Lock()
-	intermediate := s.state.intermediate
-	s.state.mu.Unlock()
+	// Read from the shuffle-received file (normal flow) and also from the
+	// map-output file if it still exists (e.g. when shuffle was skipped in tests).
+	intermediate, err := readKVLines(s.shuffleFile())
+	if err != nil {
+		http.Error(w, "read shuffle data: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	mapOut, err := readKVLines(s.mapFile())
+	if err != nil {
+		http.Error(w, "read map output: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for k, vals := range mapOut {
+		intermediate[k] = append(intermediate[k], vals...)
+	}
 
 	output := runReduce(intermediate, s.reduceFn)
+	_ = os.Remove(s.shuffleFile())
+	_ = os.Remove(s.mapFile())
 
 	s.state.mu.Lock()
 	s.state.output = output

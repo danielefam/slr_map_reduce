@@ -1,0 +1,40 @@
+title MapReduce Pipeline
+
+note over Orchestrator: Split input into ≤64 MB chunks\n(split on newline boundaries)
+
+Orchestrator->W0: POST /data  (chunk 0)
+Orchestrator->W1: POST /data  (chunk 1)
+Orchestrator->Wn: POST /data  (chunk N-1)
+
+Orchestrator->W0: POST /map  {"id":0,"peers":[...]}
+Orchestrator->W1: POST /map  {"id":1,"peers":[...]}
+Orchestrator->Wn: POST /map  {"id":N-1,"peers":[...]}
+W0-->Orchestrator: 200
+W1-->Orchestrator: 200
+Wn-->Orchestrator: 200
+
+Orchestrator->W0: POST /shuffle
+Orchestrator->W1: POST /shuffle
+Orchestrator->Wn: POST /shuffle
+note over W0,Wn: Workers push KV batches peer-to-peer\nusing FNV-32a(key) % N to pick the target
+W0->W1: POST /shuffle/recv
+W1->W0: POST /shuffle/recv
+W0-->Orchestrator: 200
+W1-->Orchestrator: 200
+Wn-->Orchestrator: 200
+
+Orchestrator->W0: POST /reduce
+Orchestrator->W1: POST /reduce
+Orchestrator->Wn: POST /reduce
+W0-->Orchestrator: 200
+W1-->Orchestrator: 200
+Wn-->Orchestrator: 200
+
+Orchestrator->W0: GET /result
+Orchestrator->W1: GET /result
+Orchestrator->Wn: GET /result
+W0-->Orchestrator: key-values
+W1-->Orchestrator: key-values
+Wn-->Orchestrator: key-values
+
+note over Orchestrator: Merge counts, sort, write output file

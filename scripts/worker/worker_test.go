@@ -9,12 +9,14 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // newTestServer spins up an isolated in-process worker server.
-func newTestServer() *httptest.Server {
-	return httptest.NewServer(newServer(wordCountMap, wordCountReduce).handler())
+func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(newServer(wordCountMap, wordCountReduce, t.TempDir()).handler())
 }
 
 // mustPost posts body to url and fails the test if the response is not 200.
@@ -64,7 +66,7 @@ func getResult(t *testing.T, baseURL string) map[string]int {
 }
 
 func TestHealth(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/health")
@@ -78,7 +80,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestHandleData(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello world\n"))
@@ -86,7 +88,7 @@ func TestHandleData(t *testing.T) {
 
 // TestSingleWorkerPipeline runs the full map→shuffle→reduce→result cycle on one worker.
 func TestSingleWorkerPipeline(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	input := "hello world\nhello go\nworld cup\n"
@@ -118,7 +120,7 @@ func TestMultiWorkerPipeline(t *testing.T) {
 	servers := make([]*httptest.Server, n)
 	peers := make([]string, n)
 	for i := range n {
-		servers[i] = httptest.NewServer(newServer(wordCountMap, wordCountReduce).handler())
+		servers[i] = httptest.NewServer(newServer(wordCountMap, wordCountReduce, t.TempDir()).handler())
 		defer servers[i].Close()
 		peers[i] = strings.TrimPrefix(servers[i].URL, "http://")
 	}
@@ -176,7 +178,7 @@ func TestMultiWorkerPipeline(t *testing.T) {
 }
 
 func TestShuffleRecvMerges(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
@@ -201,7 +203,7 @@ func TestShuffleRecvMerges(t *testing.T) {
 }
 
 func TestDataResetsState(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
@@ -230,7 +232,7 @@ func TestDataResetsState(t *testing.T) {
 }
 
 func TestHandleShuffleNoMapPhase(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	resp, err := http.Post(ts.URL+"/shuffle", "application/octet-stream", bytes.NewReader(nil))
@@ -243,9 +245,188 @@ func TestHandleShuffleNoMapPhase(t *testing.T) {
 	}
 }
 
+// TestConcurrentShufflePipeline mirrors the production broadcastPost behaviour by
+// firing all /shuffle requests concurrently and verifying the merged word counts.
+func TestConcurrentShufflePipeline(t *testing.T) {
+	const n = 4
+	servers := make([]*httptest.Server, n)
+	peers := make([]string, n)
+	for i := range n {
+		servers[i] = httptest.NewServer(newServer(wordCountMap, wordCountReduce, t.TempDir()).handler())
+		defer servers[i].Close()
+		peers[i] = strings.TrimPrefix(servers[i].URL, "http://")
+	}
+
+	chunks := []string{
+		"the quick brown fox\n",
+		"the lazy dog\n",
+		"quick brown cat\n",
+		"fox and dog\n",
+	}
+	for i, ts := range servers {
+		mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(chunks[i]))
+	}
+
+	for i, ts := range servers {
+		req, _ := json.Marshal(mapRequest{ID: i, Peers: peers})
+		mustPost(t, ts.URL+"/map", "application/json", req)
+	}
+
+	// All shuffles run concurrently, just like the real orchestrator's broadcastPost.
+	var shuffleWg sync.WaitGroup
+	for _, ts := range servers {
+		shuffleWg.Add(1)
+		go func(s *httptest.Server) {
+			defer shuffleWg.Done()
+			mustPost(t, s.URL+"/shuffle", "application/octet-stream", nil)
+		}(ts)
+	}
+	shuffleWg.Wait()
+
+	var reduceWg sync.WaitGroup
+	for _, ts := range servers {
+		reduceWg.Add(1)
+		go func(s *httptest.Server) {
+			defer reduceWg.Done()
+			mustPost(t, s.URL+"/reduce", "application/octet-stream", nil)
+		}(ts)
+	}
+	reduceWg.Wait()
+
+	merged := make(map[string]int)
+	for _, ts := range servers {
+		for word, count := range getResult(t, ts.URL) {
+			merged[word] += count
+		}
+	}
+
+	// Tokens from: "the quick brown fox\nthe lazy dog\nquick brown cat\nfox and dog\n"
+	want := map[string]int{
+		"the":   2,
+		"quick": 2,
+		"brown": 2,
+		"fox":   2,
+		"lazy":  1,
+		"dog":   2,
+		"cat":   1,
+		"and":   1,
+	}
+	for word, count := range want {
+		if merged[word] != count {
+			t.Errorf("word %q: want %d, got %d", word, count, merged[word])
+		}
+	}
+	if len(merged) != len(want) {
+		t.Errorf("merged has %d words, want %d: %v", len(merged), len(want), merged)
+	}
+}
+
+// TestWorkersReceiveEmptyData verifies that workers with no input (empty chunk) don't
+// produce spurious output and don't break the shuffle/reduce cycle.
+func TestWorkersReceiveEmptyData(t *testing.T) {
+	const n = 3
+	servers := make([]*httptest.Server, n)
+	peers := make([]string, n)
+	for i := range n {
+		servers[i] = httptest.NewServer(newServer(wordCountMap, wordCountReduce, t.TempDir()).handler())
+		defer servers[i].Close()
+		peers[i] = strings.TrimPrefix(servers[i].URL, "http://")
+	}
+
+	// Only the first worker receives data; the others get an empty payload.
+	mustPost(t, servers[0].URL+"/data", "application/octet-stream", []byte("hello world\nhello\n"))
+	mustPost(t, servers[1].URL+"/data", "application/octet-stream", []byte{})
+	mustPost(t, servers[2].URL+"/data", "application/octet-stream", []byte{})
+
+	for i, ts := range servers {
+		req, _ := json.Marshal(mapRequest{ID: i, Peers: peers})
+		mustPost(t, ts.URL+"/map", "application/json", req)
+	}
+
+	var wg sync.WaitGroup
+	for _, ts := range servers {
+		wg.Add(1)
+		go func(s *httptest.Server) {
+			defer wg.Done()
+			mustPost(t, s.URL+"/shuffle", "application/octet-stream", nil)
+		}(ts)
+	}
+	wg.Wait()
+
+	for _, ts := range servers {
+		mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	}
+
+	merged := make(map[string]int)
+	for _, ts := range servers {
+		for word, count := range getResult(t, ts.URL) {
+			merged[word] += count
+		}
+	}
+
+	want := map[string]int{"hello": 2, "world": 1}
+	for word, count := range want {
+		if merged[word] != count {
+			t.Errorf("word %q: want %d, got %d", word, count, merged[word])
+		}
+	}
+	if len(merged) != len(want) {
+		t.Errorf("unexpected words in result: %v", merged)
+	}
+}
+
+// TestUnicodeInput verifies that non-ASCII letters (accented characters) are treated
+// as part of a word token, matching unicode.IsLetter semantics in wordCountMap.
+func TestUnicodeInput(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	input := "café naïve résumé\nfoo café bar\n"
+	peer := strings.TrimPrefix(ts.URL, "http://")
+	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(input))
+	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
+	mustPost(t, ts.URL+"/map", "application/json", mapReq)
+	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
+	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+
+	got := getResult(t, ts.URL)
+	for word, wantCount := range map[string]int{"café": 2, "naïve": 1, "résumé": 1, "foo": 1, "bar": 1} {
+		if got[word] != wantCount {
+			t.Errorf("%q: want %d, got %d", word, wantCount, got[word])
+		}
+	}
+}
+
+// TestHighFrequencyWord checks that a single word repeated many times is counted correctly.
+func TestHighFrequencyWord(t *testing.T) {
+	const count = 10_000
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	var sb strings.Builder
+	for range count {
+		fmt.Fprintln(&sb, "word")
+	}
+
+	peer := strings.TrimPrefix(ts.URL, "http://")
+	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(sb.String()))
+	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
+	mustPost(t, ts.URL+"/map", "application/json", mapReq)
+	mustPost(t, ts.URL+"/shuffle", "application/octet-stream", nil)
+	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+
+	got := getResult(t, ts.URL)
+	if got["word"] != count {
+		t.Errorf("word: want %d, got %d", count, got["word"])
+	}
+	if len(got) != 1 {
+		t.Errorf("want exactly 1 distinct word, got %d: %v", len(got), got)
+	}
+}
+
 // TestLargeInput verifies the pipeline handles more than a trivial amount of data.
 func TestLargeInput(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	var sb strings.Builder
