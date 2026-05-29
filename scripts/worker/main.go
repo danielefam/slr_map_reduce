@@ -12,7 +12,7 @@
 //
 // Usage:
 //
-//	worker -port 9090 -plugin wordcount
+//	worker -port 9090
 package main
 
 import (
@@ -45,51 +45,41 @@ type state struct {
 	output []KeyValue
 }
 
-var (
-	globalState = &state{}
-	mapFn       MapFunc    = wordCountMap
-	reduceFn    ReduceFunc = wordCountReduce
-)
+// server wraps per-instance state and the map/reduce functions so that multiple
+// independent workers can run in the same process (useful for testing).
+type server struct {
+	state    *state
+	mapFn    MapFunc
+	reduceFn ReduceFunc
+}
+
+func newServer(mapFn MapFunc, reduceFn ReduceFunc) *server {
+	return &server{state: &state{}, mapFn: mapFn, reduceFn: reduceFn}
+}
+
+// handler returns an http.Handler with all worker routes registered.
+func (s *server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /data", s.handleData)
+	mux.HandleFunc("POST /map", s.handleMap)
+	mux.HandleFunc("POST /shuffle/recv", s.handleShuffleRecv)
+	mux.HandleFunc("POST /shuffle", s.handleShuffle)
+	mux.HandleFunc("POST /reduce", s.handleReduce)
+	mux.HandleFunc("GET /result", s.handleResult)
+	return mux
+}
 
 func main() {
 	port := flag.String("port", "9090", "port to listen on")
 	flag.Parse()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("POST /data", handleData)
-	mux.HandleFunc("POST /map", handleMap)
-	mux.HandleFunc("POST /shuffle/recv", handleShuffleRecv)
-	mux.HandleFunc("POST /shuffle", handleShuffle)
-	mux.HandleFunc("POST /reduce", handleReduce)
-	mux.HandleFunc("GET /result", handleResult)
-
+	srv := newServer(wordCountMap, wordCountReduce)
 	addr := ":" + *port
 	log.Printf("worker listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, srv.handler()); err != nil {
 		log.Fatal(err)
 	}
-}
-
-// handleHealth returns 200 OK when the server is ready.
-func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
-}
-
-// handleData stores the raw text data chunk sent by the client.
-func handleData(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read error: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	globalState.mu.Lock()
-	globalState.inputData = string(body)
-	globalState.intermediate = nil
-	globalState.output = nil
-	globalState.mu.Unlock()
-	w.WriteHeader(http.StatusOK)
 }
 
 // mapRequest is the JSON body sent by the client to start the map phase.
@@ -98,21 +88,39 @@ type mapRequest struct {
 	Peers []string `json:"peers"`
 }
 
-// handleMap starts the map phase synchronously and returns when done.
-func handleMap(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.state.mu.Lock()
+	s.state.inputData = string(body)
+	s.state.intermediate = nil
+	s.state.output = nil
+	s.state.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	var req mapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	globalState.mu.Lock()
-	data := globalState.inputData
-	globalState.workerID = req.ID
-	globalState.peers = req.Peers
-	intermediate := runMap(data, mapFn)
-	globalState.intermediate = intermediate
-	globalState.mu.Unlock()
+	s.state.mu.Lock()
+	data := s.state.inputData
+	s.state.workerID = req.ID
+	s.state.peers = req.Peers
+	intermediate := runMap(data, s.mapFn)
+	s.state.intermediate = intermediate
+	s.state.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"keys":%d}`, len(intermediate))
@@ -120,21 +128,21 @@ func handleMap(w http.ResponseWriter, r *http.Request) {
 
 // handleShuffleRecv accepts a batch of KV pairs from a peer and merges them
 // into the local intermediate store.
-func handleShuffleRecv(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleShuffleRecv(w http.ResponseWriter, r *http.Request) {
 	var batch []KeyValue
 	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	globalState.mu.Lock()
-	if globalState.intermediate == nil {
-		globalState.intermediate = make(map[string][]string)
+	s.state.mu.Lock()
+	if s.state.intermediate == nil {
+		s.state.intermediate = make(map[string][]string)
 	}
 	for _, kv := range batch {
-		globalState.intermediate[kv.Key] = append(globalState.intermediate[kv.Key], kv.Value)
+		s.state.intermediate[kv.Key] = append(s.state.intermediate[kv.Key], kv.Value)
 	}
-	globalState.mu.Unlock()
+	s.state.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -142,16 +150,16 @@ func handleShuffleRecv(w http.ResponseWriter, r *http.Request) {
 // handleShuffle drives the shuffle step: for each intermediate key, compute the
 // target node via fnv32(key)%N, batch the KVs, and POST them to the target's
 // /shuffle/recv endpoint. Blocks until all sends are acknowledged.
-func handleShuffle(w http.ResponseWriter, r *http.Request) {
-	globalState.mu.Lock()
-	peers := globalState.peers
-	id := globalState.workerID
-	// Take ownership of the local map output and replace globalState.intermediate
+func (s *server) handleShuffle(w http.ResponseWriter, _ *http.Request) {
+	s.state.mu.Lock()
+	peers := s.state.peers
+	id := s.state.workerID
+	// Take ownership of the local map output and replace s.state.intermediate
 	// with a fresh map so that concurrent /shuffle/recv calls write into the new
 	// map without racing against our iteration below.
-	localMap := globalState.intermediate
-	globalState.intermediate = make(map[string][]string)
-	globalState.mu.Unlock()
+	localMap := s.state.intermediate
+	s.state.intermediate = make(map[string][]string)
+	s.state.mu.Unlock()
 
 	if len(peers) == 0 {
 		http.Error(w, "no peers: run map phase first", http.StatusBadRequest)
@@ -159,7 +167,6 @@ func handleShuffle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n := len(peers)
-	// buckets[i] = KV pairs destined for peers[i]
 	buckets := make([][]KeyValue, n)
 	for key, values := range localMap {
 		target := targetNode(key, n)
@@ -193,12 +200,12 @@ func handleShuffle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Merge self-destined keys from local map output into the received-data map.
-	globalState.mu.Lock()
+	// Merge self-destined keys into the received-data map.
+	s.state.mu.Lock()
 	for _, kv := range buckets[id] {
-		globalState.intermediate[kv.Key] = append(globalState.intermediate[kv.Key], kv.Value)
+		s.state.intermediate[kv.Key] = append(s.state.intermediate[kv.Key], kv.Value)
 	}
-	globalState.mu.Unlock()
+	s.state.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -222,17 +229,16 @@ func sendBatch(peer string, batch []KeyValue) error {
 	return nil
 }
 
-// handleReduce runs the reduce phase synchronously on the locally held intermediate data.
-func handleReduce(w http.ResponseWriter, _ *http.Request) {
-	globalState.mu.Lock()
-	intermediate := globalState.intermediate
-	globalState.mu.Unlock()
+func (s *server) handleReduce(w http.ResponseWriter, _ *http.Request) {
+	s.state.mu.Lock()
+	intermediate := s.state.intermediate
+	s.state.mu.Unlock()
 
-	output := runReduce(intermediate, reduceFn)
+	output := runReduce(intermediate, s.reduceFn)
 
-	globalState.mu.Lock()
-	globalState.output = output
-	globalState.mu.Unlock()
+	s.state.mu.Lock()
+	s.state.output = output
+	s.state.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"keys":%d}`, len(output))
@@ -240,10 +246,10 @@ func handleReduce(w http.ResponseWriter, _ *http.Request) {
 
 // handleResult returns the reduce output as newline-delimited "key\tvalue" pairs,
 // sorted by key.
-func handleResult(w http.ResponseWriter, _ *http.Request) {
-	globalState.mu.Lock()
-	output := globalState.output
-	globalState.mu.Unlock()
+func (s *server) handleResult(w http.ResponseWriter, _ *http.Request) {
+	s.state.mu.Lock()
+	output := s.state.output
+	s.state.mu.Unlock()
 
 	sort.Slice(output, func(i, j int) bool { return output[i].Key < output[j].Key })
 
