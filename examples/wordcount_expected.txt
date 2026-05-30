@@ -1,0 +1,7 @@
+blue	2
+fox	2
+green	3
+hare	1
+red	3
+swift	1
+turtle	1
