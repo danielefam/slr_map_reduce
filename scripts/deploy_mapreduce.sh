@@ -109,13 +109,43 @@ load_manifest "$manifest_file"
 
 make -C "$REPO_ROOT" clean all >/dev/null
 
+prepare_bundle() {
+    local local_bundle_dir=$1
+    rm -rf "$local_bundle_dir"
+    mkdir -p "$local_bundle_dir/bin"
+    cp "$REPO_ROOT/bin/mr_worker" "$local_bundle_dir/bin/mr_worker"
+}
+
 bundle_dir="$RUN_DIR/$remote_dirname"
-rm -rf "$bundle_dir"
-mkdir -p "$bundle_dir/bin"
-cp "$REPO_ROOT/bin/mr_worker" "$bundle_dir/bin/mr_worker"
+prepare_bundle "$bundle_dir"
 
 staging_host=$(head -n 1 "$HOSTS_FILE")
 launch_status_file="$RUN_DIR/mr_launch_status.tsv"
+staging_scp_err_file="$RUN_DIR/.mr_staging_scp.err"
+fallback_scp_err_file="$RUN_DIR/.mr_fallback_scp.err"
+
+if ! scp -r "$bundle_dir" "$staging_host:~/" >/dev/null 2>"$staging_scp_err_file"; then
+    echo "Staging upload to default remote dirname failed; retrying with a unique dirname..."
+    fallback_remote_dirname="${remote_dirname}-$(timestamp_ms)"
+    fallback_bundle_dir="$RUN_DIR/$fallback_remote_dirname"
+    prepare_bundle "$fallback_bundle_dir"
+    if ! scp -r "$fallback_bundle_dir" "$staging_host:~/" >/dev/null 2>"$fallback_scp_err_file"; then
+        echo "Failed to upload worker bundle to staging host $staging_host" >&2
+        if [[ -s "$staging_scp_err_file" ]]; then
+            cat "$staging_scp_err_file" >&2
+        fi
+        if [[ -s "$fallback_scp_err_file" ]]; then
+            cat "$fallback_scp_err_file" >&2
+        fi
+        exit 1
+    fi
+    remote_dirname=$fallback_remote_dirname
+    bundle_dir=$fallback_bundle_dir
+    echo "Staging upload fallback active: using remote dirname $remote_dirname"
+fi
+
+rm -f "$staging_scp_err_file" "$fallback_scp_err_file"
+
 worker_scratch_root="${scratch_root_base%/}/$remote_dirname"
 
 write_manifest "$manifest_file" \
@@ -129,8 +159,6 @@ write_manifest "$manifest_file" \
     REMOTE_DIRNAME "$remote_dirname" \
     LAUNCH_STATUS_FILE "$launch_status_file" \
     WORKER_SCRATCH_ROOT "$worker_scratch_root"
-
-scp -r "$bundle_dir" "$staging_host:~/" >/dev/null
 
 ensure_remote_bundle() {
     local host=$1

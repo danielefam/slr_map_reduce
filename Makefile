@@ -16,10 +16,13 @@ MR_REMOTE_DIRNAME ?= slr_map_reduce_mr_bundle
 MR_INPUT ?= README.md
 MR_CHUNK_LINES ?= 200
 MR_REDUCERS ?=
+REMEDIATE_ARGS ?=
+STATUS_RETRIES ?= 2
+STATUS_RETRY_DELAY ?= 3
 
 TARGETS := $(BIN_DIR)/load_server $(BIN_DIR)/load_client $(BIN_DIR)/mr_worker $(BIN_DIR)/mr_coordinator
 
-.PHONY: all clean directories smoke select-hosts select-port deploy status stop clean-remote clean-remote-all redeploy run-client experiment deploy-mr clean-remote-mr run-mr
+.PHONY: all clean directories smoke select-hosts select-port deploy status status-report status-strict remediate-status remediate-status-dry stop clean-remote clean-remote-all redeploy run-client experiment deploy-mr clean-remote-mr run-mr
 
 all: directories $(TARGETS)
 
@@ -51,7 +54,19 @@ deploy: all
 	bash scripts/deploy.sh --count $(HOST_COUNT) --manifest $(MANIFEST) --start-port $(PORT_START) --end-port $(PORT_END) --remote-dirname $(REMOTE_DIRNAME)
 
 status:
-	bash scripts/status.sh --manifest $(MANIFEST)
+	bash scripts/status.sh --manifest $(MANIFEST) --report-only
+
+status-strict:
+	bash scripts/status.sh --manifest $(MANIFEST) --retries $(STATUS_RETRIES) --retry-delay $(STATUS_RETRY_DELAY)
+
+status-report:
+	bash scripts/status.sh --manifest $(MANIFEST) --report-only
+
+remediate-status:
+	bash scripts/remediate_status.sh --manifest $(MANIFEST) --host-count $(HOST_COUNT) $(REMEDIATE_ARGS)
+
+remediate-status-dry:
+	bash scripts/remediate_status.sh --manifest $(MANIFEST) --host-count $(HOST_COUNT) --dry-run $(REMEDIATE_ARGS)
 
 stop:
 	bash scripts/stop.sh --manifest $(MANIFEST)

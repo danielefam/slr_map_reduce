@@ -64,6 +64,8 @@ turtle	1
 make deploy-mr HOST_COUNT=3
 ```
 
+`HOST_COUNT=3` is only a small demo value for quick tests. Use any count you want (up to the available hosts), or run `make deploy-mr` to use the default.
+
 Useful overrides:
 
 ```bash
@@ -99,13 +101,77 @@ This stops the current MapReduce workers, removes the shared deployment bundle, 
 - `scripts/select_port.sh`: uses one SSH probe per host to collect currently listening TCP ports, then selects the first common free port in the configured range.
 - `scripts/deploy.sh`: builds locally, copies the server bundle once through the first selected host, then launches the server on each selected host.
 - `scripts/deploy_mapreduce.sh`: builds locally, copies the MapReduce worker bundle once, then launches one worker on each selected host.
-- `scripts/status.sh`: checks whether the distributed servers are running and listening.
+- `scripts/status.sh`: checks whether the distributed servers are running and listening, repairs stale/missing pid files when possible, and reports unhealthy anomalies (for example listening-without-pid).
 - `scripts/stop.sh`: stops the distributed servers.
 - `scripts/clean_remote.sh`: stops the distributed servers for the current manifest and removes the current shared remote bundle, logs, and pid files.
 - `scripts/clean_mapreduce.sh`: stops the distributed MapReduce workers, removes the current shared remote bundle, and removes worker-local scratch data under `/tmp/slr_map_reduce/<deployment>`.
 - `scripts/run_client.sh`: runs the local aggregator client using the stored manifest.
 - `scripts/run_mapreduce.sh`: runs the local coordinator using the stored worker manifest and writes the final word-count output locally.
+- `scripts/run_mapreduce.sh`: runs the local coordinator using the stored worker manifest and writes the final word-count output locally.
+- `scripts/test_mapreduce_local.sh`: runs a complete end-to-end MapReduce word-count test on localhost with one worker and one coordinator, validating the protocol and output.
 - `scripts/smoke_local.sh`: local one-host smoke test.
+
+Status commands:
+
+```bash
+make status
+```
+
+Informational health report for day-to-day use. It never fails the Make target.
+
+```bash
+make status-strict
+```
+
+Strict health check. `stopped` is informational, but anomalies such as `listening-without-pid` still return non-zero.
+
+`make status-strict` now retries automatically for transient issues (for example DNS hiccups).
+Default retry policy:
+- `STATUS_RETRIES=2`
+- `STATUS_RETRY_DELAY=3` seconds
+
+Override example:
+
+```bash
+make status-strict STATUS_RETRIES=4 STATUS_RETRY_DELAY=5
+```
+
+`make status-report` is an alias of `make status`.
+
+Automatic remediation command:
+
+```bash
+make remediate-status HOST_COUNT=3
+```
+
+Dry-run version (no remote side effects):
+
+```bash
+make remediate-status-dry HOST_COUNT=3
+```
+
+This command runs a robust recovery loop for the legacy load-server flow:
+1. status report
+2. remote cleanup
+3. host reselection with alternative nodes
+4. common-port reselection
+5. redeploy and recheck
+
+It writes logs to `run/remediation.log` and `run/remediation_status_report.txt`.
+
+Useful direct options:
+
+```bash
+bash scripts/remediate_status.sh --manifest run/manifest.env --host-count 3 --retries 3 --minimum-host-count 2
+```
+
+Pass extra options from Make via `REMEDIATE_ARGS`, for example:
+
+```bash
+make remediate-status HOST_COUNT=3 REMEDIATE_ARGS="--retries 3 --minimum-host-count 2 --clean-all"
+```
+
+Use `--clean-all` if you also want MapReduce cleanup during each retry cycle.
 - `docs/mapreduce_v1.md`: protocol, architecture, word-count example, and the first space-time diagram.
 
 ## Prerequisites
@@ -128,6 +194,22 @@ This validates the C binaries and the end-to-end protocol on localhost.
 ```bash
 make smoke
 ```
+
+## Local MapReduce Test
+
+To test the MapReduce word-count implementation end-to-end on localhost without needing remote worker deployment:
+
+```bash
+bash scripts/test_mapreduce_local.sh
+```
+
+This script:
+1. Starts a single `mr_worker` on port 20123 on localhost
+2. Runs the `mr_coordinator` with the sample input file
+3. Executes the complete map and reduce phases locally
+4. Verifies the output matches the expected word count result
+
+This is useful for validating the MapReduce protocol and word-count logic before attempting distributed deployment across remote hosts.
 
 ## Legacy Load-Monitor Workflow (Deprecated)
 
