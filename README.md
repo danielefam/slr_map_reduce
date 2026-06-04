@@ -34,15 +34,62 @@ See [docs/ADAPTIVE_EXECUTION.md](docs/ADAPTIVE_EXECUTION.md) for how mapper/redu
 See [docs/EXIT_CODES.md](docs/EXIT_CODES.md) for a stable, machine-readable failure taxonomy.
 See [docs/NEXT_STEPS_BLUEPRINT.md](docs/NEXT_STEPS_BLUEPRINT.md) for the implementation roadmap (bootstrap protocol v2, robust reduce remote-read, and Common Crawl integration).
 
-## Word Count Example
+## MapReduce Workflow
 
-Use the sample input file [examples/wordcount_input.txt](/home/daniele/Desktop/university/slr_map_reduce/examples/wordcount_input.txt) to test the MapReduce path. The expected result is in [examples/wordcount_expected.txt](/home/daniele/Desktop/university/slr_map_reduce/examples/wordcount_expected.txt).
+### 1) Build Binaries
 
-Example local run after workers are available:
+```bash
+make
+```
+
+### 2) Create Or Refresh The Available Host List
+
+This is the explicit host discovery step using the Telecom Paris endpoint.
+
+```bash
+make select-hosts HOST_COUNT=100
+```
+
+This writes canonical reachable hosts (for example `tp-1a201-05.enst.fr`) to `run/hosts.txt`.
+
+For quick tests you can use a smaller host count, for example:
+
+```bash
+make select-hosts HOST_COUNT=3
+```
+
+### 3) Deploy MapReduce Workers
+
+Option A: automatic selection inside deploy (default behavior):
+
+```bash
+make deploy-mr HOST_COUNT=3
+```
+
+Option B: deploy from the host list you already generated:
+
+```bash
+bash scripts/deploy_mapreduce.sh --hosts run/hosts.txt --manifest run/mr_manifest.env
+```
+
+Useful overrides:
+
+```bash
+make deploy-mr HOST_COUNT=3 MR_MANIFEST=run/mr_manifest.env MR_REMOTE_DIRNAME=my_mr_bundle
+```
+
+The deploy script starts one `mr_worker` per host and stores its local scratch root in the manifest so cleanup can remove job data safely. It first uploads the worker bundle through the staging host, then falls back to a per-host upload if a selected node cannot see the shared bundle.
+
+### 4) Run A Word Count Job
+
+Use the sample input file [examples/wordcount_input.txt](examples/wordcount_input.txt). The expected result is in [examples/wordcount_expected.txt](examples/wordcount_expected.txt).
 
 ```bash
 make run-mr MR_INPUT=examples/wordcount_input.txt MR_OUTPUT=run/mr_wordcount.txt MR_CHUNK_LINES=2
 ```
+
+The coordinator runs locally, reads the worker host list from the manifest, assigns map work, waits for all maps to finish, then starts the reduce phase.
+By default it uses only the effective mapper/reducer count needed by the input splits. To cap reducers explicitly, pass `MR_REDUCERS=N`.
 
 Expected output:
 
@@ -56,34 +103,7 @@ swift	1
 turtle	1
 ```
 
-## MapReduce Workflow
-
-### Deploy MapReduce Workers
-
-```bash
-make deploy-mr HOST_COUNT=3
-```
-
-`HOST_COUNT=3` is only a small demo value for quick tests. Use any count you want (up to the available hosts), or run `make deploy-mr` to use the default.
-
-Useful overrides:
-
-```bash
-make deploy-mr HOST_COUNT=3 MR_MANIFEST=run/mr_manifest.env MR_REMOTE_DIRNAME=my_mr_bundle
-```
-
-The deploy script starts one `mr_worker` per host and stores its local scratch root in the manifest so cleanup can remove job data safely. It first uploads the worker bundle through the staging host, then falls back to a per-host upload if a selected node cannot see the shared bundle.
-
-### Run A Word Count Job
-
-```bash
-make run-mr MR_INPUT=examples/wordcount_input.txt MR_OUTPUT=run/mr_wordcount.txt MR_CHUNK_LINES=2
-```
-
-The coordinator runs locally, reads the worker host list from the manifest, assigns map work, waits for all maps to finish, then starts the reduce phase.
-By default it uses only the effective mapper/reducer count needed by the input splits. To cap reducers explicitly, pass `MR_REDUCERS=N`.
-
-### Clean MapReduce Deployment State
+### 5) Clean MapReduce Deployment State
 
 ```bash
 make clean-remote-mr
@@ -106,7 +126,6 @@ This stops the current MapReduce workers, removes the shared deployment bundle, 
 - `scripts/clean_remote.sh`: stops the distributed servers for the current manifest and removes the current shared remote bundle, logs, and pid files.
 - `scripts/clean_mapreduce.sh`: stops the distributed MapReduce workers, removes the current shared remote bundle, and removes worker-local scratch data under `/tmp/slr_map_reduce/<deployment>`.
 - `scripts/run_client.sh`: runs the local aggregator client using the stored manifest.
-- `scripts/run_mapreduce.sh`: runs the local coordinator using the stored worker manifest and writes the final word-count output locally.
 - `scripts/run_mapreduce.sh`: runs the local coordinator using the stored worker manifest and writes the final word-count output locally.
 - `scripts/test_mapreduce_local.sh`: runs a complete end-to-end MapReduce word-count test on localhost with one worker and one coordinator, validating the protocol and output.
 - `scripts/smoke_local.sh`: local one-host smoke test.
@@ -217,30 +236,59 @@ Attention: this section is deprecated for current project work.
 Use the MapReduce workflow above for deployment and experiments.
 The legacy targets are kept only for backward compatibility with the old assignment.
 
-The sections below describe the original distributed load-average monitor flow that remains in the repository as a separate assignment.
+The section below describes the original distributed load-average monitor flow in a strict operational order.
 
-## Full Deployment Flow
+### Legacy Quickstart (Ordered)
 
-1. Select 100 alive hosts from `https://tp.telecom-paris.fr/ajax.php` and write them as canonical names such as `tp-1a201-05.enst.fr`.
-2. Discover one common free port across those hosts.
-3. Build the server and client locally.
-4. Copy the server bundle once to the first selected host with `scp`. Because the remote home is NFS-shared, every selected machine can see the same bundle.
-5. Issue one `ssh` command per selected host to start the server.
-6. Run the client locally against the generated host list and selected port.
+1. Build binaries:
 
-To create the canonical 100-host file explicitly:
+```bash
+make
+```
+
+2. Create or refresh the available host list:
 
 ```bash
 make select-hosts HOST_COUNT=100
 ```
 
-The default deployment command is:
+This writes canonical reachable hosts (for example `tp-1a201-05.enst.fr`) to `run/hosts.txt`.
+
+3. Deploy the legacy load servers (host selection + common-port discovery + remote launch):
 
 ```bash
-make deploy
+make deploy HOST_COUNT=100
 ```
 
-Useful overrides:
+4. Check deployment status:
+
+```bash
+make status
+```
+
+5. Run the client aggregator:
+
+```bash
+make run-client
+```
+
+The client exits with status `0` only when every host replies successfully. If some hosts fail, it still prints the average over successful replies and exits non-zero.
+
+6. Stop servers when done:
+
+```bash
+make stop
+```
+
+7. Remove remote deployment state when needed:
+
+```bash
+make clean-remote
+```
+
+### Legacy Operations And Overrides
+
+Deploy with explicit port range and remote bundle name:
 
 ```bash
 make deploy HOST_COUNT=100 PORT_START=21000 PORT_END=21099 REMOTE_DIRNAME=my_bundle
@@ -252,45 +300,39 @@ If you already have a hosts file, skip dynamic selection and deploy directly wit
 bash scripts/deploy.sh --hosts run/hosts.txt --manifest run/manifest.env
 ```
 
-When `--hosts` is provided, deployment now continues with the reachable subset of that file as long as at least one host is reachable. The filtered reachable host list is written back through the manifest so `status`, `stop`, and `run-client` operate on the same set.
+When `--hosts` is provided, deployment continues with the reachable subset of that file as long as at least one host is reachable. The filtered reachable host list is written back through the manifest so `status`, `stop`, and `run-client` operate on the same set.
 
-## Check Status
-
-```bash
-make status
-```
-
-## Run the Client
-
-```bash
-make run-client
-```
-
-The client exits with status `0` only when every host replies successfully. If some hosts fail, it still prints the average over successful replies and exits non-zero.
-
-## Stop the Servers
-
-```bash
-make stop
-```
-
-`make stop` is a lightweight shutdown that targets the current manifest hosts and port.
-
-## Clean Remote Deployment State
-
-```bash
-make clean-remote
-```
-
-This stops the current deployment and removes the current remote bundle directory, logs, and pid files. Use it before redeploying updated server binaries when you want to avoid stale remote state.
-
-## Clean and Redeploy
+Clean and redeploy in one command:
 
 ```bash
 make redeploy
 ```
 
-This runs the remote cleanup first, then performs a fresh deploy.
+Automatic remediation loop:
+
+```bash
+make remediate-status HOST_COUNT=3
+```
+
+Dry-run remediation (no remote side effects):
+
+```bash
+make remediate-status-dry HOST_COUNT=3
+```
+
+Direct remediation script example:
+
+```bash
+bash scripts/remediate_status.sh --manifest run/manifest.env --host-count 3 --retries 3 --minimum-host-count 2
+```
+
+Pass extra options via `REMEDIATE_ARGS`, for example:
+
+```bash
+make remediate-status HOST_COUNT=3 REMEDIATE_ARGS="--retries 3 --minimum-host-count 2 --clean-all"
+```
+
+Use `--clean-all` if you also want MapReduce cleanup during each retry cycle.
 
 ## Runtime Files
 

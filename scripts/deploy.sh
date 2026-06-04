@@ -80,6 +80,15 @@ else
     fi
 fi
 
+filtered_candidates_file="$RUN_DIR/hosts-candidates.filtered.txt"
+filter_excluded_hosts "$candidate_hosts_file" "$filtered_candidates_file"
+candidate_hosts_file="$filtered_candidates_file"
+
+if [[ ! -s "$candidate_hosts_file" ]]; then
+    echo "No candidate hosts left after applying exclusion rules (HOST_EXCLUDE_REGEX/HOST_EXCLUDE_FILE)." >&2
+    exit 1
+fi
+
 if (( explicit_hosts )); then
     bash "$SCRIPT_DIR/select_port.sh" \
         --hosts "$candidate_hosts_file" \

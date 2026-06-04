@@ -16,6 +16,7 @@ DEFAULT_API_BASE_URL="https://tp.telecom-paris.fr/ajax.php"
 DEFAULT_REMOTE_DIRNAME="slr_map_reduce_bundle"
 DEFAULT_MR_REMOTE_DIRNAME="slr_map_reduce_mr_bundle"
 DEFAULT_MR_SCRATCH_ROOT="/tmp/slr_map_reduce"
+DEFAULT_HOST_EXCLUDE_FILE="$RUN_DIR/hosts-exclude.txt"
 DEFAULT_PORT_START=20000
 DEFAULT_PORT_END=20099
 DEFAULT_HOST_COUNT=100
@@ -63,6 +64,29 @@ require_commands() {
 list_hosts() {
     local hosts_file=${1:-$DEFAULT_HOSTS_FILE}
     grep -Ev '^[[:space:]]*(#|$)' "$hosts_file"
+}
+
+filter_excluded_hosts() {
+    local input_file=$1
+    local output_file=$2
+    local exclude_regex=${HOST_EXCLUDE_REGEX:-}
+    local exclude_file=${HOST_EXCLUDE_FILE:-$DEFAULT_HOST_EXCLUDE_FILE}
+
+    awk 'NF > 0 {print $0}' "$input_file" > "$output_file"
+
+    if [[ -n "$exclude_regex" ]]; then
+        if ! grep -Eiv "$exclude_regex" "$output_file" > "$output_file.tmp"; then
+            : > "$output_file.tmp"
+        fi
+        mv "$output_file.tmp" "$output_file"
+    fi
+
+    if [[ -f "$exclude_file" ]]; then
+        if ! grep -Fvxf "$exclude_file" "$output_file" > "$output_file.tmp"; then
+            : > "$output_file.tmp"
+        fi
+        mv "$output_file.tmp" "$output_file"
+    fi
 }
 
 write_manifest() {

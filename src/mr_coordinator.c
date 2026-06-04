@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +29,8 @@ struct coordinator_config {
     int port;
     int timeout_ms;
     int reducer_limit;
+    int rpc_retries;
+    int rpc_retry_delay_ms;
 };
 
 struct host_list {
@@ -50,7 +53,7 @@ enum remote_status {
 
 static void print_usage(const char *program_name) {
     fprintf(stderr,
-            "Usage: %s --input FILE --port PORT [--hosts FILE] [--output FILE] [--chunk-lines N] [--reducers N] [--timeout-ms MS] [--job-id ID] [--job-manifest FILE]\n",
+            "Usage: %s --input FILE --port PORT [--hosts FILE] [--output FILE] [--chunk-lines N] [--reducers N] [--timeout-ms MS] [--rpc-retries N] [--rpc-retry-delay-ms MS] [--job-id ID] [--job-manifest FILE]\n",
             program_name);
 }
 
@@ -77,6 +80,8 @@ static bool parse_args(int argc, char **argv, struct coordinator_config *config)
     config->port = -1;
     config->timeout_ms = DEFAULT_IO_TIMEOUT_MS;
     config->reducer_limit = 0;
+    config->rpc_retries = DEFAULT_MR_RPC_RETRIES;
+    config->rpc_retry_delay_ms = DEFAULT_MR_RPC_RETRY_DELAY_MS;
 
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--hosts") == 0) {
@@ -121,6 +126,18 @@ static bool parse_args(int argc, char **argv, struct coordinator_config *config)
                 return false;
             }
             config->reducer_limit = parse_positive_int(argv[++index]);
+        } else if (strcmp(argv[index], "--rpc-retries") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "Missing value after --rpc-retries\n");
+                return false;
+            }
+            config->rpc_retries = parse_positive_int(argv[++index]);
+        } else if (strcmp(argv[index], "--rpc-retry-delay-ms") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "Missing value after --rpc-retry-delay-ms\n");
+                return false;
+            }
+            config->rpc_retry_delay_ms = parse_positive_int(argv[++index]);
         } else if (strcmp(argv[index], "--job-id") == 0) {
             if (index + 1 >= argc) {
                 fprintf(stderr, "Missing value after --job-id\n");
@@ -142,11 +159,29 @@ static bool parse_args(int argc, char **argv, struct coordinator_config *config)
         }
     }
 
-    if (config->input_path == NULL || config->port < 0 || config->chunk_lines < 0 || config->timeout_ms < 0) {
+    if (config->input_path == NULL || config->port < 0 || config->chunk_lines < 0 ||
+        config->timeout_ms < 0 || config->rpc_retries < 0 || config->rpc_retry_delay_ms < 0) {
         fprintf(stderr, "--input and --port are required\n");
         return false;
     }
 
+    return true;
+}
+
+static bool sleep_ms(int delay_ms) {
+    if (delay_ms <= 0) {
+        return true;
+    }
+
+    struct timespec request;
+    request.tv_sec = delay_ms / 1000;
+    request.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
+
+    while (nanosleep(&request, &request) != 0) {
+        if (errno != EINTR) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -493,6 +528,43 @@ static enum remote_status send_command_expect_ok(const char *host,
     return REMOTE_STATUS_OK;
 }
 
+static enum remote_status send_command_expect_ok_with_retry(const char *host,
+                                                            int port,
+                                                            int timeout_ms,
+                                                            int rpc_retries,
+                                                            int rpc_retry_delay_ms,
+                                                            const char *command,
+                                                            const void *payload,
+                                                            size_t payload_size,
+                                                            char *response,
+                                                            size_t response_size) {
+    enum remote_status status = REMOTE_STATUS_IO_FAILED;
+    for (int attempt = 0; attempt <= rpc_retries; ++attempt) {
+        status = send_command_expect_ok(host,
+                                        port,
+                                        timeout_ms,
+                                        command,
+                                        payload,
+                                        payload_size,
+                                        response,
+                                        response_size);
+        if (status == REMOTE_STATUS_OK || status == REMOTE_STATUS_BAD_RESPONSE) {
+            return status;
+        }
+
+        if (attempt < rpc_retries) {
+            fprintf(stderr,
+                    "Retrying command on %s after network error (%d/%d)\n",
+                    host,
+                    attempt + 1,
+                    rpc_retries);
+            (void)sleep_ms(rpc_retry_delay_ms);
+        }
+    }
+
+    return status;
+}
+
 static enum remote_status fetch_data(const char *host,
                                      int port,
                                      int timeout_ms,
@@ -536,6 +608,34 @@ static enum remote_status fetch_data(const char *host,
     *content = buffer;
     *length = expected;
     return REMOTE_STATUS_OK;
+}
+
+static enum remote_status fetch_data_with_retry(const char *host,
+                                                int port,
+                                                int timeout_ms,
+                                                int rpc_retries,
+                                                int rpc_retry_delay_ms,
+                                                const char *command,
+                                                char **content,
+                                                size_t *length) {
+    enum remote_status status = REMOTE_STATUS_IO_FAILED;
+    for (int attempt = 0; attempt <= rpc_retries; ++attempt) {
+        status = fetch_data(host, port, timeout_ms, command, content, length);
+        if (status == REMOTE_STATUS_OK || status == REMOTE_STATUS_BAD_RESPONSE) {
+            return status;
+        }
+
+        if (attempt < rpc_retries) {
+            fprintf(stderr,
+                    "Retrying fetch on %s after network error (%d/%d)\n",
+                    host,
+                    attempt + 1,
+                    rpc_retries);
+            (void)sleep_ms(rpc_retry_delay_ms);
+        }
+    }
+
+    return status;
 }
 
 static int remote_status_to_exit_code(enum remote_status status) {
@@ -664,6 +764,15 @@ static bool collect_result_lines(struct string_list *lines, const char *content)
 }
 
 int main(int argc, char **argv) {
+    struct sigaction ignore_pipe;
+    memset(&ignore_pipe, 0, sizeof(ignore_pipe));
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_pipe, NULL) < 0) {
+        perror("sigaction(SIGPIPE)");
+        return MR_EXIT_SETUP;
+    }
+
     struct coordinator_config config;
     if (!parse_args(argc, argv, &config)) {
         print_usage(argv[0]);
@@ -687,6 +796,7 @@ int main(int argc, char **argv) {
     int exit_code = MR_EXIT_INTERNAL;
     char *peers = NULL;
     struct string_list output_lines = {0};
+    size_t *reducer_host_indices = NULL;
 
     if (job_id == NULL) {
         generated_job_id = generate_job_id();
@@ -718,8 +828,14 @@ int main(int argc, char **argv) {
             hosts.count,
             job_id);
 
+    reducer_host_indices = calloc(effective_reducer_count, sizeof(*reducer_host_indices));
+    if (reducer_host_indices == NULL) {
+        exit_code = MR_EXIT_SETUP;
+        goto cleanup;
+    }
+
     for (size_t index = 0; index < chunks.count; ++index) {
-        const char *host = hosts.items[index % effective_mapper_count];
+        size_t preferred_host_index = index % effective_mapper_count;
         const char *payload = chunks.items[index];
         size_t payload_size = strlen(payload);
 
@@ -732,18 +848,40 @@ int main(int argc, char **argv) {
         }
 
         char response[MR_CONTROL_LINE_SIZE];
-        enum remote_status status = send_command_expect_ok(host,
-                                                            config.port,
-                                                            config.timeout_ms,
-                                                            command,
-                                                            payload,
-                                                            payload_size,
-                                                            response,
-                                                            sizeof(response));
-        if (status != REMOTE_STATUS_OK) {
-            fprintf(stderr, "Map task %zu failed on %s (%s)\n",
+        enum remote_status status = REMOTE_STATUS_IO_FAILED;
+        bool map_done = false;
+
+        for (size_t host_offset = 0; host_offset < effective_mapper_count; ++host_offset) {
+            size_t host_index = (preferred_host_index + host_offset) % effective_mapper_count;
+            const char *host = hosts.items[host_index];
+            status = send_command_expect_ok_with_retry(host,
+                                                       config.port,
+                                                       config.timeout_ms,
+                                                       config.rpc_retries,
+                                                       config.rpc_retry_delay_ms,
+                                                       command,
+                                                       payload,
+                                                       payload_size,
+                                                       response,
+                                                       sizeof(response));
+            if (status == REMOTE_STATUS_OK) {
+                map_done = true;
+                break;
+            }
+
+            if (status == REMOTE_STATUS_BAD_RESPONSE) {
+                fprintf(stderr, "Map task %zu got protocol error on %s\n", index, host);
+            } else {
+                fprintf(stderr,
+                        "Map task %zu network error on %s, trying next worker if available\n",
+                        index,
+                        host);
+            }
+        }
+
+        if (!map_done) {
+            fprintf(stderr, "Map task %zu failed on all mappers (%s)\n",
                     index,
-                    host,
                     status == REMOTE_STATUS_BAD_RESPONSE ? "protocol" : "network");
             exit_code = remote_status_to_exit_code(status);
             goto cleanup;
@@ -774,7 +912,7 @@ int main(int argc, char **argv) {
     }
 
     for (size_t reducer_id = 0; reducer_id < effective_reducer_count; ++reducer_id) {
-        const char *host = hosts.items[reducer_id];
+        size_t preferred_host_index = reducer_id % effective_mapper_count;
         char command[MR_CONTROL_LINE_SIZE];
         int written = snprintf(command, sizeof(command), "REDUCE %s %zu %zu\n", job_id, reducer_id, peers_used);
         if (written < 0 || (size_t)written >= sizeof(command)) {
@@ -784,18 +922,41 @@ int main(int argc, char **argv) {
         }
 
         char response[MR_CONTROL_LINE_SIZE];
-        enum remote_status status = send_command_expect_ok(host,
-                                                            config.port,
-                                                            config.timeout_ms,
-                                                            command,
-                                                            peers,
-                                                            peers_used,
-                                                            response,
-                                                            sizeof(response));
-        if (status != REMOTE_STATUS_OK) {
-            fprintf(stderr, "Reduce task %zu failed on %s (%s)\n",
+        enum remote_status status = REMOTE_STATUS_IO_FAILED;
+        bool reduce_done = false;
+
+        for (size_t host_offset = 0; host_offset < effective_mapper_count; ++host_offset) {
+            size_t host_index = (preferred_host_index + host_offset) % effective_mapper_count;
+            const char *host = hosts.items[host_index];
+            status = send_command_expect_ok_with_retry(host,
+                                                       config.port,
+                                                       config.timeout_ms,
+                                                       config.rpc_retries,
+                                                       config.rpc_retry_delay_ms,
+                                                       command,
+                                                       peers,
+                                                       peers_used,
+                                                       response,
+                                                       sizeof(response));
+            if (status == REMOTE_STATUS_OK) {
+                reducer_host_indices[reducer_id] = host_index;
+                reduce_done = true;
+                break;
+            }
+
+            if (status == REMOTE_STATUS_BAD_RESPONSE) {
+                fprintf(stderr, "Reduce task %zu got protocol error on %s\n", reducer_id, host);
+            } else {
+                fprintf(stderr,
+                        "Reduce task %zu network error on %s, trying next worker if available\n",
+                        reducer_id,
+                        host);
+            }
+        }
+
+        if (!reduce_done) {
+            fprintf(stderr, "Reduce task %zu failed on all reducers (%s)\n",
                     reducer_id,
-                    host,
                     status == REMOTE_STATUS_BAD_RESPONSE ? "protocol" : "network");
             exit_code = remote_status_to_exit_code(status);
             goto cleanup;
@@ -805,7 +966,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "All reduce tasks finished for job %s\n", job_id);
 
     for (size_t reducer_id = 0; reducer_id < effective_reducer_count; ++reducer_id) {
-        const char *host = hosts.items[reducer_id];
+        const char *host = hosts.items[reducer_host_indices[reducer_id]];
         char command[MR_CONTROL_LINE_SIZE];
         int written = snprintf(command, sizeof(command), "RESULT %s %zu\n", job_id, reducer_id);
         if (written < 0 || (size_t)written >= sizeof(command)) {
@@ -816,7 +977,14 @@ int main(int argc, char **argv) {
 
         char *content = NULL;
         size_t length = 0;
-        enum remote_status status = fetch_data(host, config.port, config.timeout_ms, command, &content, &length);
+        enum remote_status status = fetch_data_with_retry(host,
+                                  config.port,
+                                  config.timeout_ms,
+                                  config.rpc_retries,
+                                  config.rpc_retry_delay_ms,
+                                  command,
+                                  &content,
+                                  &length);
         if (status != REMOTE_STATUS_OK) {
             fprintf(stderr, "Failed to fetch reducer %zu result from %s (%s)\n",
                     reducer_id,
@@ -843,6 +1011,7 @@ int main(int argc, char **argv) {
 
 cleanup:
     free_string_list(&output_lines);
+    free(reducer_host_indices);
     free(peers);
     free_string_list(&chunks);
     free_host_list(&hosts);

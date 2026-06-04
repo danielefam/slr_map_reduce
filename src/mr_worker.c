@@ -916,6 +916,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    struct sigaction ignore_pipe;
+    memset(&ignore_pipe, 0, sizeof(ignore_pipe));
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_pipe, NULL) < 0) {
+        perror("sigaction(SIGPIPE)");
+        return 1;
+    }
+
     int server_fd = create_listener(config.bind_address, config.port);
     if (server_fd < 0) {
         return 1;

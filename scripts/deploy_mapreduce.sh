@@ -84,6 +84,22 @@ else
     if ! bash "$SCRIPT_DIR/select_hosts.sh" --count "$candidate_count" --output "$candidate_hosts_file" --url "$api_url"; then
         bash "$SCRIPT_DIR/select_hosts.sh" --count "$host_count" --output "$candidate_hosts_file" --url "$api_url"
     fi
+
+    # Avoid repeatedly selecting the same first hosts across runs.
+    if command -v shuf >/dev/null 2>&1; then
+        shuffled_candidates="$candidate_hosts_file.shuf"
+        shuf "$candidate_hosts_file" > "$shuffled_candidates"
+        mv "$shuffled_candidates" "$candidate_hosts_file"
+    fi
+fi
+
+filtered_candidates_file="$RUN_DIR/hosts-candidates.filtered.txt"
+filter_excluded_hosts "$candidate_hosts_file" "$filtered_candidates_file"
+candidate_hosts_file="$filtered_candidates_file"
+
+if [[ ! -s "$candidate_hosts_file" ]]; then
+    echo "No candidate hosts left after applying exclusion rules (HOST_EXCLUDE_REGEX/HOST_EXCLUDE_FILE)." >&2
+    exit 1
 fi
 
 if (( explicit_hosts )); then

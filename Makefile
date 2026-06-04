@@ -16,6 +16,10 @@ MR_REMOTE_DIRNAME ?= slr_map_reduce_mr_bundle
 MR_INPUT ?= README.md
 MR_CHUNK_LINES ?= 200
 MR_REDUCERS ?=
+MR_RPC_RETRIES ?= 6
+MR_RPC_RETRY_DELAY_MS ?= 400
+MR_RUN_ATTEMPTS ?= 6
+MR_RUN_RETRY_DELAY ?= 1
 REMEDIATE_ARGS ?=
 STATUS_RETRIES ?= 2
 STATUS_RETRY_DELAY ?= 3
@@ -91,7 +95,7 @@ clean-remote-mr:
 	bash scripts/clean_mapreduce.sh --manifest $(MR_MANIFEST)
 
 run-mr: all
-	bash scripts/run_mapreduce.sh --manifest $(MR_MANIFEST) --job-manifest $(MR_JOB) --input $(MR_INPUT) --output $(MR_OUTPUT) --chunk-lines $(MR_CHUNK_LINES) $(if $(MR_REDUCERS),--reducers $(MR_REDUCERS),)
+	bash scripts/run_mapreduce.sh --manifest $(MR_MANIFEST) --job-manifest $(MR_JOB) --input $(MR_INPUT) --output $(MR_OUTPUT) --chunk-lines $(MR_CHUNK_LINES) $(if $(MR_REDUCERS),--reducers $(MR_REDUCERS),) --rpc-retries $(MR_RPC_RETRIES) --rpc-retry-delay-ms $(MR_RPC_RETRY_DELAY_MS) --run-attempts $(MR_RUN_ATTEMPTS) --run-retry-delay $(MR_RUN_RETRY_DELAY)
 
 experiment: deploy
 	bash scripts/status.sh --manifest $(MANIFEST)
