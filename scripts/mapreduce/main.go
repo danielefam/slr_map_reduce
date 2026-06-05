@@ -68,6 +68,7 @@ func main() {
 	inputDir := flag.String("input-dir", "", "directory of WET files on NFS (alternative to -input)")
 	outputFile := flag.String("output", "result.txt", "path for merged output file")
 	n := flag.Int("n", 0, "number of workers (0 = all hosts)")
+	filesLimit := flag.Int("files-limit", 0, "cap the number of WET files used from -input-dir (0 = all)")
 	port := flag.String("port", "9090", "worker HTTP port")
 	flag.Parse()
 
@@ -79,16 +80,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("read hosts: %v", err)
 	}
-	if *n > 0 && *n < len(hosts) {
-		hosts = hosts[:*n]
-	}
 	nWorkers := len(hosts)
 	peers := make([]string, nWorkers)
 	for i, h := range hosts {
 		peers[i] = h + ":" + *port
 	}
 
-	log.Printf("workers: %d", nWorkers)
+	log.Printf("candidate workers: %d (target -n=%d)", nWorkers, *n)
 
 	// ── Step 1: build worker binary ────────────────────────────────────────
 	log.Println("building worker binary…")
@@ -112,10 +110,17 @@ func main() {
 	}
 	log.Printf("%d workers ready", len(hosts))
 
+	// Trim survivors down to the target -n now that we know who is healthy.
+	if *n > 0 && *n < len(hosts) {
+		hosts = hosts[:*n]
+		peers = peers[:*n]
+		log.Printf("using first %d healthy workers (target -n=%d)", len(hosts), *n)
+	}
+
 	// ── Step 4: split input and distribute data ─────────────────────────────
 	log.Println("splitting and distributing input…")
 	if *inputDir != "" {
-		if err := distributeFiles(*inputDir, hosts, peers); err != nil {
+		if err := distributeFiles(*inputDir, *filesLimit, hosts, peers); err != nil {
 			log.Fatalf("distribute files: %v", err)
 		}
 	} else {
@@ -199,10 +204,13 @@ func deployWorker(hosts, peers []string, port string) ([]string, []string, error
 	}
 	results := make([]result, len(hosts))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8) // throttle to avoid ssh gateway overload
 	for i, h := range hosts {
 		wg.Add(1)
 		go func(idx int, host, peer string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			results[idx] = result{host: host, peer: peer}
 			// kill any leftover worker and remove the binary so SCP can overwrite it
 			_, _ = sshRun(host, []string{
@@ -314,10 +322,13 @@ func waitHealthy(hosts, peers []string) ([]string, []string, error) {
 // distributeFiles lists WET files in dir, assigns them round-robin to workers,
 // and tells each worker to load its files via POST /load (read directly from NFS).
 // If dir is not locally accessible, it lists files by SSH-ing into the first worker.
-func distributeFiles(dir string, hosts []string, peers []string) error {
+func distributeFiles(dir string, filesLimit int, hosts []string, peers []string) error {
 	files, err := listWETFiles(dir, hosts)
 	if err != nil {
 		return fmt.Errorf("list WET files: %w", err)
+	}
+	if filesLimit > 0 && filesLimit < len(files) {
+		files = files[:filesLimit]
 	}
 
 	filesByWorker := make([][]string, len(peers))
