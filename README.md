@@ -381,12 +381,43 @@ The `mapreduce` orchestrator cross-compiles the worker automatically
 
 ## Error Handling & Fault Tolerance
 
-| Scenario                           | Behaviour                                                                                                          |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Worker not reachable at startup    | `waitHealthy` retries up to 30 times with 2 s delay before failing (30 s client timeout per probe)                |
-| SCP / SSH failure                  | `deployWorker` reports the first error and aborts the pipeline                                                     |
-| Worker returns non-200             | Orchestrator logs the error body and aborts the phase                                                              |
-| Map/reduce phase times out         | 60 min HTTP client timeout per worker; worker returns error, orchestrator aborts                                   |
-| Data upload times out              | 30 min HTTP client timeout for `/load` requests                                                                    |
-| `/intermediate` fetch failure      | 10 min HTTP client timeout per fetch; worker responds 500 to `/reduce` call; orchestrator aborts                  |
-| `run.sh` receives SIGINT/SIGTERM   | `trap cleanup EXIT` ensures remote processes are killed                                                            |
+The orchestrator uses a **slot-based coordinator** with a **spare pool**:
+
+- `N` (target `-n`) logical slots map 1:1 to physical hosts. Partitioning
+  uses `FNV-32a(key) % N`, so `N` is fixed for the duration of the job.
+- Hosts beyond `N` in `hosts.txt` become **spares** — kept healthy and
+  ready to replace any slot whose host fails.
+- Every worker call (`/load`, `/map`, `/reduce`, `/result`) is bound to a
+  `context.Context` so it can be cancelled promptly.
+- A background **health watcher** polls `GET /health` on every active and
+  spare host every `-health-interval` (default 5 s). Two consecutive failures
+  mark a host dead so it will not be reused.
+
+| Scenario                            | Behaviour                                                                                                          |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Worker not reachable at startup     | `waitHealthy` retries 30× / 2 s; survivors form slot+spare pool                                                    |
+| SCP / SSH failure (deploy)          | Failed hosts are skipped; deploy throttled to 8 parallel connections                                               |
+| Worker returns 5xx during map/reduce | Calling host is replaced from spare pool, slot rewinds to `pending`, `/load` → `/map` (→ `/reduce`) replay        |
+| Worker dies → peer's `/reduce` 5xx with `fetch from peer X` | Coordinator parses the message, blames host `X` (not the caller), replaces `X`, then re-runs `/reduce` on all surviving slots with the updated peer list |
+| Transport error / timeout on a slot | Same as above; calling host replaced                                                                               |
+| Map/reduce phase times out          | 60 min HTTP client timeout per worker; failure triggers slot replacement                                            |
+| Data upload times out               | 30 min HTTP client timeout for `/load`; failure triggers slot replacement                                          |
+| `/intermediate` fetch failure       | 10 min worker-internal timeout; worker returns 500 to its `/reduce` caller; orchestrator identifies the dead peer  |
+| `run.sh` receives SIGINT/SIGTERM    | `trap cleanup EXIT` kills remote processes                                                                          |
+
+### Tunable flags (orchestrator)
+
+| Flag                  | Default | Purpose                                                       |
+| --------------------- | ------- | ------------------------------------------------------------- |
+| `-n`                  | 0       | Target number of active slots; extras in `hosts.txt` are spares |
+| `-files-limit`        | 0       | Cap the number of WET files used from `-input-dir`            |
+| `-max-attempts`       | 4       | Per-slot host swaps before failing the job                    |
+| `-health-interval`    | 5s      | `/health` poll cadence during long phases                     |
+| `-backoff-initial`    | 250ms   | First retry backoff (doubles, capped at 5 s)                  |
+
+### When the job will still fail
+
+- Spare pool exhausted (more slots fail than spares can replace).
+- All workers fail their initial `/health` check.
+- A single slot trips `-max-attempts` swaps.
+

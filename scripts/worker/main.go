@@ -230,7 +230,12 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	data := s.state.inputData
 	s.state.workerID = req.ID
 	s.state.peers = req.Peers
+	s.state.output = nil
 	s.state.mu.Unlock()
+
+	// Ensure idempotency: a repeat /map call (e.g. a replacement worker
+	// re-running the task) must not see stale buckets from a previous run.
+	s.removeIntermediate()
 
 	n := len(req.Peers)
 	intermediate := runMap(data, s.mapFn)
@@ -304,13 +309,37 @@ func fetchIntermediate(peer string, reducerID, n int) ([]KeyValue, error) {
 	return kvs, nil
 }
 
+// reduceRequest is the optional JSON body of POST /reduce. When Peers is
+// non-empty it overrides the peer list stored by the most recent /map call,
+// allowing the orchestrator to update routing after replacing a dead host.
+type reduceRequest struct {
+	Peers []string `json:"peers,omitempty"`
+}
+
 // handleReduce pulls intermediate data from all peers via /intermediate, then runs
 // the reduce function over the merged KV pairs.
-func (s *server) handleReduce(w http.ResponseWriter, _ *http.Request) {
+//
+// Peer list selection (in order of preference):
+//  1. peers from the request body (if provided and non-empty)
+//  2. peers stored from the prior /map call
+func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
+	var req reduceRequest
+	if r.Body != nil {
+		// Body is optional; ignore decode errors for empty/short bodies.
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
 	s.state.mu.Lock()
 	peers := s.state.peers
 	id := s.state.workerID
 	s.state.mu.Unlock()
+
+	if len(req.Peers) > 0 {
+		peers = req.Peers
+		s.state.mu.Lock()
+		s.state.peers = req.Peers
+		s.state.mu.Unlock()
+	}
 
 	if len(peers) == 0 {
 		http.Error(w, "no peers: run map phase first", http.StatusBadRequest)

@@ -20,6 +20,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -70,6 +71,9 @@ func main() {
 	n := flag.Int("n", 0, "number of workers (0 = all hosts)")
 	filesLimit := flag.Int("files-limit", 0, "cap the number of WET files used from -input-dir (0 = all)")
 	port := flag.String("port", "9090", "worker HTTP port")
+	maxAttempts := flag.Int("max-attempts", 4, "per-slot retry attempts before failing the job")
+	healthInterval := flag.Duration("health-interval", 5*time.Second, "active /health poll interval during long phases")
+	backoffInitial := flag.Duration("backoff-initial", 250*time.Millisecond, "initial retry backoff (doubles up to 5s)")
 	flag.Parse()
 
 	if *inputFile == "" && *inputDir == "" {
@@ -110,49 +114,93 @@ func main() {
 	}
 	log.Printf("%d workers ready", len(hosts))
 
-	// Trim survivors down to the target -n now that we know who is healthy.
-	if *n > 0 && *n < len(hosts) {
-		hosts = hosts[:*n]
-		peers = peers[:*n]
-		log.Printf("using first %d healthy workers (target -n=%d)", len(hosts), *n)
+	// Decide how many slots (N) and which hosts are spares.
+	target := *n
+	if target <= 0 || target > len(hosts) {
+		target = len(hosts)
 	}
+	if target > len(hosts) {
+		log.Fatalf("need at least %d healthy workers but only %d are ready", target, len(hosts))
+	}
+	slotPeers := peers[:target]
+	sparePeers := append([]string(nil), peers[target:]...)
+	log.Printf("using %d active slots + %d spares (target -n=%d)",
+		len(slotPeers), len(sparePeers), *n)
 
-	// ── Step 4: split input and distribute data ─────────────────────────────
-	log.Println("splitting and distributing input…")
+	// Assemble the coordinator.
+	coord := newCoordinator(slotPeers, sparePeers, *maxAttempts, *backoffInitial, *healthInterval)
+
+	// ── Step 4: assign input to slots ───────────────────────────────────────
+	log.Println("preparing slot inputs…")
 	if *inputDir != "" {
-		if err := distributeFiles(*inputDir, *filesLimit, hosts, peers); err != nil {
-			log.Fatalf("distribute files: %v", err)
+		files, err := listWETFiles(*inputDir, hosts)
+		if err != nil {
+			log.Fatalf("list WET files: %v", err)
+		}
+		if *filesLimit > 0 && *filesLimit < len(files) {
+			files = files[:*filesLimit]
+		}
+		log.Printf("found %d WET files, distributing across %d slots", len(files), len(coord.slots))
+		for i, f := range files {
+			s := coord.slots[i%len(coord.slots)]
+			s.files = append(s.files, f)
 		}
 	} else {
-		if err := distributeData(*inputFile, peers); err != nil {
-			log.Fatalf("distribute data: %v", err)
+		f, err := os.Open(*inputFile)
+		if err != nil {
+			log.Fatalf("open input: %v", err)
+		}
+		chunks, err := splitIntoChunks(f, chunkSize)
+		f.Close()
+		if err != nil {
+			log.Fatalf("split input: %v", err)
+		}
+		for i, s := range coord.slots {
+			s.chunk = chunkForWorker(chunks, i)
 		}
 	}
 
-	// ── Step 5: map phase ──────────────────────────────────────────────────
+	// ── Step 5: drive all slots through map → reduce → result ───────────────
+	// Background health watcher cancels in-flight calls on dead hosts.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go coord.watchHealth(ctx)
+
 	log.Println("starting map phase…")
-	if err := broadcastMap(peers); err != nil {
+	if err := coord.drive(ctx, sMapped); err != nil {
 		log.Fatalf("map phase: %v", err)
 	}
 	log.Println("map phase done")
 
-	// ── Step 6: reduce phase ──────────────────────────────────────────────────
 	log.Println("starting reduce phase…")
-	if err := broadcastPost(longClient, peers, "/reduce", nil); err != nil {
+	if err := coord.drive(ctx, sReduced); err != nil {
 		log.Fatalf("reduce phase: %v", err)
 	}
 	log.Println("reduce phase done")
 
-	// ── Step 7: collect results ────────────────────────────────────────────
 	log.Println("collecting results…")
-	if err := collectResults(peers, *outputFile); err != nil {
+	if err := coord.drive(ctx, sDone); err != nil {
 		log.Fatalf("collect: %v", err)
+	}
+	if err := coord.mergeResults(*outputFile); err != nil {
+		log.Fatalf("merge: %v", err)
 	}
 	log.Printf("results written to %s", *outputFile)
 
-	// ── Step 9: cleanup ────────────────────────────────────────────────────
+	// Stop the health watcher before cleanup so it doesn't race with kills.
+	cancel()
+
+	// ── Step 6: cleanup ─────────────────────────────────────────────────────
 	log.Println("cleaning up workers…")
-	cleanupWorkers(hosts)
+	cleanupHosts := make([]string, 0)
+	for _, peer := range coord.hostsForCleanup() {
+		host, _, found := strings.Cut(peer, ":")
+		if !found {
+			host = peer
+		}
+		cleanupHosts = append(cleanupHosts, host)
+	}
+	cleanupWorkers(cleanupHosts)
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -545,11 +593,23 @@ func collectResults(peers []string, outputFile string) error {
 
 // fetchResult calls GET /result on a peer and returns parsed KV pairs.
 func fetchResult(peer string) ([]KeyValue, error) {
-	resp, err := longClient.Get("http://" + peer + "/result") //nolint:gosec
+	return fetchResultCtx(context.Background(), peer)
+}
+
+func fetchResultCtx(ctx context.Context, peer string) ([]KeyValue, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+peer+"/result", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := longClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET %s/result returned %d: %s", peer, resp.StatusCode, b)
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -591,11 +651,25 @@ func cleanupWorkers(hosts []string) {
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
 
 func postRaw(client *http.Client, peer, path string, body []byte) error {
-	ct := "application/octet-stream"
-	if len(body) == 0 {
+	return postRawCtx(context.Background(), client, peer, path, body)
+}
+
+func postJSON(client *http.Client, peer, path string, body []byte) error {
+	return postJSONCtx(context.Background(), client, peer, path, body)
+}
+
+// postRawCtx posts body to peer+path with the given context. The context controls
+// both connection setup and the in-flight request, so cancelling it aborts a stuck call.
+func postRawCtx(ctx context.Context, client *http.Client, peer, path string, body []byte) error {
+	if body == nil {
 		body = []byte{}
 	}
-	resp, err := client.Post("http://"+peer+path, ct, bytes.NewReader(body)) //nolint:gosec
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+peer+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build POST %s%s: %w", peer, path, err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("POST %s%s: %w", peer, path, err)
 	}
@@ -607,8 +681,13 @@ func postRaw(client *http.Client, peer, path string, body []byte) error {
 	return nil
 }
 
-func postJSON(client *http.Client, peer, path string, body []byte) error {
-	resp, err := client.Post("http://"+peer+path, "application/json", bytes.NewReader(body)) //nolint:gosec
+func postJSONCtx(ctx context.Context, client *http.Client, peer, path string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+peer+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build POST %s%s: %w", peer, path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("POST %s%s: %w", peer, path, err)
 	}
