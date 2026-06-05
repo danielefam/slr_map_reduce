@@ -18,3 +18,5 @@ vgcore.*
 *~
 *.swp
 *.swo
+data/
+*.txt
