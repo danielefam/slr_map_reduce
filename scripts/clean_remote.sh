@@ -30,9 +30,24 @@ EOF
     esac
 done
 
-require_commands ssh awk ps rm printf
+require_commands ssh awk ps rm printf mktemp
 manifest_file=$(normalize_path "$manifest_file")
 load_manifest "$manifest_file"
+
+base_remote_dirname=${BASE_REMOTE_DIRNAME:-$REMOTE_DIRNAME}
+hosts_registry_file="$RUN_DIR/legacy_deployed_hosts.txt"
+hosts_tmp=$(mktemp)
+trap 'rm -f "$hosts_tmp"' EXIT
+
+{
+    [[ -f "$HOSTS_FILE" ]] && list_hosts "$HOSTS_FILE" || true
+    [[ -f "$hosts_registry_file" ]] && list_hosts "$hosts_registry_file" || true
+} | awk 'NF > 0 && !seen[$0]++ { print }' > "$hosts_tmp"
+
+if [[ ! -s "$hosts_tmp" ]]; then
+    printf 'No hosts available for legacy cleanup (manifest/registry empty).\n' >&2
+    exit 1
+fi
 
 failures=0
 total_hosts=0
@@ -48,17 +63,19 @@ printf '%-28s %-3s %-14s %s\n' "----------------------------" "---" "-----------
 
 while IFS= read -r host; do
     (( total_hosts += 1 ))
-    result=$(ssh "${SSH_OPTIONS[@]}" "$host" bash -s -- "$REMOTE_DIRNAME" "$PORT" <<'REMOTE'
+    result=$(ssh "${SSH_OPTIONS[@]}" "$host" bash -s -- "$REMOTE_DIRNAME" "$base_remote_dirname" "$PORT" <<'REMOTE'
 set -euo pipefail
 
 remote_dirname=$1
-port=$2
+base_remote_dirname=$2
+port=$3
 app_dir="$HOME/$remote_dirname"
 server_bin="$app_dir/bin/load_server"
+bundle_prefix="$HOME/$base_remote_dirname-"
 had_state=0
 
 find_bundle_pids() {
-    ps -u "$USER" -o pid= -o args= | awk -v server_bin="$server_bin" '
+    ps -u "$USER" -o pid= -o args= | awk -v server_bin="$server_bin" -v bundle_prefix="$bundle_prefix" '
         {
             pid=$1
             $1=""
@@ -67,7 +84,7 @@ find_bundle_pids() {
             if (argc < 1) {
                 next
             }
-            if (argv[1] == server_bin) {
+            if (argv[1] == server_bin || (index(argv[1], bundle_prefix) == 1 && argv[1] ~ /\/bin\/load_server$/)) {
                 print pid
             }
         }
@@ -75,13 +92,13 @@ find_bundle_pids() {
 }
 
 find_port_pids() {
-    ps -u "$USER" -o pid= -o args= | awk -v server_bin="$server_bin" -v port="$port" '
+    ps -u "$USER" -o pid= -o args= | awk -v server_bin="$server_bin" -v bundle_prefix="$bundle_prefix" -v port="$port" '
         {
             pid=$1
             $1=""
             sub(/^[[:space:]]+/, "", $0)
             argc=split($0, argv, /[[:space:]]+/)
-            if (argc < 1 || argv[1] != server_bin) {
+            if (argc < 1 || !(argv[1] == server_bin || (index(argv[1], bundle_prefix) == 1 && argv[1] ~ /\/bin\/load_server$/))) {
                 next
             }
             for (i = 2; i < argc; i++) {
@@ -109,11 +126,14 @@ kill_matching_pids() {
 if [[ -d "$app_dir" ]]; then
     had_state=1
 fi
+if compgen -G "${bundle_prefix}*" > /dev/null; then
+    had_state=1
+fi
 
 kill_matching_pids < <(find_port_pids || true)
 kill_matching_pids < <(find_bundle_pids || true)
 
-rm -rf "$app_dir"
+rm -rf "$app_dir" "${bundle_prefix}"*
 
 remaining_pid=$(find_bundle_pids | head -n 1 || true)
 if [[ -n "$remaining_pid" ]]; then
@@ -121,7 +141,7 @@ if [[ -n "$remaining_pid" ]]; then
     exit 1
 fi
 
-if [[ -d "$app_dir" ]]; then
+if [[ -d "$app_dir" ]] || compgen -G "${bundle_prefix}*" > /dev/null; then
     echo "directory-remains"
     exit 2
 fi
@@ -172,7 +192,7 @@ REMOTE
         (( failures += 1 ))
     fi
     unset rc
-done < "$HOSTS_FILE"
+done < "$hosts_tmp"
 
 printf '\n'
 printf 'Summary: total=%d cleaned=%d already-clean=%d failed=%d\n' \

@@ -13,6 +13,7 @@ api_url=$DEFAULT_API_BASE_URL
 start_port=$DEFAULT_PORT_START
 end_port=$DEFAULT_PORT_END
 remote_dirname=$DEFAULT_MR_REMOTE_DIRNAME
+base_remote_dirname=$DEFAULT_MR_REMOTE_DIRNAME
 scratch_root_base=$DEFAULT_MR_SCRATCH_ROOT
 explicit_hosts=0
 
@@ -44,6 +45,7 @@ while (( $# > 0 )); do
             ;;
         --remote-dirname)
             remote_dirname=$2
+            base_remote_dirname=$2
             shift 2
             ;;
         --scratch-root)
@@ -79,7 +81,7 @@ if [[ -n "$hosts_file" ]]; then
     explicit_hosts=1
 else
     candidate_hosts_file="$RUN_DIR/hosts-candidates.txt"
-    hosts_file=$DEFAULT_HOSTS_FILE
+    hosts_file=$DEFAULT_MR_HOSTS_FILE
     candidate_count=$(( host_count + 25 ))
     if ! bash "$SCRIPT_DIR/select_hosts.sh" --count "$candidate_count" --output "$candidate_hosts_file" --url "$api_url"; then
         bash "$SCRIPT_DIR/select_hosts.sh" --count "$host_count" --output "$candidate_hosts_file" --url "$api_url"
@@ -173,7 +175,9 @@ write_manifest "$manifest_file" \
     PORT_RANGE_END "$PORT_RANGE_END" \
     STAGING_HOST "$staging_host" \
     REMOTE_DIRNAME "$remote_dirname" \
+    BASE_REMOTE_DIRNAME "$base_remote_dirname" \
     LAUNCH_STATUS_FILE "$launch_status_file" \
+    WORKER_SCRATCH_BASE "$scratch_root_base" \
     WORKER_SCRATCH_ROOT "$worker_scratch_root"
 
 ensure_remote_bundle() {
@@ -289,6 +293,16 @@ while IFS= read -r host; do
     worker_id=$(( worker_id + 1 ))
     unset rc
 done < "$HOSTS_FILE"
+
+mr_registry_file="$RUN_DIR/mr_deployed_hosts.txt"
+mr_registry_tmp="$mr_registry_file.tmp"
+if [[ -f "$launch_status_file" ]]; then
+    {
+        [[ -f "$mr_registry_file" ]] && cat "$mr_registry_file"
+        awk -F'\t' '$2 == "0" { print $1 }' "$launch_status_file"
+    } | awk 'NF > 0 && !seen[$0]++ { print }' > "$mr_registry_tmp"
+    mv "$mr_registry_tmp" "$mr_registry_file"
+fi
 
 printf 'MapReduce launch results written to %s\n' "$launch_status_file"
 (( failures == 0 ))

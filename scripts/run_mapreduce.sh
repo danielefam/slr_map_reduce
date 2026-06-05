@@ -18,6 +18,30 @@ rpc_retries=
 rpc_retry_delay_ms=
 run_attempts=6
 run_retry_delay=1
+preflight_timeout_sec=1
+
+is_integer() {
+    local value=$1
+    [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+require_positive_integer() {
+    local name=$1
+    local value=$2
+    if ! is_integer "$value" || (( value <= 0 )); then
+        printf '%s must be a positive integer (got: %s)\n' "$name" "$value" >&2
+        exit 2
+    fi
+}
+
+require_non_negative_integer() {
+    local name=$1
+    local value=$2
+    if ! is_integer "$value"; then
+        printf '%s must be a non-negative integer (got: %s)\n' "$name" "$value" >&2
+        exit 2
+    fi
+}
 
 while (( $# > 0 )); do
     case "$1" in
@@ -69,6 +93,10 @@ while (( $# > 0 )); do
             run_retry_delay=$2
             shift 2
             ;;
+        --preflight-timeout-sec)
+            preflight_timeout_sec=$2
+            shift 2
+            ;;
         --help)
             cat <<'EOF'
 Usage: run_mapreduce.sh --input FILE [--manifest FILE] [--job-manifest FILE]
@@ -76,6 +104,7 @@ Usage: run_mapreduce.sh --input FILE [--manifest FILE] [--job-manifest FILE]
                         [--timeout-ms MS] [--job-id ID]
                         [--rpc-retries N] [--rpc-retry-delay-ms MS]
                         [--run-attempts N] [--run-retry-delay SECONDS]
+                        [--preflight-timeout-sec SECONDS]
 
 Run the local MapReduce coordinator using the stored worker host list and port.
 EOF
@@ -93,7 +122,28 @@ if [[ -z "$input_file" ]]; then
     exit 2
 fi
 
-if ! require_commands mkdir; then
+require_positive_integer "--chunk-lines" "$chunk_lines"
+require_positive_integer "--run-attempts" "$run_attempts"
+require_non_negative_integer "--run-retry-delay" "$run_retry_delay"
+require_positive_integer "--preflight-timeout-sec" "$preflight_timeout_sec"
+
+if [[ -n "$reducers" ]]; then
+    require_positive_integer "--reducers" "$reducers"
+fi
+
+if [[ -n "$timeout_ms" ]]; then
+    require_positive_integer "--timeout-ms" "$timeout_ms"
+fi
+
+if [[ -n "$rpc_retries" ]]; then
+    require_positive_integer "--rpc-retries" "$rpc_retries"
+fi
+
+if [[ -n "$rpc_retry_delay_ms" ]]; then
+    require_positive_integer "--rpc-retry-delay-ms" "$rpc_retry_delay_ms"
+fi
+
+if ! require_commands mkdir cp grep tee awk timeout mktemp; then
     exit 5
 fi
 ensure_run_dir
@@ -141,8 +191,81 @@ if [[ -n "$rpc_retry_delay_ms" ]]; then
 fi
 
 runtime_hosts_file="$RUN_DIR/mr_hosts_runtime.txt"
-if [[ "$HOSTS_FILE" != "$runtime_hosts_file" ]]; then
-    cp "$HOSTS_FILE" "$runtime_hosts_file"
+source_hosts_file="$HOSTS_FILE"
+if [[ "$source_hosts_file" == "$runtime_hosts_file" ]]; then
+    if [[ -s "$DEFAULT_MR_HOSTS_FILE" ]]; then
+        source_hosts_file="$DEFAULT_MR_HOSTS_FILE"
+        printf 'MapReduce run: manifest HOSTS_FILE points to runtime hosts; using stable host list %s\n' "$source_hosts_file" >&2
+    elif [[ -s "$RUN_DIR/mr_deployed_hosts.txt" ]]; then
+        cp "$RUN_DIR/mr_deployed_hosts.txt" "$DEFAULT_MR_HOSTS_FILE"
+        source_hosts_file="$DEFAULT_MR_HOSTS_FILE"
+        printf 'MapReduce run: manifest HOSTS_FILE points to runtime hosts; recovered stable host list %s from deployed-hosts registry\n' "$source_hosts_file" >&2
+    fi
+fi
+
+if [[ "$source_hosts_file" != "$runtime_hosts_file" ]]; then
+    cp "$source_hosts_file" "$runtime_hosts_file"
+fi
+
+probe_host_port() {
+    local host=$1
+    local port=$2
+
+    timeout "$preflight_timeout_sec" bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
+
+preflight_reachability() {
+    local hosts_file=$1
+    local port=$2
+    local total=0
+    local reachable=0
+    local first_unreachable=
+    local reachable_hosts_tmp
+
+    reachable_hosts_tmp=$(mktemp)
+    : > "$reachable_hosts_tmp"
+
+    while IFS= read -r host; do
+        [[ -z "$host" ]] && continue
+        (( total += 1 ))
+        if probe_host_port "$host" "$port"; then
+            (( reachable += 1 ))
+            printf '%s\n' "$host" >> "$reachable_hosts_tmp"
+        elif [[ -z "$first_unreachable" ]]; then
+            first_unreachable=$host
+        fi
+    done < <(grep -Ev '^[[:space:]]*(#|$)' "$hosts_file" || true)
+
+    if (( total == 0 )); then
+        rm -f "$reachable_hosts_tmp"
+        printf 'MapReduce preflight failed: no valid hosts in %s\n' "$hosts_file" >&2
+        return 3
+    fi
+
+    if (( reachable == 0 )); then
+        rm -f "$reachable_hosts_tmp"
+        printf 'MapReduce preflight failed: 0/%d worker hosts reachable on tcp/%s from this coordinator. Example unreachable host: %s\n' \
+            "$total" "$port" "${first_unreachable:-unknown}" >&2
+        printf 'Action: redeploy workers (make deploy-mr) or use local fallback (make run-mr-local).\n' >&2
+        return 6
+    fi
+
+    if (( reachable < total )); then
+        mv "$reachable_hosts_tmp" "$hosts_file"
+        printf 'MapReduce preflight pruned %d unreachable host(s); continuing with %d reachable host(s).\n' \
+            "$((total - reachable))" "$reachable" >&2
+    else
+        rm -f "$reachable_hosts_tmp"
+    fi
+
+    printf 'MapReduce preflight: %d/%d worker hosts reachable on tcp/%s\n' "$reachable" "$total" "$port" >&2
+    return 0
+}
+
+preflight_reachability "$runtime_hosts_file" "$PORT"
+preflight_rc=$?
+if (( preflight_rc != 0 )); then
+    exit "$preflight_rc"
 fi
 
 attempt=1

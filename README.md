@@ -79,6 +79,7 @@ make deploy-mr HOST_COUNT=3 MR_MANIFEST=run/mr_manifest.env MR_REMOTE_DIRNAME=my
 ```
 
 The deploy script starts one `mr_worker` per host and stores its local scratch root in the manifest so cleanup can remove job data safely. It first uploads the worker bundle through the staging host, then falls back to a per-host upload if a selected node cannot see the shared bundle.
+Selected MapReduce hosts are persisted in `run/mr_hosts_selected.txt`; each run uses `run/mr_hosts_runtime.txt` as an isolated, mutable runtime set.
 
 ### 4) Run A Word Count Job
 
@@ -88,8 +89,24 @@ Use the sample input file [examples/wordcount_input.txt](examples/wordcount_inpu
 make run-mr MR_INPUT=examples/wordcount_input.txt MR_OUTPUT=run/mr_wordcount.txt MR_CHUNK_LINES=2
 ```
 
+Important: `make run-mr` uses the deployed worker list from `run/mr_manifest.env`. If those remote hosts are stale or unreachable, this command will fail after retries.
+
+Before launching the coordinator, `scripts/run_mapreduce.sh` now performs a bounded TCP preflight and automatically prunes unreachable hosts from the runtime host set for that run only. This reduces long retry cycles on stale host lists.
+
 The coordinator runs locally, reads the worker host list from the manifest, assigns map work, waits for all maps to finish, then starts the reduce phase.
 By default it uses only the effective mapper/reducer count needed by the input splits. To cap reducers explicitly, pass `MR_REDUCERS=N`.
+
+Preflight timeout is configurable from Make:
+
+```bash
+make run-mr MR_PREFLIGHT_TIMEOUT_SEC=2 MR_INPUT=examples/wordcount_input.txt MR_OUTPUT=run/mr_wordcount.txt MR_CHUNK_LINES=2
+```
+
+For a guaranteed local-only execution (no remote hosts required):
+
+```bash
+make run-mr-local
+```
 
 Expected output:
 
@@ -217,6 +234,12 @@ make smoke
 ## Local MapReduce Test
 
 To test the MapReduce word-count implementation end-to-end on localhost without needing remote worker deployment:
+
+```bash
+make run-mr-local
+```
+
+Equivalent direct script call:
 
 ```bash
 bash scripts/test_mapreduce_local.sh

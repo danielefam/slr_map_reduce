@@ -20,13 +20,14 @@ MR_RPC_RETRIES ?= 6
 MR_RPC_RETRY_DELAY_MS ?= 400
 MR_RUN_ATTEMPTS ?= 6
 MR_RUN_RETRY_DELAY ?= 1
+MR_PREFLIGHT_TIMEOUT_SEC ?= 1
 REMEDIATE_ARGS ?=
 STATUS_RETRIES ?= 2
 STATUS_RETRY_DELAY ?= 3
 
 TARGETS := $(BIN_DIR)/load_server $(BIN_DIR)/load_client $(BIN_DIR)/mr_worker $(BIN_DIR)/mr_coordinator
 
-.PHONY: all clean directories smoke select-hosts select-port deploy status status-report status-strict remediate-status remediate-status-dry stop clean-remote clean-remote-all redeploy run-client experiment deploy-mr clean-remote-mr run-mr
+.PHONY: all clean directories smoke select-hosts select-port deploy status status-report status-strict remediate-status remediate-status-dry stop clean-remote clean-remote-all redeploy run-client experiment deploy-mr clean-remote-mr run-mr run-mr-local test-mr-local
 
 all: directories $(TARGETS)
 
@@ -95,7 +96,12 @@ clean-remote-mr:
 	bash scripts/clean_mapreduce.sh --manifest $(MR_MANIFEST)
 
 run-mr: all
-	bash scripts/run_mapreduce.sh --manifest $(MR_MANIFEST) --job-manifest $(MR_JOB) --input $(MR_INPUT) --output $(MR_OUTPUT) --chunk-lines $(MR_CHUNK_LINES) $(if $(MR_REDUCERS),--reducers $(MR_REDUCERS),) --rpc-retries $(MR_RPC_RETRIES) --rpc-retry-delay-ms $(MR_RPC_RETRY_DELAY_MS) --run-attempts $(MR_RUN_ATTEMPTS) --run-retry-delay $(MR_RUN_RETRY_DELAY)
+	bash scripts/run_mapreduce.sh --manifest $(MR_MANIFEST) --job-manifest $(MR_JOB) --input $(MR_INPUT) --output $(MR_OUTPUT) --chunk-lines $(MR_CHUNK_LINES) $(if $(MR_REDUCERS),--reducers $(MR_REDUCERS),) --rpc-retries $(MR_RPC_RETRIES) --rpc-retry-delay-ms $(MR_RPC_RETRY_DELAY_MS) --run-attempts $(MR_RUN_ATTEMPTS) --run-retry-delay $(MR_RUN_RETRY_DELAY) --preflight-timeout-sec $(MR_PREFLIGHT_TIMEOUT_SEC)
+
+run-mr-local: all
+	bash scripts/test_mapreduce_local.sh
+
+test-mr-local: run-mr-local
 
 experiment: deploy
 	bash scripts/status.sh --manifest $(MANIFEST)

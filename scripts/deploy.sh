@@ -13,6 +13,7 @@ api_url=$DEFAULT_API_BASE_URL
 start_port=$DEFAULT_PORT_START
 end_port=$DEFAULT_PORT_END
 remote_dirname=$DEFAULT_REMOTE_DIRNAME
+base_remote_dirname=$DEFAULT_REMOTE_DIRNAME
 explicit_hosts=0
 
 while (( $# > 0 )); do
@@ -43,6 +44,7 @@ while (( $# > 0 )); do
             ;;
         --remote-dirname)
             remote_dirname=$2
+            base_remote_dirname=$2
             shift 2
             ;;
         --help)
@@ -131,6 +133,7 @@ write_manifest "$manifest_file" \
     PORT_RANGE_END "$PORT_RANGE_END" \
     STAGING_HOST "$staging_host" \
     REMOTE_DIRNAME "$remote_dirname" \
+    BASE_REMOTE_DIRNAME "$base_remote_dirname" \
     LAUNCH_STATUS_FILE "$launch_status_file"
 
 launch_remote() {
@@ -223,6 +226,16 @@ while IFS= read -r host; do
     fi
     unset rc
 done < "$HOSTS_FILE"
+
+legacy_registry_file="$RUN_DIR/legacy_deployed_hosts.txt"
+legacy_registry_tmp="$legacy_registry_file.tmp"
+if [[ -f "$launch_status_file" ]]; then
+    {
+        [[ -f "$legacy_registry_file" ]] && cat "$legacy_registry_file"
+        awk -F'\t' '$2 == "0" { print $1 }' "$launch_status_file"
+    } | awk 'NF > 0 && !seen[$0]++ { print }' > "$legacy_registry_tmp"
+    mv "$legacy_registry_tmp" "$legacy_registry_file"
+fi
 
 printf 'Launch results written to %s\n' "$launch_status_file"
 (( failures == 0 ))

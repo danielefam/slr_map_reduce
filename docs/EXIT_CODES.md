@@ -29,6 +29,7 @@ The coordinator classifies remote failures into two groups:
 - connect failed
 - socket send/recv failed
 - timed out while waiting on remote endpoint
+- preflight detected zero reachable worker hosts before coordinator submission
 
 2. `MR_EXIT_PROTOCOL`:
 - remote response does not start with expected `OK ...` for control commands
