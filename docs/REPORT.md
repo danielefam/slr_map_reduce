@@ -11,7 +11,7 @@
 ## 1. Introduction
 
 🔲 _Write 2–3 paragraphs:_
-- Goal: a from-scratch distributed MapReduce framework in Go over the
+- Goal: a from-scratch distributed MapReduce framework in C++ over the
   `*.enst.fr` lab pool, benchmarked on Common Crawl data and compared to
   Apache Kafka Streams.
 - Constraints: no root, no Docker, NFS home directories, shared machines.
@@ -25,17 +25,14 @@
 
 | Component | Location | Role |
 | --------- | -------- | ---- |
-| Orchestrator | `scripts/mapreduce` (runs on the local machine) | builds + deploys workers, splits input, drives phases, merges results, cleans up |
-| Worker | `scripts/worker` (one HTTP server per node, port 9090) | executes map/reduce, stores intermediate buckets on node-local disk, serves peers |
-| Job packages | `scripts/jobs/<name>` | pluggable `Mapper`/`Reducer` implementations (see §2.3) |
-| Host discovery | `scripts/make_hosts` | queries `tp.telecom-paris.fr` for available lab machines → `hosts.txt` |
+| Orchestrator | `bin/slr_mapreduce` (runs on the local machine) | deploys workers, splits input, drives phases, merges results, cleans up |
+| Worker | `bin/slr_worker` (one HTTP server per node, port 9090) | executes map/reduce, stores intermediate buckets on node-local disk, serves peers |
+| Jobs | built-in C++ job names (`wordcount`, `langdetect`, `domainpop`, `docdensity`) | selected via `-job <name>` |
+| Host discovery | `bin/slr_make_hosts` | queries `tp.telecom-paris.fr` for available lab machines → `hosts.txt` |
 
 ### 2.2 Job lifecycle
 
-1. **Build:** the orchestrator copies the worker package into a temp dir,
-   generates a `job_binding_generated.go` that imports the package selected
-   with `-job`, and cross-compiles a static `linux/amd64` binary. The deployed
-   binary therefore contains exactly one job and no fallback.
+1. **Build:** `scripts/build_cpp.sh` compiles C++ binaries (`slr_worker`, `slr_mapreduce`, and helper tools).
 2. **Deploy:** the binary is `scp`-ed to `/tmp/mr-worker` on every host and
    started with `nohup` (PID recorded in `/tmp/mr-worker.pid`); operations are
    bounded by `-parallel` (default 16) concurrent SSH/SCP sessions.
@@ -53,8 +50,7 @@
 
 ### 2.3 Pluggable jobs (use cases)
 
-All jobs implement the two-method `mrjob` API and are selected at run time via
-`./mapreduce.sh -job scripts/jobs/<name> …`:
+All jobs are selected at run time via `./mapreduce.sh -job <name> …`:
 
 | Job | Key → Value | Question answered |
 | --- | ----------- | ----------------- |
@@ -255,12 +251,12 @@ combiner support)._
 
 ```bash
 # Word count on Common Crawl, 10 nodes
-./mapreduce.sh -job scripts/jobs/wordcount -commoncrawl -files-limit 10 -n 10 -output wc.txt
+./mapreduce.sh -job wordcount -commoncrawl -files-limit 10 -n 10 -output wc.txt
 
 # The three analysis jobs
-./mapreduce.sh -job scripts/jobs/langdetect -commoncrawl -files-limit 10 -n 10 -output lang.txt
-./mapreduce.sh -job scripts/jobs/domainpop  -commoncrawl -files-limit 10 -n 10 -output domains.txt
-./mapreduce.sh -job scripts/jobs/docdensity -commoncrawl -files-limit 10 -n 10 -output density.txt
+./mapreduce.sh -job langdetect -commoncrawl -files-limit 10 -n 10 -output lang.txt
+./mapreduce.sh -job domainpop  -commoncrawl -files-limit 10 -n 10 -output domains.txt
+./mapreduce.sh -job docdensity -commoncrawl -files-limit 10 -n 10 -output density.txt
 
 # docdensity post-processing (averages/ratios from integer counters)
 awk -F'\t' '$1=="stat:chars.total"{t=$2} $1=="stat:chars.alnum"{a=$2} $1=="stat:lines"{l=$2}

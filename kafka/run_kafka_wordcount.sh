@@ -16,7 +16,7 @@
 #   ./run_kafka_wordcount.sh -input ../test_input.txt [-output kafka_result.txt]
 #
 # Comparison with the custom framework:
-#   ../mapreduce.sh -job scripts/jobs/wordcount -input <same file> ... prints
+#   ../mapreduce.sh -job wordcount -input <same file> ... prints
 #   "TIMING ... compute_seconds=…"; this script prints the same metric.
 
 set -euo pipefail

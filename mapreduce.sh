@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Runs the full MapReduce pipeline:
 #   1. Fetch available hosts
-#   2. Run the mapreduce client (builds worker, deploys, map→shuffle→reduce→collect)
+#   2. Run the C++ mapreduce client (deploys workers, map→shuffle→reduce→collect)
 #   3. Cleanup is handled by the mapreduce client itself
 #
 # Usage:
-#   ./mapreduce.sh -job scripts/jobs/wordcount -input /path/to/data.txt -output result.txt [-n 10] [-port 9090]
-#   ./mapreduce.sh -job scripts/jobs/wordcount -commoncrawl [-crawl CC-MAIN-2026-05] -output result.txt [-n 10] [-port 9090]
+#   ./mapreduce.sh -job wordcount -input /path/to/data.txt -output result.txt [-n 10] [-port 9090]
+#   ./mapreduce.sh -job wordcount -commoncrawl [-crawl CC-MAIN-2026-05] -output result.txt [-n 10] [-port 9090]
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)"
+SCRIPTS="$ROOT/scripts"
+BIN_DIR="$ROOT/bin"
 HOSTS="$ROOT/hosts.txt"
 
 # Default values (can be overridden by passing the same flags)
@@ -42,16 +43,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$JOB" ]]; then
-  echo "Usage: missing required -job <path> flag" >&2
+  echo "Usage: missing required -job <name> flag" >&2
   exit 1
 fi
 
-if [[ ! -d "$JOB" ]]; then
-  echo "Job path must be an existing directory: $JOB" >&2
-  exit 1
+if [[ "$JOB" == */* ]]; then
+  if [[ ! -d "$JOB" ]]; then
+    echo "Job path must be an existing directory: $JOB" >&2
+    exit 1
+  fi
+  JOB="$(basename "$JOB")"
 fi
 
-JOB="$(cd "$JOB" && pwd)"
+case "$JOB" in
+  wordcount|langdetect|domainpop|docdensity) ;;
+  *)
+    echo "Unsupported job '$JOB'. Supported jobs: wordcount, langdetect, domainpop, docdensity" >&2
+    exit 1
+    ;;
+esac
 
 if [[ -n "$INPUT" ]]; then
   if [[ ! -f "$INPUT" ]]; then
@@ -71,12 +81,16 @@ if [[ -n "$INPUT" && "$USE_COMMONCRAWL" -eq 1 ]]; then
 fi
 
 if [[ -z "$INPUT" && "$USE_COMMONCRAWL" -eq 0 ]]; then
-  echo "Usage: $0 -job <path> -input <file>|-commoncrawl [-crawl <id>] [-files-limit <n>] [-chunks-limit <n>] [-output <file>] [-n <workers>] [-port <port>]" >&2
+  echo "Usage: $0 -job <name> -input <file>|-commoncrawl [-crawl <id>] [-files-limit <n>] [-chunks-limit <n>] [-output <file>] [-n <workers>] [-port <port>]" >&2
   exit 1
 fi
 
+if [[ ! -x "$BIN_DIR/slr_make_hosts" || ! -x "$BIN_DIR/slr_mapreduce" || ! -x "$BIN_DIR/slr_worker" ]]; then
+  "$SCRIPTS/build_cpp.sh"
+fi
+
 echo "=== Step 1: Fetching hosts ==="
-(cd "$SCRIPTS" && go run ./make_hosts -n "$N" -f "$HOSTS")
+"$BIN_DIR/slr_make_hosts" -n "$N" -f "$HOSTS"
 
 echo ""
 echo "=== Step 2: Running MapReduce ==="
@@ -89,13 +103,13 @@ if [[ "$USE_COMMONCRAWL" -eq 1 ]]; then
   (( CHUNKS_LIMIT > 0 )) && EXTRA_FLAGS+=(-chunks-limit "$CHUNKS_LIMIT")
 fi
 
-(cd "$SCRIPTS" && go run ./mapreduce \
+"$BIN_DIR/slr_mapreduce" \
   -hosts "$HOSTS" \
   -job "$JOB" \
   -output "$OUTPUT" \
   -n "$N" \
   -port "$PORT" \
-  "${EXTRA_FLAGS[@]}")
+  "${EXTRA_FLAGS[@]}"
 
 echo ""
 echo "All done. Results are in $OUTPUT"

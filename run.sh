@@ -7,29 +7,35 @@
 
 set -euo pipefail
 
-SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)"
-MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifest.json"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTS="$ROOT/scripts"
+BIN_DIR="$ROOT/bin"
+MANIFEST="$ROOT/manifest.json"
 HOSTS="hosts.txt"
 STATS="stats.txt"
 N=100  # number of cluster nodes; must match "n" in manifest.json
 
+if [[ ! -x "$BIN_DIR/slr_make_hosts" || ! -x "$BIN_DIR/slr_deploy" || ! -x "$BIN_DIR/slr_collect" || ! -x "$BIN_DIR/slr_cleanup" ]]; then
+  "$SCRIPTS/build_cpp.sh"
+fi
+
 cleanup() {
   echo ""
   echo "=== Step 4: Cleaning up ==="
-  (cd "$SCRIPTS" && go run ./cleanup -m "$MANIFEST" -h "../$HOSTS") || true
+  "$BIN_DIR/slr_cleanup" -m "$MANIFEST" -h "$HOSTS" || true
 }
 trap cleanup EXIT
 
 echo "=== Step 1: Fetching $N hosts ==="
-(cd "$SCRIPTS" && go run ./make_hosts -n "$N" -f "../$HOSTS")
+"$BIN_DIR/slr_make_hosts" -n "$N" -f "$HOSTS"
 
 echo ""
 echo "=== Step 2: Starting HTTP servers ==="
-(cd "$SCRIPTS" && go run ./deploy -m "$MANIFEST" -h "../$HOSTS")
+"$BIN_DIR/slr_deploy" -m "$MANIFEST" -h "$HOSTS"
 
 echo ""
 echo "=== Step 3: Collecting stats (1/5/15-min load + memory) ==="
-(cd "$SCRIPTS" && go run ./collect -m "$MANIFEST" -h "../$HOSTS" -o "../$STATS")
+"$BIN_DIR/slr_collect" -m "$MANIFEST" -h "$HOSTS" -o "$STATS"
 echo "Stats written to $STATS"
 
 echo ""

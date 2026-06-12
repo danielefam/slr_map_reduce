@@ -14,6 +14,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
+BIN_DIR="$ROOT/bin"
 EXP_DIR="$ROOT/experiments"
 
 MANIFEST="$ROOT/manifest.json"
@@ -40,13 +41,18 @@ done
 mkdir -p "$EXP_DIR"
 mkdir -p "$(dirname "$OUT")"
 mkdir -p "$(dirname "$MASTER_HOSTS")"
+
+if [[ ! -x "$BIN_DIR/slr_make_hosts" || ! -x "$BIN_DIR/slr_deploy" || ! -x "$BIN_DIR/slr_collect" || ! -x "$BIN_DIR/slr_cleanup" ]]; then
+  "$SCRIPTS/build_cpp.sh"
+fi
+
 WORK_DIR="$(mktemp -d)"
 RUN_HOSTS="$WORK_DIR/hosts.txt"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 if [[ "$DO_FETCH" -eq 1 ]]; then
   echo "=== Fetching up to $NODES hosts ==="
-  ( cd "$SCRIPTS" && go run ./make_hosts -n "$NODES" -f "$MASTER_HOSTS" )
+  "$BIN_DIR/slr_make_hosts" -n "$NODES" -f "$MASTER_HOSTS"
 fi
 
 if [[ ! -s "$MASTER_HOSTS" ]]; then
@@ -78,13 +84,13 @@ run_phase() {
   local phase="$1" parallel="$2" stats_file="$3"
   case "$phase" in
     deploy)
-      timed_run bash -lc "cd '$SCRIPTS' && go run ./deploy -m '$MANIFEST' -h '$RUN_HOSTS' -parallel '$parallel'"
+      timed_run "$BIN_DIR/slr_deploy" -m "$MANIFEST" -h "$RUN_HOSTS" -parallel "$parallel"
       ;;
     collect)
-      timed_run bash -lc "cd '$SCRIPTS' && go run ./collect -m '$MANIFEST' -h '$RUN_HOSTS' -o '$stats_file' -parallel '$parallel'"
+      timed_run "$BIN_DIR/slr_collect" -m "$MANIFEST" -h "$RUN_HOSTS" -o "$stats_file" -parallel "$parallel"
       ;;
     cleanup)
-      timed_run bash -lc "cd '$SCRIPTS' && go run ./cleanup -m '$MANIFEST' -h '$RUN_HOSTS' -parallel '$parallel'"
+      timed_run "$BIN_DIR/slr_cleanup" -m "$MANIFEST" -h "$RUN_HOSTS" -parallel "$parallel"
       ;;
     *)
       echo "unknown phase: $phase" >&2

@@ -12,12 +12,12 @@
 # Bound the workload with -files-limit and/or -chunks-limit.
 #
 # Usage:
-#   experiments/run_benchmark.sh -job scripts/jobs/wordcount -chunks-limit 256
-#   experiments/run_benchmark.sh -job scripts/jobs/wordcount -crawl CC-MAIN-2026-05 -files-limit 4 \
+#   experiments/run_benchmark.sh -job wordcount -chunks-limit 256
+#   experiments/run_benchmark.sh -job wordcount -crawl CC-MAIN-2026-05 -files-limit 4 \
 #       -nodes "1 2 4 8 16 32 64 128" -reps 3 -out experiments/results.csv
 #
 # Flags:
-#   -job          PATH   Required Go job package directory
+#   -job          NAME   Required job name (wordcount|langdetect|domainpop|docdensity)
 #   -crawl        ID     Override the Common Crawl ID (default: latest crawl)
 #   -files-limit  N      Cap number of WET files used
 #   -chunks-limit N      Second workload cap kept for compatibility
@@ -32,6 +32,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
+BIN_DIR="$ROOT/bin"
 EXP_DIR="$ROOT/experiments"
 
 CRAWL=""
@@ -62,18 +63,24 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$JOB" ]]; then
-  echo "Error: missing required -job <path> flag" >&2
+  echo "Error: missing required -job <name> flag" >&2
   exit 1
 fi
 
-if [[ ! -d "$JOB" ]]; then
-  echo "Error: job path must be an existing directory: $JOB" >&2
-  exit 1
-fi
-
-JOB="$(cd "$JOB" && pwd)"
+case "$JOB" in
+  wordcount|langdetect|domainpop|docdensity) ;;
+  *)
+    echo "Error: unsupported -job '$JOB' (expected one of: wordcount, langdetect, domainpop, docdensity)" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$EXP_DIR"
+
+if [[ ! -x "$BIN_DIR/slr_make_hosts" || ! -x "$BIN_DIR/slr_mapreduce" || ! -x "$BIN_DIR/slr_worker" ]]; then
+  "$SCRIPTS/build_cpp.sh"
+fi
+
 WORK_DIR="$(mktemp -d)"
 MASTER_HOSTS="$EXP_DIR/bench-hosts.txt"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -92,7 +99,7 @@ fi
 # ── Fetch a master pool of hosts once ────────────────────────────────────────
 if [[ "$DO_FETCH" -eq 1 ]]; then
   echo "=== Fetching up to $MAX_N hosts ==="
-  ( cd "$SCRIPTS" && go run ./make_hosts -n "$MAX_N" -f "$MASTER_HOSTS" )
+  "$BIN_DIR/slr_make_hosts" -n "$MAX_N" -f "$MASTER_HOSTS"
 fi
 if [[ ! -s "$MASTER_HOSTS" ]]; then
   echo "Error: no master hosts file at $MASTER_HOSTS (run without -no-fetch)" >&2
@@ -116,7 +123,7 @@ run_one() {
   [[ -n "$CRAWL" ]] && extra+=(-crawl "$CRAWL")
   (( FILES_LIMIT  > 0 )) && extra+=(-files-limit  "$FILES_LIMIT")
   (( CHUNKS_LIMIT > 0 )) && extra+=(-chunks-limit "$CHUNKS_LIMIT")
-  log="$( cd "$SCRIPTS" && go run ./mapreduce \
+  log="$( "$BIN_DIR/slr_mapreduce" \
             -hosts "$hosts_file" \
             -job "$JOB" \
             -output "$out_file" \
