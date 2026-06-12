@@ -5,12 +5,14 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSplitIntoChunks_SmallInput(t *testing.T) {
@@ -161,6 +163,54 @@ func TestResolveCommonCrawlURLs(t *testing.T) {
 		if urls[i] != want[i] {
 			t.Errorf("urls[%d] = %q, want %q", i, urls[i], want[i])
 		}
+	}
+}
+
+func TestWaitHealthyWithConfig_ProbesPeersInParallel(t *testing.T) {
+	t.Parallel()
+
+	var listens []net.Listener
+	t.Cleanup(func() {
+		for _, ln := range listens {
+			_ = ln.Close()
+		}
+	})
+
+	startSlowServer := func() string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listens = append(listens, ln)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(100 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		server := &http.Server{Handler: mux}
+		go func() {
+			_ = server.Serve(ln)
+		}()
+		t.Cleanup(func() {
+			_ = server.Close()
+		})
+		return ln.Addr().String()
+	}
+
+	hosts := []string{"h1", "h2", "h3"}
+	peers := []string{startSlowServer(), startSlowServer(), startSlowServer()}
+
+	start := time.Now()
+	gotHosts, gotPeers, err := waitHealthyWithConfig(hosts, peers, len(peers), 1, 0, &http.Client{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("waitHealthyWithConfig: %v", err)
+	}
+	if len(gotHosts) != len(hosts) || len(gotPeers) != len(peers) {
+		t.Fatalf("got %d hosts/%d peers, want %d/%d", len(gotHosts), len(gotPeers), len(hosts), len(peers))
+	}
+	if elapsed := time.Since(start); elapsed >= 250*time.Millisecond {
+		t.Fatalf("health checks took %v, expected parallel probes to finish well under 250ms", elapsed)
 	}
 }
 

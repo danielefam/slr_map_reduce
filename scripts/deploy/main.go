@@ -15,15 +15,14 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
-	"time"
+
+	"scripts/internal/remote"
 )
 
 // Manifest describes what to deploy and where.
@@ -41,6 +40,7 @@ type Manifest struct {
 func main() {
 	m := flag.String("m", "manifest.json", "path to the manifest file")
 	h := flag.String("h", "hosts.txt", "path to the file containing hosts")
+	parallel := flag.Int("parallel", remote.DefaultParallelism, "maximum number of concurrent SSH/SCP operations")
 	flag.Parse()
 
 	manifest, err := parseManifest(*m)
@@ -49,11 +49,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	for _, file := range manifest.Files {
-		fmt.Printf("Copying %s → %s\n", file, manifest.NFS)
-		if err := scpFile(file, manifest.NFS); err != nil {
-			fmt.Fprintf(os.Stderr, "error copying %s: %v\n", file, err)
-			os.Exit(1)
+	if len(manifest.Files) > 0 {
+		fmt.Printf("Copying %d file(s) to %s...\n", len(manifest.Files), manifest.NFS)
+		type copyResult struct {
+			file string
+			err  error
+		}
+		results := make([]copyResult, len(manifest.Files))
+		indexes := make([]int, len(manifest.Files))
+		for i := range manifest.Files {
+			indexes[i] = i
+		}
+		remote.RunBounded(indexes, *parallel, func(i int) {
+			results[i] = copyResult{
+				file: manifest.Files[i],
+				err:  scpFile(manifest.Files[i], manifest.NFS),
+			}
+		})
+		for _, result := range results {
+			if result.err != nil {
+				fmt.Fprintf(os.Stderr, "error copying %s: %v\n", result.file, result.err)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -73,10 +90,13 @@ func main() {
 		mu     sync.Mutex
 		failed int
 	)
+	sem := make(chan struct{}, remote.NormalizeParallelism(*parallel, len(hosts)))
 	for _, host := range hosts {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(h string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			out, err := sshRun(h, manifest.Commands)
 			mu.Lock()
 			defer mu.Unlock()
@@ -126,27 +146,12 @@ func readHosts(path string) ([]string, error) {
 
 // scpFile copies a local file to the remote NFS destination.
 func scpFile(src, dst string) error {
-	cmd := exec.Command("scp", src, dst)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return remote.RunSCP(src, dst, remote.DefaultSCPTimeout)
 }
 
 // sshRun connects to host and executes all commands in a single SSH session,
 // joined with " && " so that a failure in any command stops execution.
 // Returns the combined stdout+stderr output and any error.
 func sshRun(host string, commands []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=5",
-		"-o", "ServerAliveCountMax=3",
-		host,
-		strings.Join(commands, " && "),
-	)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return remote.RunSSH(host, commands, remote.DefaultSSHTimeout)
 }

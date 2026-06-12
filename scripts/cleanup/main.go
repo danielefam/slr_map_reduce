@@ -17,16 +17,15 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
+
+	"scripts/internal/remote"
 )
 
 // Manifest mirrors the deploy manifest; only the fields needed for cleanup are used.
@@ -40,6 +39,7 @@ type Manifest struct {
 func main() {
 	m := flag.String("m", "manifest.json", "path to the manifest file")
 	h := flag.String("h", "hosts.txt", "path to the file containing hosts")
+	parallel := flag.Int("parallel", remote.DefaultParallelism, "maximum number of concurrent SSH operations")
 	flag.Parse()
 
 	manifest, err := parseManifest(*m)
@@ -66,10 +66,13 @@ func main() {
 			wg sync.WaitGroup
 			mu sync.Mutex
 		)
+		sem := make(chan struct{}, remote.NormalizeParallelism(*parallel, len(hosts)))
 		for _, host := range hosts {
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(h string) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				out, err := sshRun(h, manifest.CleanupCommands)
 				mu.Lock()
 				defer mu.Unlock()
@@ -129,19 +132,7 @@ func readHosts(path string) ([]string, error) {
 // joined with " && " so that a failure in any command stops execution.
 // Returns the combined stdout+stderr output and any error.
 func sshRun(host string, commands []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=5",
-		"-o", "ServerAliveCountMax=3",
-		host,
-		strings.Join(commands, " && "),
-	)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return remote.RunSSH(host, commands, remote.DefaultSSHTimeout)
 }
 
 // removeFromNFS parses the NFS target (e.g. "user@host:/path/") and SSHes into
@@ -159,9 +150,14 @@ func removeFromNFS(nfs string, files []string) error {
 		remotePaths[i] = filepath.Join(basePath, filepath.Base(f))
 	}
 
-	args := append([]string{sshHost, "rm", "-f"}, remotePaths...)
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	quoted := make([]string, len(remotePaths))
+	for i, path := range remotePaths {
+		quoted[i] = shellQuote(path)
+	}
+	_, err := remote.RunSSH(sshHost, []string{"rm -f -- " + strings.Join(quoted, " ")}, remote.DefaultSSHTimeout)
+	return err
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
