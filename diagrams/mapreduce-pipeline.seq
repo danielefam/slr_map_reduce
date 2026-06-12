@@ -1,0 +1,36 @@
+title MapReduce Pipeline
+
+note over Orchestrator: Split input into ≤64 MB chunks\n(split on newline boundaries)\nOr assign NFS .wet/.wet.gz files round-robin via POST /load
+
+Orchestrator->W0: POST /data  (chunk 0)
+Orchestrator->W1: POST /data  (chunk 1)
+Orchestrator->Wn: POST /data  (chunk N-1)
+
+Orchestrator->W0: POST /map  {"id":0,"peers":[...]}
+Orchestrator->W1: POST /map  {"id":1,"peers":[...]}
+Orchestrator->Wn: POST /map  {"id":N-1,"peers":[...]}
+note over W0,Wn: Each worker partitions its intermediate KVs into N bucket files\n(map-bucket-{n}-{idx}.jsonl) keyed by FNV-32a(key) % N
+W0-->Orchestrator: 200
+W1-->Orchestrator: 200
+Wn-->Orchestrator: 200
+
+Orchestrator->W0: POST /reduce
+Orchestrator->W1: POST /reduce
+Orchestrator->Wn: POST /reduce
+note over W0,Wn: Each worker fetches its pre-partitioned bucket from all peers\nvia GET /intermediate?reducer=id&n=N (O(1) file read, no scan)\nthen runs the reduce function locally
+W0->W1: GET /intermediate?reducer=0&n=N
+W0->Wn: GET /intermediate?reducer=0&n=N
+W1->W0: GET /intermediate?reducer=1&n=N
+W1->Wn: GET /intermediate?reducer=1&n=N
+W0-->Orchestrator: 200
+W1-->Orchestrator: 200
+Wn-->Orchestrator: 200
+
+Orchestrator->W0: GET /result
+Orchestrator->W1: GET /result
+Orchestrator->Wn: GET /result
+W0-->Orchestrator: key-values
+W1-->Orchestrator: key-values
+Wn-->Orchestrator: key-values
+
+note over Orchestrator: Merge counts, sort, write output file
