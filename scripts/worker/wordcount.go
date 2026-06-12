@@ -1,26 +1,20 @@
 package main
 
 import (
-	"strconv"
-	"strings"
-	"unicode"
+	"scripts/jobs/wordcount"
 )
 
-// wordCountMap emits (word, "1") for every alphanumeric token in text.
-func wordCountMap(_ string, text string) []KeyValue {
-	words := strings.FieldsFunc(text, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
-	})
-	out := make([]KeyValue, 0, len(words))
-	for _, w := range words {
-		if w != "" {
-			out = append(out, KeyValue{Key: strings.ToLower(w), Value: "1"})
-		}
-	}
-	return out
+var (
+	wordCountMapper  = wordcount.NewMapper()
+	wordCountReducer = wordcount.NewReducer()
+)
+
+// wordCountMap adapts the sample word-count job for existing worker tests.
+func wordCountMap(docID, text string) []KeyValue {
+	return wordCountMapper.Map(docID, text)
 }
 
-// wordCountReduce counts the number of values emitted for a word.
-func wordCountReduce(_ string, values []string) string {
-	return strconv.Itoa(len(values))
+// wordCountReduce adapts the sample word-count job for existing worker tests.
+func wordCountReduce(key string, values []string) string {
+	return wordCountReducer.Reduce(key, values)
 }

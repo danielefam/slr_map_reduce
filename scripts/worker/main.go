@@ -144,7 +144,12 @@ func main() {
 		log.Fatalf("create work dir: %v", err)
 	}
 
-	srv := newServer(wordCountMap, wordCountReduce, workDir)
+	mapper, reducer, err := loadInjectedJob()
+	if err != nil {
+		log.Fatalf("load injected job: %v", err)
+	}
+
+	srv := newServer(mapFuncFrom(mapper), reduceFuncFrom(reducer), workDir)
 	addr := ":" + *port
 	log.Printf("worker listening on %s (workDir: %s)", addr, workDir)
 	if err := http.ListenAndServe(addr, srv.handler()); err != nil {

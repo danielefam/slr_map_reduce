@@ -5,7 +5,7 @@ pool of remote lab machines (`*.enst.fr`):
 
 | Script         | Purpose                                                                    |
 | -------------- | -------------------------------------------------------------------------- |
-| `mapreduce.sh` | Run a distributed **word-count MapReduce** job across N remote workers     |
+| `mapreduce.sh` | Run a distributed **custom MapReduce** job across N remote workers         |
 | `run.sh`       | Deploy an HTTP server to remote hosts, collect system stats, then clean up |
 
 Both workflows are written in Go and share a common `hosts.txt` discovery mechanism.
@@ -26,6 +26,8 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
     ├── deploy/         # Copies files to NFS and runs commands via SSH
     ├── collect/        # Collects stats from remote hosts via SSH
     ├── cleanup/        # Runs cleanup commands and removes NFS files
+    ├── mrjob/          # Shared Mapper / Reducer interfaces for custom jobs
+    ├── jobs/           # Reference and user-provided MapReduce job packages
     ├── mapreduce/      # Client-side MapReduce orchestrator
     └── worker/         # HTTP worker server (map / reduce)
 ```
@@ -42,16 +44,17 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 ## Quick Start
 
-### Word-Count MapReduce
+### Custom MapReduce Job
 
 ```bash
-./mapreduce.sh -input /path/to/data.txt -output result.txt -n 10 -port 9090
+./mapreduce.sh -job scripts/jobs/wordcount -input /path/to/data.txt -output result.txt -n 10 -port 9090
 # or, from the official Common Crawl website:
-./mapreduce.sh -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 4 -output result.txt -n 10 -port 9090
+./mapreduce.sh -job scripts/jobs/wordcount -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 4 -output result.txt -n 10 -port 9090
 ```
 
 | Flag            | Default      | Description                                                                        |
 | --------------- | ------------ | ---------------------------------------------------------------------------------- |
+| `-job`          | _(required)_ | Path to a Go package directory that exports `NewMapper()` and `NewReducer()`       |
 | `-input`        | _(optional)_ | Path to the input text file                                                        |
 | `-commoncrawl`  | _(optional)_ | Use the official Common Crawl website instead of a local file                      |
 | `-crawl`        | latest crawl | Common Crawl ID override for reproducible website-backed runs                      |
@@ -64,6 +67,19 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 The output file contains one `word<TAB>count` line per word, sorted by
 descending count then alphabetically.
+
+The repository includes `scripts/jobs/wordcount` as a reference job package.
+Custom job packages must implement the interfaces from `scripts/mrjob` and
+export:
+
+```go
+func NewMapper() mrjob.Mapper
+func NewReducer() mrjob.Reducer
+```
+
+`mapreduce.sh` resolves relative `-input` and `-output` paths from the
+repository root, so commands like `-input data/simple.txt -output result.txt`
+work regardless of the wrapper changing into `scripts/` internally.
 
 ### Remote Stats Collection
 
@@ -182,15 +198,15 @@ remote node by the `mapreduce` orchestrator.
 Coordinates the full pipeline from the client machine:
 
 1. Read N hosts from `hosts.txt`
-2. Build the worker binary (`GOOS=linux GOARCH=amd64`)
-3. SCP the binary to each node
+2. Build the worker binary (`GOOS=linux GOARCH=amd64`) against the required `-job` package
+3. SCP the staged binary to each node, then swap it into place remotely
 4. SSH each node to start the worker HTTP server (`nohup`) using SSH connection reuse
 5. Wait for all workers to pass the health check with bounded parallel probes
 6. Distribute input — either split a local file (`-input`) into 64 MB chunks and push them via `POST /data`, **or** resolve Common Crawl WET URLs from the official website and assign them **round-robin** across the N workers via `POST /load`. Workers download those WET files into their local `workDir`, map from local file streams, and delete the downloaded inputs after map succeeds. Bound Common Crawl runs with `-files-limit` and/or `-chunks-limit`.
 7. Broadcast `POST /map` with each worker's ID and the full peer list — each worker partitions its intermediate KVs into N bucket files (`map-bucket-{n}-{idx}.jsonl`) using `FNV-32a(key) % N`
 8. Broadcast `POST /reduce` — each worker fetches its pre-partitioned bucket file from every peer via `GET /intermediate?reducer=id&n=N` (O(1) file read per peer) and runs reduce locally
-9. `GET /result` from every worker, merge word counts, sort (descending count, then alphabetical), write output file
-10. SSH cleanup: kill worker processes and remove temporary files
+9. `GET /result` from every worker, merge final key/value results, sort (descending numeric value when applicable, then alphabetical), write output file
+10. SSH cleanup: kill worker processes and remove temporary files, including failure paths after deploy
 
 ---
 
@@ -290,7 +306,7 @@ sequenceDiagram
         Wn-->>Orchestrator: key-values
     end
 
-    Note over Orchestrator: Merge counts, sort, write output file
+    Note over Orchestrator: Merge integer reducer outputs by key, sort, write output file
 ```
 
 ---
@@ -342,7 +358,7 @@ Input file
 (or: .wet/.wet.gz files assigned round-robin ── POST /load ──▶ Workers)
 
 Workers: Map phase
-    Each worker applies wordCountMap line-by-line:
+    Each worker applies the selected job's Mapper line-by-line:
     "hello world hello" → [(hello,1),(world,1),(hello,1)]
     Output: N pre-partitioned bucket files on disk (map-bucket-{n}-{idx}.jsonl)
     Keys routed by FNV-32a(key) % N — partitioning done once, at map time
@@ -352,27 +368,41 @@ Workers: Reduce phase  (pull-based, no orchestrator involvement)
       GET /intermediate?reducer=i&n=N
     Peers serve map-bucket-{n}-{i}.jsonl directly — O(1), no scan
     After fetching: each worker owns all values for a disjoint key set
-    wordCountReduce(key, values) = len(values)
+    The selected job's Reducer runs on that worker-local key set
     Output: sorted []KeyValue
 
 Orchestrator: Collect phase
     GET /result from all workers
-    Merge totals (sum counts across workers for same key)
+    Merge totals (sum integer reducer outputs across workers for same key)
     Sort: descending count, then alphabetical
     Write to output file
 ```
 
 ---
 
-## Word-Count Functions
+## Job Contract
 
-| Function          | Signature                    | Behaviour                                                                           |
-| ----------------- | ---------------------------- | ----------------------------------------------------------------------------------- |
-| `wordCountMap`    | `(docID, text) → []KeyValue` | Splits text on non-alphanumeric runes; emits `(lowercase_word, "1")` for each token |
-| `wordCountReduce` | `(key, []string) → string`   | Returns `len(values)` as a string (counts occurrences)                              |
+Custom jobs live under `scripts/jobs/` and must satisfy the `scripts/mrjob`
+contract:
 
-The map and reduce functions are pluggable via the `MapFunc` / `ReduceFunc` type
-aliases, so the worker can be adapted to other jobs.
+| Item          | Purpose |
+| ------------- | ------- |
+| `mrjob.Mapper` | Produces intermediate `[]KeyValue` pairs from one input document |
+| `mrjob.Reducer` | Reduces all values for one key into the final string value |
+| `NewMapper()` | Returns the job's mapper implementation |
+| `NewReducer()` | Returns the job's reducer implementation |
+
+### Reference job: `scripts/jobs/wordcount`
+
+| Function          | Behaviour                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------- |
+| `Mapper.Map`      | Splits text on non-alphanumeric runes; emits `(lowercase_word, "1")` for each token |
+| `Reducer.Reduce`  | Returns `len(values)` as a string (counts occurrences)                              |
+
+> **Current limitation:** the orchestrator still merges final `/result` payloads by
+> parsing `kv.Value` as an integer and summing counts across workers. That means
+> custom reducers must currently return integer strings if they want the final
+> merged output to be meaningful.
 
 ---
 
@@ -396,7 +426,8 @@ cd scripts && go vet ./worker/ ./mapreduce/ ./deploy/ ./collect/ ./cleanup/ ./ma
 ```
 
 The `mapreduce` orchestrator cross-compiles the worker automatically
-(`GOOS=linux GOARCH=amd64`) before deploying it.
+(`GOOS=linux GOARCH=amd64`) before deploying it, injecting the required `-job`
+package into the worker binary at build time.
 
 ---
 
@@ -441,6 +472,7 @@ Bound it with `-files-limit` and/or `-chunks-limit`.
 ```bash
 # Recommended: sweep 1→128, 3 reps/N, and plot at the end.
 experiments/run_benchmark.sh \
+    -job scripts/jobs/wordcount \
     -crawl CC-MAIN-2026-05 \
     -chunks-limit 256 \
     -nodes "1 2 4 8 16 32 64 128" \
@@ -452,7 +484,8 @@ What happens for each node count `N` in the sequence:
 
 1. The runner fetches a master host pool once (`make_hosts -n <maxN>`), then
    slices the first `N` hosts for the run.
-2. It invokes the MapReduce orchestrator `-reps` times. Each run loads the data
+2. It invokes the MapReduce orchestrator `-reps` times with the required `-job`
+   package. Each run loads the data
    **before** starting the timer, then times only map → reduce → collect and
    prints `TIMING nodes=N … compute_seconds=…`.
 3. The runner parses `compute_seconds`, validates that the orchestrator actually
@@ -495,6 +528,7 @@ existing `experiments/bench-hosts.txt`:
 
 ```bash
 experiments/run_benchmark.sh -crawl CC-MAIN-2026-05 -chunks-limit 256 \
+    -job scripts/jobs/wordcount \
     -no-fetch -plot
 ```
 
@@ -510,6 +544,7 @@ experiments/run_benchmark.sh -crawl CC-MAIN-2026-05 -chunks-limit 256 \
 
 | Flag            | Default                   | Purpose                                                 |
 | --------------- | ------------------------- | ------------------------------------------------------- |
+| `-job`          | _(required)_              | Go job package directory to build into the worker       |
 | `-crawl`        | latest crawl              | Common Crawl ID override                                |
 | `-files-limit`  | 0                         | Cap number of WET files (fixed workload)                |
 | `-chunks-limit` | 0                         | Second workload cap kept for compatibility              |

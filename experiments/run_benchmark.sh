@@ -12,11 +12,12 @@
 # Bound the workload with -files-limit and/or -chunks-limit.
 #
 # Usage:
-#   experiments/run_benchmark.sh -chunks-limit 256
-#   experiments/run_benchmark.sh -crawl CC-MAIN-2026-05 -files-limit 4 \
+#   experiments/run_benchmark.sh -job scripts/jobs/wordcount -chunks-limit 256
+#   experiments/run_benchmark.sh -job scripts/jobs/wordcount -crawl CC-MAIN-2026-05 -files-limit 4 \
 #       -nodes "1 2 4 8 16 32 64 128" -reps 3 -out experiments/results.csv
 #
 # Flags:
+#   -job          PATH   Required Go job package directory
 #   -crawl        ID     Override the Common Crawl ID (default: latest crawl)
 #   -files-limit  N      Cap number of WET files used
 #   -chunks-limit N      Second workload cap kept for compatibility
@@ -34,6 +35,7 @@ SCRIPTS="$ROOT/scripts"
 EXP_DIR="$ROOT/experiments"
 
 CRAWL=""
+JOB=""
 FILES_LIMIT=0
 CHUNKS_LIMIT=0
 NODES="1 2 4 8 16 32 64 128"
@@ -45,6 +47,7 @@ DO_FETCH=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -job)          JOB="$2";          shift 2 ;;
     -crawl)        CRAWL="$2";        shift 2 ;;
     -files-limit)  FILES_LIMIT="$2";  shift 2 ;;
     -chunks-limit) CHUNKS_LIMIT="$2"; shift 2 ;;
@@ -57,6 +60,18 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
+
+if [[ -z "$JOB" ]]; then
+  echo "Error: missing required -job <path> flag" >&2
+  exit 1
+fi
+
+if [[ ! -d "$JOB" ]]; then
+  echo "Error: job path must be an existing directory: $JOB" >&2
+  exit 1
+fi
+
+JOB="$(cd "$JOB" && pwd)"
 
 mkdir -p "$EXP_DIR"
 WORK_DIR="$(mktemp -d)"
@@ -103,6 +118,7 @@ run_one() {
   (( CHUNKS_LIMIT > 0 )) && extra+=(-chunks-limit "$CHUNKS_LIMIT")
   log="$( cd "$SCRIPTS" && go run ./mapreduce \
             -hosts "$hosts_file" \
+            -job "$JOB" \
             -output "$out_file" \
             -n "$n" \
             -port "$PORT" \

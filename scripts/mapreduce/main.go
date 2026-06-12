@@ -17,8 +17,8 @@
 //
 // Usage:
 //
-//	mapreduce -hosts hosts.txt -input data.txt -output result.txt [-n 10] [-port 9090]
-//	mapreduce -hosts hosts.txt -commoncrawl [-crawl CC-MAIN-2026-05] -output result.txt [-n 10] [-port 9090]
+//	mapreduce -hosts hosts.txt -job ./jobs/wordcount -input data.txt -output result.txt [-n 10] [-port 9090]
+//	mapreduce -hosts hosts.txt -job ./jobs/wordcount -commoncrawl [-crawl CC-MAIN-2026-05] -output result.txt [-n 10] [-port 9090]
 package main
 
 import (
@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,11 +73,18 @@ type mapRequest struct {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	hostsFile := flag.String("hosts", "../hosts.txt", "path to hosts file")
 	inputFile := flag.String("input", "", "path to input data file")
 	commonCrawl := flag.Bool("commoncrawl", false, "read input from the official Common Crawl website instead of a local file")
 	crawl := flag.String("crawl", "", "Common Crawl ID to use in -commoncrawl mode (default: latest crawl)")
 	outputFile := flag.String("output", "result.txt", "path for merged output file")
+	jobPath := flag.String("job", "", "path to Go package directory that exports NewMapper and NewReducer")
 	n := flag.Int("n", 0, "number of workers (0 = all hosts)")
 	filesLimit := flag.Int("files-limit", 0, "cap the number of Common Crawl WET files used in -commoncrawl mode (0 = all)")
 	chunksLimit := flag.Int("chunks-limit", 0, "additional Common Crawl workload cap kept for benchmark compatibility; applied as a second URL-count limit (0 = disabled)")
@@ -88,15 +96,17 @@ func main() {
 	flag.Parse()
 
 	switch {
+	case strings.TrimSpace(*jobPath) == "":
+		return fmt.Errorf("missing required -job <path> flag")
 	case *inputFile == "" && !*commonCrawl:
-		log.Fatal("choose exactly one input mode: -input <file> or -commoncrawl [-crawl CC-MAIN-...]")
+		return fmt.Errorf("choose exactly one input mode: -input <file> or -commoncrawl [-crawl CC-MAIN-...]")
 	case *inputFile != "" && *commonCrawl:
-		log.Fatal("-input and -commoncrawl are mutually exclusive")
+		return fmt.Errorf("-input and -commoncrawl are mutually exclusive")
 	}
 
 	hosts, err := readHosts(*hostsFile)
 	if err != nil {
-		log.Fatalf("read hosts: %v", err)
+		return fmt.Errorf("read hosts: %w", err)
 	}
 	nWorkers := len(hosts)
 	peers := make([]string, nWorkers)
@@ -104,28 +114,48 @@ func main() {
 		peers[i] = h + ":" + *port
 	}
 
+	var coord *coordinator
+	var deployedHosts []string
+	cancel := func() {}
+	defer func() {
+		cancel()
+		if len(deployedHosts) == 0 {
+			return
+		}
+		log.Println("cleaning up workers…")
+		hostsForCleanup := append([]string(nil), deployedHosts...)
+		if coord != nil {
+			hostsForCleanup = peerHosts(coord.hostsForCleanup())
+		}
+		cleanupWorkers(hostsForCleanup, *parallel)
+	}()
+
 	log.Printf("candidate workers: %d (target -n=%d)", nWorkers, *n)
 
 	// ── Step 1: build worker binary ────────────────────────────────────────
 	log.Println("building worker binary…")
-	if err := buildWorker(); err != nil {
-		log.Fatalf("build failed: %v", err)
+	workerBuildPath, err := buildWorker(*jobPath)
+	if err != nil {
+		return fmt.Errorf("build failed: %w", err)
 	}
+	defer os.Remove(workerBuildPath)
 
 	// ── Step 2: SCP binary to every node ───────────────────────────────────
 	log.Println("deploying worker binary…")
-	hosts, peers, err = deployWorker(hosts, peers, *port, *parallel)
+	hosts, peers, err = deployWorker(hosts, peers, workerBuildPath, *port, *parallel)
 	if err != nil {
-		log.Fatalf("deploy failed: %v", err)
+		return fmt.Errorf("deploy failed: %w", err)
 	}
+	deployedHosts = append([]string(nil), hosts...)
 	log.Printf("deployed to %d workers", len(hosts))
 
 	// ── Step 3: health-check all workers ───────────────────────────────────
 	log.Println("waiting for workers to become ready…")
 	hosts, peers, err = waitHealthy(hosts, peers, *parallel)
 	if err != nil {
-		log.Fatalf("health check: %v", err)
+		return fmt.Errorf("health check: %w", err)
 	}
+	deployedHosts = append(deployedHosts[:0], hosts...)
 	log.Printf("%d workers ready", len(hosts))
 
 	// Decide how many slots (N) and which hosts are spares.
@@ -134,7 +164,7 @@ func main() {
 		target = len(hosts)
 	}
 	if target > len(hosts) {
-		log.Fatalf("need at least %d healthy workers but only %d are ready", target, len(hosts))
+		return fmt.Errorf("need at least %d healthy workers but only %d are ready", target, len(hosts))
 	}
 	slotPeers := peers[:target]
 	sparePeers := append([]string(nil), peers[target:]...)
@@ -142,14 +172,14 @@ func main() {
 		len(slotPeers), len(sparePeers), *n)
 
 	// Assemble the coordinator.
-	coord := newCoordinator(slotPeers, sparePeers, *maxAttempts, *backoffInitial, *healthInterval)
+	coord = newCoordinator(slotPeers, sparePeers, *maxAttempts, *backoffInitial, *healthInterval)
 
 	// ── Step 4: assign input to slots ───────────────────────────────────────
 	log.Println("preparing slot inputs…")
 	if *commonCrawl {
 		resolvedCrawl, urls, err := resolveCommonCrawlURLs(*crawl, *filesLimit, *chunksLimit)
 		if err != nil {
-			log.Fatalf("resolve Common Crawl inputs: %v", err)
+			return fmt.Errorf("resolve Common Crawl inputs: %w", err)
 		}
 		log.Printf("resolved %d Common Crawl WET URLs from %s, distributing round-robin across %d slots",
 			len(urls), resolvedCrawl, len(coord.slots))
@@ -163,12 +193,12 @@ func main() {
 	} else {
 		f, err := os.Open(*inputFile)
 		if err != nil {
-			log.Fatalf("open input: %v", err)
+			return fmt.Errorf("open input: %w", err)
 		}
 		chunks, err := splitIntoChunks(f, chunkSize)
 		f.Close()
 		if err != nil {
-			log.Fatalf("split input: %v", err)
+			return fmt.Errorf("split input: %w", err)
 		}
 		for i, s := range coord.slots {
 			s.chunk = chunkForWorker(chunks, i)
@@ -177,15 +207,15 @@ func main() {
 
 	// ── Step 5: drive all slots through map → reduce → result ───────────────
 	// Background health watcher cancels in-flight calls on dead hosts.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stopHealth := context.WithCancel(context.Background())
+	cancel = stopHealth
 	go coord.watchHealth(ctx)
 
 	// Load data onto workers BEFORE the compute timer starts so that the
 	// /data upload (or /load) is excluded from the measured compute time.
 	log.Println("loading data onto workers…")
 	if err := coord.drive(ctx, sLoaded); err != nil {
-		log.Fatalf("load phase: %v", err)
+		return fmt.Errorf("load phase: %w", err)
 	}
 	log.Println("load phase done")
 
@@ -193,7 +223,7 @@ func main() {
 	computeStart := time.Now()
 	mapStart := computeStart
 	if err := coord.drive(ctx, sMapped); err != nil {
-		log.Fatalf("map phase: %v", err)
+		return fmt.Errorf("map phase: %w", err)
 	}
 	mapDur := time.Since(mapStart)
 	log.Println("map phase done")
@@ -201,7 +231,7 @@ func main() {
 	log.Println("starting reduce phase…")
 	reduceStart := time.Now()
 	if err := coord.drive(ctx, sReduced); err != nil {
-		log.Fatalf("reduce phase: %v", err)
+		return fmt.Errorf("reduce phase: %w", err)
 	}
 	reduceDur := time.Since(reduceStart)
 	log.Println("reduce phase done")
@@ -209,10 +239,10 @@ func main() {
 	log.Println("collecting results…")
 	collectStart := time.Now()
 	if err := coord.drive(ctx, sDone); err != nil {
-		log.Fatalf("collect: %v", err)
+		return fmt.Errorf("collect: %w", err)
 	}
 	if err := coord.mergeResults(*outputFile); err != nil {
-		log.Fatalf("merge: %v", err)
+		return fmt.Errorf("merge: %w", err)
 	}
 	collectDur := time.Since(collectStart)
 	computeDur := time.Since(computeStart)
@@ -224,18 +254,7 @@ func main() {
 
 	// Stop the health watcher before cleanup so it doesn't race with kills.
 	cancel()
-
-	// ── Step 6: cleanup ─────────────────────────────────────────────────────
-	log.Println("cleaning up workers…")
-	cleanupHosts := make([]string, 0)
-	for _, peer := range coord.hostsForCleanup() {
-		host, _, found := strings.Cut(peer, ":")
-		if !found {
-			host = peer
-		}
-		cleanupHosts = append(cleanupHosts, host)
-	}
-	cleanupWorkers(cleanupHosts, *parallel)
+	return nil
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -254,32 +273,61 @@ func readHosts(path string) ([]string, error) {
 	return hosts, nil
 }
 
-// buildWorker compiles the worker binary for linux/amd64 into a temp file.
-// It expects to be run via `go run ./mapreduce` from the scripts/ directory,
-// so the worker source is at ./worker relative to the current working directory.
-func buildWorker() error {
-	// When run via `go run ./mapreduce` the cwd is scripts/.
-	// When run as a compiled binary the cwd may differ; accept a -worker-src flag
-	// or fall back to locating the source relative to os.Executable.
-	workerSrc := "./worker" // relative to scripts/
-	if _, err := os.Stat(workerSrc); err != nil {
-		// Try relative to the binary's directory
-		exe, _ := os.Executable()
-		workerSrc = filepath.Join(filepath.Dir(exe), "..", "worker")
+// buildWorker compiles a worker binary for linux/amd64 into a temp file.
+// It injects the selected job package into a temporary worker package copy so
+// that the deployed binary has no fallback/default job.
+func buildWorker(jobPath string) (string, error) {
+	scriptsDir, err := resolveScriptsDir()
+	if err != nil {
+		return "", err
+	}
+	jobImportPath, err := resolveJobImportPath(scriptsDir, jobPath)
+	if err != nil {
+		return "", err
 	}
 
-	out := "/tmp/mr-worker-build"
-	cmd := exec.Command("go", "build", "-o", out, workerSrc)
+	workerSrc := filepath.Join(scriptsDir, "worker")
+	buildDir, err := os.MkdirTemp(scriptsDir, ".mr-worker-build-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(buildDir)
+
+	if err := copyWorkerPackage(workerSrc, buildDir); err != nil {
+		return "", err
+	}
+	if err := writeInjectedJobBinding(buildDir, jobImportPath); err != nil {
+		return "", err
+	}
+
+	outFile, err := os.CreateTemp("", "mr-worker-build-*")
+	if err != nil {
+		return "", err
+	}
+	out := outFile.Name()
+	if err := outFile.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Remove(out); err != nil {
+		return "", err
+	}
+
+	buildTarget := "./" + filepath.Base(buildDir)
+	cmd := exec.Command("go", "build", "-o", out, buildTarget)
+	cmd.Dir = scriptsDir
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // deployWorker SCPs the worker binary to each host and starts the HTTP server.
 // It returns the subset of hosts and peers that were successfully deployed.
 // An error is returned only if every host fails.
-func deployWorker(hosts, peers []string, port string, parallel int) ([]string, []string, error) {
+func deployWorker(hosts, peers []string, workerBuildPath, port string, parallel int) ([]string, []string, error) {
 	type result struct {
 		host string
 		peer string
@@ -294,19 +342,19 @@ func deployWorker(hosts, peers []string, port string, parallel int) ([]string, [
 		host := hosts[idx]
 		peer := peers[idx]
 		results[idx] = result{host: host, peer: peer}
-		// Copy first so the startup SSH session can reuse the same control socket
-		// for cleanup + launch on a warm connection.
-		if err := scpTo("/tmp/mr-worker-build", host, workerBinary); err != nil {
+		remoteBinary := fmt.Sprintf("%s.deploy-%d", workerBinary, time.Now().UnixNano()+int64(idx))
+		if err := scpTo(workerBuildPath, host, remoteBinary); err != nil {
 			results[idx].err = fmt.Errorf("scp to %s: %w", host, err)
 			return
 		}
 		startCmd := fmt.Sprintf(
 			"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "+
-				"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log && "+
-				"chmod +x %s && nohup %s -port %s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
-			workerBinary, workerBinary, port)
+				"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log %s && "+
+				"mv %s %s && chmod +x %s && nohup %s -port %s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
+			workerBinary, remoteBinary, workerBinary, workerBinary, workerBinary, port)
 		_, err := sshRun(host, []string{startCmd})
 		if err != nil {
+			_, _ = sshRun(host, []string{"rm -f " + remoteBinary})
 			results[idx].err = fmt.Errorf("ssh start on %s: %w", host, err)
 		}
 	})
@@ -328,6 +376,114 @@ func deployWorker(hosts, peers []string, port string, parallel int) ([]string, [
 
 func scpTo(src, host, dst string) error {
 	return remote.RunSCP(src, host+":"+dst, remote.DefaultSCPTimeout)
+}
+
+func resolveScriptsDir() (string, error) {
+	if _, err := os.Stat("go.mod"); err == nil {
+		return filepath.Abs(".")
+	}
+
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if ok {
+		candidate := filepath.Join(filepath.Dir(sourceFile), "..")
+		if _, err := os.Stat(filepath.Join(candidate, "go.mod")); err == nil {
+			return filepath.Abs(candidate)
+		}
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate executable: %w", err)
+	}
+	candidate := filepath.Join(filepath.Dir(exe), "..")
+	if _, err := os.Stat(filepath.Join(candidate, "go.mod")); err != nil {
+		return "", fmt.Errorf("locate scripts directory: %w", err)
+	}
+	return filepath.Abs(candidate)
+}
+
+func resolveJobImportPath(scriptsDir, jobPath string) (string, error) {
+	jobPath = strings.TrimSpace(jobPath)
+	if jobPath == "" {
+		return "", fmt.Errorf("job path is required")
+	}
+
+	absJobPath, err := filepath.Abs(jobPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve job path %q: %w", jobPath, err)
+	}
+	info, err := os.Stat(absJobPath)
+	if err != nil {
+		return "", fmt.Errorf("stat job path %q: %w", jobPath, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("job path %q is not a directory", jobPath)
+	}
+
+	rel, err := filepath.Rel(scriptsDir, absJobPath)
+	if err != nil {
+		return "", fmt.Errorf("relativize job path %q: %w", jobPath, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("job path %q must be inside %s", absJobPath, scriptsDir)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(absJobPath, "*.go"))
+	if err != nil {
+		return "", fmt.Errorf("list Go files in %q: %w", jobPath, err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("job path %q does not contain any Go files", jobPath)
+	}
+
+	return "scripts/" + filepath.ToSlash(rel), nil
+}
+
+func copyWorkerPackage(srcDir, dstDir string) error {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == "builtin_job.go" {
+			continue
+		}
+		if err := copyFile(filepath.Join(srcDir, name), filepath.Join(dstDir, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, info.Mode().Perm())
+}
+
+func writeInjectedJobBinding(buildDir, jobImportPath string) error {
+	content := fmt.Sprintf(`package main
+
+import (
+	"scripts/mrjob"
+	job %q
+)
+
+func loadInjectedJob() (mrjob.Mapper, mrjob.Reducer, error) {
+	return job.NewMapper(), job.NewReducer(), nil
+}
+`, jobImportPath)
+	return os.WriteFile(filepath.Join(buildDir, "job_binding_generated.go"), []byte(content), 0o644)
 }
 
 func sshRun(host string, commands []string) (string, error) {
@@ -784,6 +940,18 @@ func cleanupWorkers(hosts []string, parallel int) {
 			log.Printf("[%s] cleanup warning: %v", host, err)
 		}
 	})
+}
+
+func peerHosts(peers []string) []string {
+	hosts := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		host, _, found := strings.Cut(peer, ":")
+		if !found {
+			host = peer
+		}
+		hosts = append(hosts, host)
+	}
+	return hosts
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
