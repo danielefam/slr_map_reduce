@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -19,7 +21,31 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr size_t kChunkSize = 64u * 1024u * 1024u;
-constexpr const char* kWorkerBinary = "/tmp/mr-worker";
+
+std::string user_tag() {
+  const char* user_env = std::getenv("USER");
+  std::string user = (user_env != nullptr && *user_env != '\0') ? std::string(user_env) : "unknown";
+  for (char& ch : user) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (!(std::isalnum(uch) || ch == '-' || ch == '_')) {
+      ch = '_';
+    }
+  }
+  return user;
+}
+
+std::string worker_binary_path() {
+  static const std::string path = "/tmp/mr-worker-" + user_tag();
+  return path;
+}
+
+std::string worker_pid_path() {
+  return worker_binary_path() + ".pid";
+}
+
+std::string worker_log_path() {
+  return worker_binary_path() + ".log";
+}
 
 struct Config {
   std::string hosts_file = "../hosts.txt";
@@ -130,9 +156,12 @@ std::vector<std::string> health_ready(const std::vector<std::string>& peers, int
 }
 
 void deploy_workers(const std::vector<std::string>& hosts, const std::string& worker_local_path, int port, const std::string& job_name, bool pprof, int parallel) {
+  const std::string worker_binary = worker_binary_path();
+  const std::string worker_pid = worker_pid_path();
+  const std::string worker_log = worker_log_path();
   slr::parallel_for(hosts.size(), parallel, [&](size_t i) {
     const std::string& host = hosts[i];
-    const std::string remote_binary = std::string(kWorkerBinary) + ".deploy-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(i);
+    const std::string remote_binary = worker_binary + ".deploy-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(i);
     const std::string scp_cmd = "scp " + slr::ssh_options() + " " + slr::shell_quote(worker_local_path) + " " + slr::shell_quote(host + ":" + remote_binary);
     auto scp = slr::exec_capture(scp_cmd);
     if (scp.exit_code != 0) {
@@ -140,12 +169,12 @@ void deploy_workers(const std::vector<std::string>& hosts, const std::string& wo
     }
 
     const std::string start_cmd =
-        "kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "
-        "rm -f /tmp/mr-worker.pid /tmp/mr-worker.log " + std::string(kWorkerBinary) + " && "
-        "mv " + remote_binary + " " + std::string(kWorkerBinary) + " && "
-        "chmod +x " + std::string(kWorkerBinary) + " && "
-        "nohup " + std::string(kWorkerBinary) + " -port " + std::to_string(port) + " -job " + job_name + (pprof ? " -pprof" : "") +
-        " </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid";
+      "kill $(cat " + worker_pid + ") 2>/dev/null || true && "
+      "rm -f " + worker_pid + " " + worker_log + " " + worker_binary + " && "
+      "mv " + remote_binary + " " + worker_binary + " && "
+      "chmod +x " + worker_binary + " && "
+      "nohup " + worker_binary + " -port " + std::to_string(port) + " -job " + job_name + (pprof ? " -pprof" : "") +
+      " </dev/null >" + worker_log + " 2>&1 & echo $! > " + worker_pid;
 
     const std::string ssh_cmd = "ssh " + slr::ssh_options() + " " + slr::shell_quote(host) + " " + slr::shell_quote(start_cmd);
     auto ssh = slr::exec_capture(ssh_cmd);
@@ -251,10 +280,13 @@ std::string get_payload(const std::string& peer, const std::string& route) {
 }
 
 void cleanup_hosts(const std::vector<std::string>& hosts, int parallel) {
+  const std::string worker_binary = worker_binary_path();
+  const std::string worker_pid = worker_pid_path();
+  const std::string worker_log = worker_log_path();
   slr::parallel_for(hosts.size(), parallel, [&](size_t i) {
     const std::string cmd =
         "ssh " + slr::ssh_options() + " " + slr::shell_quote(hosts[i]) + " " +
-        slr::shell_quote("kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && rm -f /tmp/mr-worker.pid /tmp/mr-worker.log /tmp/mr-worker && rm -rf /tmp/slr-worker-*");
+        slr::shell_quote("kill $(cat " + worker_pid + ") 2>/dev/null || true && rm -f " + worker_pid + " " + worker_log + " " + worker_binary + " && rm -rf /tmp/slr-worker-*");
     (void)slr::exec_capture(cmd);
   });
 }
