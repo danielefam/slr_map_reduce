@@ -4,9 +4,9 @@ package main
 import (
 	"bufio"
 	"hash/fnv"
+	"io"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 // KeyValue is a single intermediate or output key-value pair.
@@ -21,11 +21,11 @@ type MapFunc func(docID, text string) []KeyValue
 // ReduceFunc reduces all values for a key into a single output string.
 type ReduceFunc func(key string, values []string) string
 
-// runMap applies fn to every line in data, using the line number as docID.
+// runMap applies fn to every line in r, using the line number as docID.
 // Returns intermediate KV pairs grouped by key.
-func runMap(data string, fn MapFunc) map[string][]string {
+func runMap(r io.Reader, fn MapFunc) (map[string][]string, error) {
 	out := make(map[string][]string)
-	scanner := bufio.NewScanner(strings.NewReader(data))
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
 	lineNo := 0
 	for scanner.Scan() {
@@ -35,7 +35,7 @@ func runMap(data string, fn MapFunc) map[string][]string {
 		}
 		lineNo++
 	}
-	return out
+	return out, scanner.Err()
 }
 
 // runReduce applies fn to every key in intermediate, returning the final sorted KV list.

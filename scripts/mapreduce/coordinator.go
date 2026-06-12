@@ -41,12 +41,12 @@ import (
 type slotState int
 
 const (
-	sPending  slotState = iota // not yet loaded on the current host
-	sLoaded                    // /load done
-	sMapped                    // /map done; bucket files written
-	sReduced                   // /reduce done
-	sDone                      // /result fetched
-	sFailed                    // exhausted retries and spares
+	sPending slotState = iota // not yet loaded on the current host
+	sLoaded                   // /load done
+	sMapped                   // /map done; bucket files written
+	sReduced                  // /reduce done
+	sDone                     // /result fetched
+	sFailed                   // exhausted retries and spares
 )
 
 func (s slotState) String() string {
@@ -70,7 +70,7 @@ func (s slotState) String() string {
 // slot is one logical worker. id is fixed; host changes on replacement.
 type slot struct {
 	id    int
-	files []string // for -input-dir mode (POST /load)
+	urls  []string // for Common Crawl mode (POST /load)
 	chunk []byte   // for -input mode (POST /data)
 
 	mu       sync.Mutex
@@ -83,6 +83,10 @@ type slot struct {
 	// was completed. If c.epoch is later bumped, the reduce is stale and
 	// must be re-run.
 	reduceEpoch int64
+}
+
+type loadRequest struct {
+	URLs []string `json:"urls"`
 }
 
 // coordinator owns the slot table, the spare pool, and the configuration
@@ -257,10 +261,10 @@ func (c *coordinator) backoff(attempt int) time.Duration {
 
 // ── per-slot remote calls ───────────────────────────────────────────────────
 
-// loadOnHost calls POST /load (file mode) or POST /data (chunk mode) on host.
+// loadOnHost calls POST /load (Common Crawl URL mode) or POST /data (chunk mode) on host.
 func (c *coordinator) loadOnHost(ctx context.Context, host string, s *slot) error {
-	if len(s.files) > 0 {
-		body, _ := json.Marshal(s.files)
+	if len(s.urls) > 0 {
+		body, _ := json.Marshal(loadRequest{URLs: s.urls})
 		return postJSONCtx(ctx, dataClient, host, "/load", body)
 	}
 	return postRawCtx(ctx, dataClient, host, "/data", s.chunk)

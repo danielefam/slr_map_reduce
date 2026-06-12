@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,6 +86,43 @@ func TestHandleData(t *testing.T) {
 	defer ts.Close()
 
 	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello world\n"))
+}
+
+func TestHandleLoadDownloadsAndCleansInputs(t *testing.T) {
+	workDir := t.TempDir()
+	srv := newServer(wordCountMap, wordCountReduce, workDir)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, _ = gz.Write([]byte("hello crawl\nhello web\n"))
+		_ = gz.Close()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer source.Close()
+
+	body, _ := json.Marshal(loadRequest{URLs: []string{source.URL + "/segment-00000.wet.gz"}})
+	mustPost(t, ts.URL+"/load", "application/json", body)
+
+	peer := strings.TrimPrefix(ts.URL, "http://")
+	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
+	mustPost(t, ts.URL+"/map", "application/json", mapReq)
+	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+
+	got := getResult(t, ts.URL)
+	if got["hello"] != 2 || got["crawl"] != 1 || got["web"] != 1 {
+		t.Fatalf("unexpected result counts: %v", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(workDir, "cc-input-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected downloaded inputs to be removed after map, found %v", matches)
+	}
 }
 
 // TestSingleWorkerPipeline runs the full map→reduce→result cycle on one worker.

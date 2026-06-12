@@ -7,19 +7,23 @@
 //  3. SCP the binary to each node
 //  4. SSH each node to start the worker HTTP server (nohup)
 //  5. Wait for all workers to pass the health check
-//  6. Split the input file into 64 MB chunks and POST each to a worker
+//  6. Split a local input file into 64 MB chunks or resolve Common Crawl WET URLs
+//     and assign them to workers
 //  7. Broadcast POST /map  (with peer list) — wait for all to finish
 //  8. Broadcast POST /reduce               — wait for all to finish
 //  9. GET /result from every worker, merge-sort, write to output file
+//
 // 10. SSH cleanup: kill worker processes
 //
 // Usage:
 //
 //	mapreduce -hosts hosts.txt -input data.txt -output result.txt [-n 10] [-port 9090]
+//	mapreduce -hosts hosts.txt -commoncrawl [-crawl CC-MAIN-2026-05] -output result.txt [-n 10] [-port 9090]
 package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
@@ -46,9 +50,11 @@ const (
 
 // HTTP clients with appropriate timeouts for each operation class.
 var (
-	shortClient = &http.Client{Timeout: 30 * time.Second}  // health checks
-	dataClient  = &http.Client{Timeout: 30 * time.Minute}  // data upload/load
-	longClient  = &http.Client{Timeout: 60 * time.Minute}  // map, reduce, collect
+	shortClient         = &http.Client{Timeout: 30 * time.Second} // health checks
+	dataClient          = &http.Client{Timeout: 30 * time.Minute} // data upload/load
+	longClient          = &http.Client{Timeout: 60 * time.Minute} // map, reduce, collect
+	commonCrawlIndexURL = "https://index.commoncrawl.org/collinfo.json"
+	commonCrawlDataURL  = "https://data.commoncrawl.org"
 )
 
 // KeyValue mirrors the worker type for result parsing.
@@ -66,18 +72,23 @@ type mapRequest struct {
 func main() {
 	hostsFile := flag.String("hosts", "../hosts.txt", "path to hosts file")
 	inputFile := flag.String("input", "", "path to input data file")
-	inputDir := flag.String("input-dir", "", "directory of WET files on NFS (alternative to -input)")
+	commonCrawl := flag.Bool("commoncrawl", false, "read input from the official Common Crawl website instead of a local file")
+	crawl := flag.String("crawl", "", "Common Crawl ID to use in -commoncrawl mode (default: latest crawl)")
 	outputFile := flag.String("output", "result.txt", "path for merged output file")
 	n := flag.Int("n", 0, "number of workers (0 = all hosts)")
-	filesLimit := flag.Int("files-limit", 0, "cap the number of WET files used from -input-dir (0 = all)")
+	filesLimit := flag.Int("files-limit", 0, "cap the number of Common Crawl WET files used in -commoncrawl mode (0 = all)")
+	chunksLimit := flag.Int("chunks-limit", 0, "additional Common Crawl workload cap kept for benchmark compatibility; applied as a second URL-count limit (0 = disabled)")
 	port := flag.String("port", "9090", "worker HTTP port")
 	maxAttempts := flag.Int("max-attempts", 4, "per-slot retry attempts before failing the job")
 	healthInterval := flag.Duration("health-interval", 5*time.Second, "active /health poll interval during long phases")
 	backoffInitial := flag.Duration("backoff-initial", 250*time.Millisecond, "initial retry backoff (doubles up to 5s)")
 	flag.Parse()
 
-	if *inputFile == "" && *inputDir == "" {
-		log.Fatal("one of -input or -input-dir is required")
+	switch {
+	case *inputFile == "" && !*commonCrawl:
+		log.Fatal("choose exactly one input mode: -input <file> or -commoncrawl [-crawl CC-MAIN-...]")
+	case *inputFile != "" && *commonCrawl:
+		log.Fatal("-input and -commoncrawl are mutually exclusive")
 	}
 
 	hosts, err := readHosts(*hostsFile)
@@ -132,19 +143,20 @@ func main() {
 
 	// ── Step 4: assign input to slots ───────────────────────────────────────
 	log.Println("preparing slot inputs…")
-	if *inputDir != "" {
-		files, err := listWETFiles(*inputDir, hosts)
+	if *commonCrawl {
+		resolvedCrawl, urls, err := resolveCommonCrawlURLs(*crawl, *filesLimit, *chunksLimit)
 		if err != nil {
-			log.Fatalf("list WET files: %v", err)
+			log.Fatalf("resolve Common Crawl inputs: %v", err)
 		}
-		if *filesLimit > 0 && *filesLimit < len(files) {
-			files = files[:*filesLimit]
+		log.Printf("resolved %d Common Crawl WET URLs from %s, distributing round-robin across %d slots",
+			len(urls), resolvedCrawl, len(coord.slots))
+		if len(urls) < len(coord.slots) {
+			log.Printf("WARNING: only %d WET URLs for %d slots — %d worker(s) will get empty input; "+
+				"raise -files-limit/-chunks-limit for a meaningful high-N measurement",
+				len(urls), len(coord.slots), len(coord.slots)-len(urls))
 		}
-		log.Printf("found %d WET files, distributing across %d slots", len(files), len(coord.slots))
-		for i, f := range files {
-			s := coord.slots[i%len(coord.slots)]
-			s.files = append(s.files, f)
-		}
+		assignURLsRoundRobin(coord.slots, urls)
+		logSlotURLBalance(coord.slots)
 	} else {
 		f, err := os.Open(*inputFile)
 		if err != nil {
@@ -166,26 +178,46 @@ func main() {
 	defer cancel()
 	go coord.watchHealth(ctx)
 
+	// Load data onto workers BEFORE the compute timer starts so that the
+	// /data upload (or /load) is excluded from the measured compute time.
+	log.Println("loading data onto workers…")
+	if err := coord.drive(ctx, sLoaded); err != nil {
+		log.Fatalf("load phase: %v", err)
+	}
+	log.Println("load phase done")
+
 	log.Println("starting map phase…")
+	computeStart := time.Now()
+	mapStart := computeStart
 	if err := coord.drive(ctx, sMapped); err != nil {
 		log.Fatalf("map phase: %v", err)
 	}
+	mapDur := time.Since(mapStart)
 	log.Println("map phase done")
 
 	log.Println("starting reduce phase…")
+	reduceStart := time.Now()
 	if err := coord.drive(ctx, sReduced); err != nil {
 		log.Fatalf("reduce phase: %v", err)
 	}
+	reduceDur := time.Since(reduceStart)
 	log.Println("reduce phase done")
 
 	log.Println("collecting results…")
+	collectStart := time.Now()
 	if err := coord.drive(ctx, sDone); err != nil {
 		log.Fatalf("collect: %v", err)
 	}
 	if err := coord.mergeResults(*outputFile); err != nil {
 		log.Fatalf("merge: %v", err)
 	}
+	collectDur := time.Since(collectStart)
+	computeDur := time.Since(computeStart)
 	log.Printf("results written to %s", *outputFile)
+
+	// Machine-parseable timing line for benchmarking (compute phases only).
+	log.Printf("TIMING nodes=%d map_seconds=%.3f reduce_seconds=%.3f collect_seconds=%.3f compute_seconds=%.3f",
+		len(coord.slots), mapDur.Seconds(), reduceDur.Seconds(), collectDur.Seconds(), computeDur.Seconds())
 
 	// Stop the health watcher before cleanup so it doesn't race with kills.
 	cancel()
@@ -252,13 +284,10 @@ func deployWorker(hosts, peers []string, port string) ([]string, []string, error
 	}
 	results := make([]result, len(hosts))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8) // throttle to avoid ssh gateway overload
 	for i, h := range hosts {
 		wg.Add(1)
 		go func(idx int, host, peer string) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 			results[idx] = result{host: host, peer: peer}
 			// kill any leftover worker and remove the binary so SCP can overwrite it
 			_, _ = sshRun(host, []string{
@@ -367,81 +396,120 @@ func waitHealthy(hosts, peers []string) ([]string, []string, error) {
 	return goodHosts, goodPeers, nil
 }
 
-// distributeFiles lists WET files in dir, assigns them round-robin to workers,
-// and tells each worker to load its files via POST /load (read directly from NFS).
-// If dir is not locally accessible, it lists files by SSH-ing into the first worker.
-func distributeFiles(dir string, filesLimit int, hosts []string, peers []string) error {
-	files, err := listWETFiles(dir, hosts)
-	if err != nil {
-		return fmt.Errorf("list WET files: %w", err)
-	}
-	if filesLimit > 0 && filesLimit < len(files) {
-		files = files[:filesLimit]
-	}
-
-	filesByWorker := make([][]string, len(peers))
-	for i, f := range files {
-		filesByWorker[i%len(peers)] = append(filesByWorker[i%len(peers)], f)
-	}
-	log.Printf("found %d WET files, distributing across %d workers", len(files), len(peers))
-
-	var wg sync.WaitGroup
-	errs := make([]error, len(peers))
-	for idx, peer := range peers {
-		wg.Add(1)
-		go func(workerIdx int, p string, workerFiles []string) {
-			defer wg.Done()
-			body, _ := json.Marshal(workerFiles)
-			errs[workerIdx] = postJSON(dataClient, p, "/load", body)
-		}(idx, peer, filesByWorker[idx])
-	}
-	wg.Wait()
-	return firstErr(errs)
+type commonCrawlCollection struct {
+	ID string `json:"id"`
 }
 
-// listWETFiles returns all .wet/.wet.gz paths in dir. It first tries a local
-// directory read; if the NFS is not mounted locally it falls back to an SSH
-// listing on the first reachable worker host.
-func listWETFiles(dir string, hosts []string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err == nil {
-		var files []string
-		for _, e := range entries {
-			if e.IsDir() {
+func resolveCommonCrawlURLs(crawl string, filesLimit, chunksLimit int) (string, []string, error) {
+	resolvedCrawl := crawl
+	if resolvedCrawl == "" {
+		var err error
+		resolvedCrawl, err = resolveLatestCommonCrawl()
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	urls, err := fetchCommonCrawlWETURLs(resolvedCrawl)
+	if err != nil {
+		return "", nil, err
+	}
+	urls = applyCommonCrawlLimits(urls, filesLimit, chunksLimit)
+	if len(urls) == 0 {
+		return "", nil, fmt.Errorf("no Common Crawl WET URLs selected for crawl %s", resolvedCrawl)
+	}
+	return resolvedCrawl, urls, nil
+}
+
+func resolveLatestCommonCrawl() (string, error) {
+	var collections []commonCrawlCollection
+	if err := retryCommonCrawl(func() error {
+		resp, err := shortClient.Get(commonCrawlIndexURL) //nolint:gosec
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("collinfo returned %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(&collections)
+	}); err != nil {
+		return "", fmt.Errorf("fetch crawl index: %w", err)
+	}
+	if len(collections) == 0 {
+		return "", fmt.Errorf("crawl index is empty")
+	}
+	ids := make([]string, 0, len(collections))
+	for _, collection := range collections {
+		if collection.ID != "" {
+			ids = append(ids, collection.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("crawl index contained no IDs")
+	}
+	sort.Strings(ids)
+	return ids[len(ids)-1], nil
+}
+
+func fetchCommonCrawlWETURLs(crawl string) ([]string, error) {
+	manifestURL := fmt.Sprintf("%s/crawl-data/%s/wet.paths.gz", commonCrawlDataURL, crawl)
+	var urls []string
+	if err := retryCommonCrawl(func() error {
+		resp, err := dataClient.Get(manifestURL) //nolint:gosec
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("wet paths returned %d", resp.StatusCode)
+		}
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		defer gr.Close()
+		body, err := io.ReadAll(gr)
+		if err != nil {
+			return err
+		}
+		lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+		urls = urls[:0]
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
 				continue
 			}
-			name := e.Name()
-			if strings.HasSuffix(name, ".wet.gz") || strings.HasSuffix(name, ".wet") {
-				files = append(files, filepath.Join(dir, name))
-			}
+			urls = append(urls, fmt.Sprintf("%s/%s", commonCrawlDataURL, strings.TrimPrefix(line, "/")))
 		}
-		if len(files) == 0 {
-			return nil, fmt.Errorf("no .wet or .wet.gz files found in %s", dir)
-		}
-		return files, nil
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", manifestURL, err)
 	}
+	sort.Strings(urls)
+	return urls, nil
+}
 
-	// NFS not mounted locally — ask a worker via SSH.
-	log.Printf("local access to %s unavailable (%v), listing via SSH", dir, err)
-	for _, host := range hosts {
-		out, sshErr := sshRun(host, []string{
-			fmt.Sprintf("find %s -maxdepth 1 \\( -name '*.wet.gz' -o -name '*.wet' \\) 2>/dev/null | sort", dir),
-		})
-		if sshErr != nil {
-			log.Printf("SSH list on %s failed: %v", host, sshErr)
-			continue
-		}
-		var files []string
-		for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-			if line = strings.TrimSpace(line); line != "" {
-				files = append(files, line)
-			}
-		}
-		if len(files) > 0 {
-			return files, nil
+func retryCommonCrawl(fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			lastErr = err
 		}
 	}
-	return nil, fmt.Errorf("could not list WET files in %s via SSH on any worker", dir)
+	return lastErr
+}
+
+func applyCommonCrawlLimits(urls []string, filesLimit, chunksLimit int) []string {
+	limit := len(urls)
+	if filesLimit > 0 && filesLimit < limit {
+		limit = filesLimit
+	}
+	if chunksLimit > 0 && chunksLimit < limit {
+		limit = chunksLimit
+	}
+	return append([]string(nil), urls[:limit]...)
 }
 
 // distributeData splits the input file into ≤64 MB chunks and POSTs each to a worker.
@@ -504,6 +572,88 @@ func chunkForWorker(chunks [][]byte, i int) []byte {
 		return chunks[i]
 	}
 	return []byte{}
+}
+
+// assignURLsRoundRobin distributes Common Crawl URLs across slots so that slot i
+// receives URLs i, i+N, i+2N, … (N = len(slots)).
+func assignURLsRoundRobin(slots []*slot, urls []string) {
+	n := len(slots)
+	if n == 0 {
+		return
+	}
+	for _, s := range slots {
+		s.urls = nil
+	}
+	for i, rawURL := range urls {
+		slots[i%n].urls = append(slots[i%n].urls, rawURL)
+	}
+}
+
+// assignChunksRoundRobin distributes chunks across slots so that slot i receives
+// chunks i, i+N, i+2N, … (N = len(slots)), concatenating them into slot.chunk.
+// A trailing newline is inserted between concatenated chunks so words at chunk
+// boundaries are never merged. Slots that receive no chunk get an empty payload.
+func assignChunksRoundRobin(slots []*slot, chunks [][]byte) {
+	n := len(slots)
+	if n == 0 {
+		return
+	}
+	bufs := make([][]byte, n)
+	for j, c := range chunks {
+		idx := j % n
+		bufs[idx] = append(bufs[idx], c...)
+		if len(c) > 0 && c[len(c)-1] != '\n' {
+			bufs[idx] = append(bufs[idx], '\n')
+		}
+	}
+	for i, s := range slots {
+		s.chunk = bufs[i]
+	}
+}
+
+// logSlotBalance reports the per-slot input byte distribution so workload skew
+// (from uneven chunk counts or sub-64 MB tail chunks) is visible in the logs.
+func logSlotBalance(slots []*slot) {
+	if len(slots) == 0 {
+		return
+	}
+	var total, min, max int
+	min = -1
+	for _, s := range slots {
+		b := len(s.chunk)
+		total += b
+		if min < 0 || b < min {
+			min = b
+		}
+		if b > max {
+			max = b
+		}
+	}
+	avg := total / len(slots)
+	log.Printf("slot input balance: total=%d MB, avg=%d MB, min=%d MB, max=%d MB across %d slots",
+		total>>20, avg>>20, min>>20, max>>20, len(slots))
+}
+
+func logSlotURLBalance(slots []*slot) {
+	if len(slots) == 0 {
+		return
+	}
+	total := 0
+	min := -1
+	max := 0
+	for _, s := range slots {
+		count := len(s.urls)
+		total += count
+		if min < 0 || count < min {
+			min = count
+		}
+		if count > max {
+			max = count
+		}
+	}
+	avg := float64(total) / float64(len(slots))
+	log.Printf("slot URL balance: total=%d, avg=%.2f, min=%d, max=%d across %d slots",
+		total, avg, min, max, len(slots))
 }
 
 // broadcastMap sends POST /map to all peers with the full peer list and each worker's ID.

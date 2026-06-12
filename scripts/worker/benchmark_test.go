@@ -44,7 +44,9 @@ func BenchmarkWordCountReduce(b *testing.B) {
 func BenchmarkRunMap(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
-		runMap(mapBenchInput, wordCountMap)
+		if _, err := runMap(strings.NewReader(mapBenchInput), wordCountMap); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

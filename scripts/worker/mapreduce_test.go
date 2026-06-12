@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -27,7 +28,10 @@ func TestTargetNodeDeterministic(t *testing.T) {
 
 func TestRunMapBasic(t *testing.T) {
 	data := "hello world\nhello go\n"
-	result := runMap(data, wordCountMap)
+	result, err := runMap(strings.NewReader(data), wordCountMap)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(result["hello"]) != 2 {
 		t.Errorf("hello: want 2 values, got %d", len(result["hello"]))
@@ -41,14 +45,20 @@ func TestRunMapBasic(t *testing.T) {
 }
 
 func TestRunMapEmpty(t *testing.T) {
-	result := runMap("", wordCountMap)
+	result, err := runMap(strings.NewReader(""), wordCountMap)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(result) != 0 {
 		t.Errorf("empty input: want 0 keys, got %d", len(result))
 	}
 }
 
 func TestRunMapEmitsValues(t *testing.T) {
-	result := runMap("a b c\n", wordCountMap)
+	result, err := runMap(strings.NewReader("a b c\n"), wordCountMap)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for key, vals := range result {
 		for _, v := range vals {
 			if v != "1" {

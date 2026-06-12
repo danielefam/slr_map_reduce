@@ -23,15 +23,15 @@ import (
 type fakeWorker struct {
 	mu sync.Mutex
 
-	failNext       map[string]int    // path -> times to fail with 500
-	failPeerReduce string            // if non-empty, /reduce returns "fetch from peer X: died"
-	stopAfter      map[string]int    // path -> after N successes, srv.Close()
-	pathCounts     map[string]int    // observed counts per path
-	files          []string          // last received /load body
-	peers          []string          // peers passed in /map (or /reduce)
-	id             int               // id from last /map
-	results        []KeyValue        // /result payload to return
-	srv            *httptest.Server  // injected after construction
+	failNext       map[string]int   // path -> times to fail with 500
+	failPeerReduce string           // if non-empty, /reduce returns "fetch from peer X: died"
+	stopAfter      map[string]int   // path -> after N successes, srv.Close()
+	pathCounts     map[string]int   // observed counts per path
+	urls           []string         // last received /load body
+	peers          []string         // peers passed in /map (or /reduce)
+	id             int              // id from last /map
+	results        []KeyValue       // /result payload to return
+	srv            *httptest.Server // injected after construction
 	loaded         bool
 	mapped         bool
 	reduced        bool
@@ -52,10 +52,10 @@ func (w *fakeWorker) handler() http.Handler {
 		rw.Write([]byte("ok"))
 	})
 	mux.HandleFunc("POST /load", w.wrap("/load", func(rw http.ResponseWriter, r *http.Request) {
-		var paths []string
-		_ = json.NewDecoder(r.Body).Decode(&paths)
+		var req loadRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.mu.Lock()
-		w.files = paths
+		w.urls = req.URLs
 		w.loaded = true
 		w.mu.Unlock()
 		rw.WriteHeader(200)
@@ -155,7 +155,7 @@ func TestCoordinator_HappyPath(t *testing.T) {
 	workers, slots, spares := startFake(t, 3, 0)
 	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
 	for i, s := range c.slots {
-		s.files = []string{fmt.Sprintf("/cal/x%d.wet", i)}
+		s.urls = []string{fmt.Sprintf("https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x%d.wet.gz", i)}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -183,7 +183,7 @@ func TestCoordinator_ReplaceOnMapTransportError(t *testing.T) {
 	workers, slots, spares := startFake(t, 3, 2)
 	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
 	for _, s := range c.slots {
-		s.files = []string{"/cal/x.wet"}
+		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
 	}
 
 	// Kill slot 1's server so /load fails.
@@ -209,7 +209,7 @@ func TestCoordinator_ReplacePeerOnReduceFailure(t *testing.T) {
 	workers, slots, spares := startFake(t, 3, 2)
 	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
 	for _, s := range c.slots {
-		s.files = []string{"/cal/x.wet"}
+		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -256,7 +256,7 @@ func TestCoordinator_NoSpareLeftFailsJob(t *testing.T) {
 	workers, slots, spares := startFake(t, 2, 0) // zero spares
 	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
 	for _, s := range c.slots {
-		s.files = []string{"/cal/x.wet"}
+		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
 	}
 	workers[0].srv.Close()
 	workers[0].srv = nil

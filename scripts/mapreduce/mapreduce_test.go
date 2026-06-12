@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +114,53 @@ func TestChunkForWorker_EmptyChunks(t *testing.T) {
 	got := chunkForWorker(nil, 0)
 	if len(got) != 0 {
 		t.Errorf("nil chunks: want empty, got %q", got)
+	}
+}
+
+func TestResolveCommonCrawlURLs(t *testing.T) {
+	oldIndexURL := commonCrawlIndexURL
+	oldDataURL := commonCrawlDataURL
+	t.Cleanup(func() {
+		commonCrawlIndexURL = oldIndexURL
+		commonCrawlDataURL = oldDataURL
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/collinfo.json", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]commonCrawlCollection{
+			{ID: "CC-MAIN-2025-13"},
+			{ID: "CC-MAIN-2026-05"},
+			{ID: "CC-MAIN-2024-99"},
+		})
+	})
+	mux.HandleFunc("/crawl-data/CC-MAIN-2026-05/wet.paths.gz", func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, _ = gz.Write([]byte("crawl-data/CC-MAIN-2026-05/segments/b.wet.gz\ncrawl-data/CC-MAIN-2026-05/segments/a.wet.gz\n"))
+		_ = gz.Close()
+		_, _ = w.Write(buf.Bytes())
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	commonCrawlIndexURL = server.URL + "/collinfo.json"
+	commonCrawlDataURL = server.URL
+
+	crawl, urls, err := resolveCommonCrawlURLs("", 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if crawl != "CC-MAIN-2026-05" {
+		t.Fatalf("crawl = %q, want %q", crawl, "CC-MAIN-2026-05")
+	}
+	want := []string{server.URL + "/crawl-data/CC-MAIN-2026-05/segments/a.wet.gz"}
+	if len(urls) != len(want) {
+		t.Fatalf("got %d urls, want %d", len(urls), len(want))
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Errorf("urls[%d] = %q, want %q", i, urls[i], want[i])
+		}
 	}
 }
 

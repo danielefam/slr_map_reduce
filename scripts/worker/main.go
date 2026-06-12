@@ -4,6 +4,7 @@
 //
 //	GET  /health              — readiness probe
 //	POST /data                — receive raw text data chunk
+//	POST /load                — download Common Crawl WET URLs into workDir
 //	POST /map                 — start map phase
 //	GET  /intermediate        — serve map output for a given reducer bucket
 //	POST /reduce              — start reduce phase (pulls from peers via /intermediate)
@@ -23,7 +24,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -36,8 +39,10 @@ import (
 type state struct {
 	mu sync.Mutex
 
-	// input data written by the client
+	// input data written directly by the client in local-file mode
 	inputData string
+	// inputFiles are Common Crawl WET files downloaded under workDir.
+	inputFiles []string
 
 	// index of this worker in the peer list (set at map phase)
 	workerID int
@@ -153,6 +158,12 @@ type mapRequest struct {
 	Peers []string `json:"peers"`
 }
 
+type loadRequest struct {
+	URLs []string `json:"urls"`
+}
+
+var commonCrawlDownloadClient = &http.Client{Timeout: 30 * time.Minute}
+
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
@@ -164,8 +175,13 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if err := s.resetInputs(); err != nil {
+		http.Error(w, "reset inputs: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	s.state.mu.Lock()
 	s.state.inputData = string(body)
+	s.state.inputFiles = nil
 	s.state.output = nil
 	s.state.mu.Unlock()
 
@@ -173,45 +189,26 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleLoad accepts a JSON array of file paths, reads them (decompressing .gz files),
-// and sets the worker's input data. Used when input lives on a shared NFS mount.
+// handleLoad accepts Common Crawl WET URLs, downloads them into workDir, and
+// sets the worker's local input file list for the next /map run.
 func (s *server) handleLoad(w http.ResponseWriter, r *http.Request) {
-	var paths []string
-	if err := json.NewDecoder(r.Body).Decode(&paths); err != nil {
+	var req loadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	var buf strings.Builder
-	for _, path := range paths {
-		f, err := os.Open(path)
-		if err != nil {
-			http.Error(w, "open file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		var reader io.Reader = f
-		if strings.HasSuffix(path, ".gz") {
-			gr, err := gzip.NewReader(f)
-			if err != nil {
-				f.Close()
-				http.Error(w, "gzip open "+path+": "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			defer gr.Close()
-			reader = gr
-		}
-		data, err := io.ReadAll(reader)
-		f.Close()
-		if err != nil {
-			http.Error(w, "read file "+path+": "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		buf.Write(data)
-		buf.WriteByte('\n')
+	if err := s.resetInputs(); err != nil {
+		http.Error(w, "reset inputs: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
-
+	paths, err := s.downloadInputs(req.URLs)
+	if err != nil {
+		http.Error(w, "download inputs: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	s.state.mu.Lock()
-	s.state.inputData = buf.String()
+	s.state.inputData = ""
+	s.state.inputFiles = paths
 	s.state.output = nil
 	s.state.mu.Unlock()
 
@@ -228,6 +225,7 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 
 	s.state.mu.Lock()
 	data := s.state.inputData
+	files := append([]string(nil), s.state.inputFiles...)
 	s.state.workerID = req.ID
 	s.state.peers = req.Peers
 	s.state.output = nil
@@ -238,7 +236,17 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	s.removeIntermediate()
 
 	n := len(req.Peers)
-	intermediate := runMap(data, s.mapFn)
+	var err error
+	var intermediate map[string][]string
+	if len(files) > 0 {
+		intermediate, err = s.runMapFiles(files)
+	} else {
+		intermediate, err = runMap(strings.NewReader(data), s.mapFn)
+	}
+	if err != nil {
+		http.Error(w, "run map: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// Partition intermediate KVs into n bucket files (one per reducer) so that
 	// /intermediate?reducer=X can serve its file directly without scanning all output.
@@ -252,6 +260,12 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	for i, kvs := range buckets {
 		if err := writeKVLines(s.bucketFile(n, i), kvs); err != nil {
 			http.Error(w, "write map bucket: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if len(files) > 0 {
+		if err := s.clearMappedInputs(files); err != nil {
+			http.Error(w, "cleanup mapped inputs: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
@@ -400,4 +414,154 @@ func (s *server) handleResult(w http.ResponseWriter, _ *http.Request) {
 	for _, kv := range output {
 		fmt.Fprintf(w, "%s\t%s\n", kv.Key, kv.Value)
 	}
+}
+
+func (s *server) resetInputs() error {
+	s.state.mu.Lock()
+	stale := append([]string(nil), s.state.inputFiles...)
+	s.state.inputData = ""
+	s.state.inputFiles = nil
+	s.state.output = nil
+	s.state.mu.Unlock()
+	return removeFiles(stale)
+}
+
+func (s *server) runMapFiles(files []string) (map[string][]string, error) {
+	out := make(map[string][]string)
+	for _, file := range files {
+		fileMap, err := s.runMapFile(file)
+		if err != nil {
+			return nil, err
+		}
+		for key, values := range fileMap {
+			out[key] = append(out[key], values...)
+		}
+	}
+	return out, nil
+}
+
+func (s *server) runMapFile(file string) (map[string][]string, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", file, err)
+	}
+	defer f.Close()
+
+	var reader io.Reader = f
+	if strings.HasSuffix(file, ".gz") {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, fmt.Errorf("gzip open %s: %w", file, err)
+		}
+		defer gr.Close()
+		reader = gr
+	}
+	intermediate, err := runMap(reader, s.mapFn)
+	if err != nil {
+		return nil, fmt.Errorf("map %s: %w", file, err)
+	}
+	return intermediate, nil
+}
+
+func (s *server) clearMappedInputs(files []string) error {
+	if err := removeFiles(files); err != nil {
+		return err
+	}
+	s.state.mu.Lock()
+	if equalStringSlices(s.state.inputFiles, files) {
+		s.state.inputFiles = nil
+	}
+	s.state.mu.Unlock()
+	return nil
+}
+
+func (s *server) downloadInputs(urls []string) ([]string, error) {
+	paths := make([]string, 0, len(urls))
+	for i, rawURL := range urls {
+		path, err := s.downloadInput(i, rawURL)
+		if err != nil {
+			_ = removeFiles(paths)
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func (s *server) downloadInput(index int, rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse url %q: %w", rawURL, err)
+	}
+	base := path.Base(parsed.Path)
+	if base == "" || base == "." || base == "/" {
+		base = "input.wet.gz"
+	}
+	finalPath := filepath.Join(s.workDir, fmt.Sprintf("cc-input-%05d-%s", index, base))
+
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := s.downloadInputOnce(rawURL, finalPath); err == nil {
+			return finalPath, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return "", fmt.Errorf("download %s: %w", rawURL, lastErr)
+}
+
+func (s *server) downloadInputOnce(rawURL, finalPath string) error {
+	resp, err := commonCrawlDownloadClient.Get(rawURL) //nolint:gosec
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	tmp, err := os.CreateTemp(s.workDir, "cc-input-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func removeFiles(paths []string) error {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
