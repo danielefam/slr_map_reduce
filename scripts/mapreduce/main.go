@@ -93,6 +93,7 @@ func run() error {
 	healthInterval := flag.Duration("health-interval", 5*time.Second, "active /health poll interval during long phases")
 	backoffInitial := flag.Duration("backoff-initial", 250*time.Millisecond, "initial retry backoff (doubles up to 5s)")
 	parallel := flag.Int("parallel", remote.DefaultParallelism, "maximum number of concurrent SSH/SCP or readiness-check operations")
+	workerPprof := flag.Bool("worker-pprof", false, "start remote workers with -pprof (exposes /debug/pprof/ for bottleneck analysis)")
 	flag.Parse()
 
 	switch {
@@ -142,7 +143,7 @@ func run() error {
 
 	// ── Step 2: SCP binary to every node ───────────────────────────────────
 	log.Println("deploying worker binary…")
-	hosts, peers, err = deployWorker(hosts, peers, workerBuildPath, *port, *parallel)
+	hosts, peers, err = deployWorker(hosts, peers, workerBuildPath, *port, *parallel, *workerPprof)
 	if err != nil {
 		return fmt.Errorf("deploy failed: %w", err)
 	}
@@ -327,7 +328,7 @@ func buildWorker(jobPath string) (string, error) {
 // deployWorker SCPs the worker binary to each host and starts the HTTP server.
 // It returns the subset of hosts and peers that were successfully deployed.
 // An error is returned only if every host fails.
-func deployWorker(hosts, peers []string, workerBuildPath, port string, parallel int) ([]string, []string, error) {
+func deployWorker(hosts, peers []string, workerBuildPath, port string, parallel int, withPprof bool) ([]string, []string, error) {
 	type result struct {
 		host string
 		peer string
@@ -350,8 +351,8 @@ func deployWorker(hosts, peers []string, workerBuildPath, port string, parallel 
 		startCmd := fmt.Sprintf(
 			"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "+
 				"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log %s && "+
-				"mv %s %s && chmod +x %s && nohup %s -port %s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
-			workerBinary, remoteBinary, workerBinary, workerBinary, workerBinary, port)
+				"mv %s %s && chmod +x %s && nohup %s -port %s%s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
+			workerBinary, remoteBinary, workerBinary, workerBinary, workerBinary, port, pprofArg(withPprof))
 		_, err := sshRun(host, []string{startCmd})
 		if err != nil {
 			_, _ = sshRun(host, []string{"rm -f " + remoteBinary})
@@ -376,6 +377,14 @@ func deployWorker(hosts, peers []string, workerBuildPath, port string, parallel 
 
 func scpTo(src, host, dst string) error {
 	return remote.RunSCP(src, host+":"+dst, remote.DefaultSCPTimeout)
+}
+
+// pprofArg returns the extra worker CLI argument enabling profiling endpoints.
+func pprofArg(enabled bool) string {
+	if enabled {
+		return " -pprof"
+	}
+	return ""
 }
 
 func resolveScriptsDir() (string, error) {

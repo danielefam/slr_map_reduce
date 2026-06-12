@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"path"
@@ -34,6 +35,11 @@ import (
 	"sync"
 	"time"
 )
+
+// pprofEnabled controls whether Go profiling endpoints are registered under
+// /debug/pprof/. Set by the -pprof flag in main(); off by default so that
+// production benchmark runs are not perturbed.
+var pprofEnabled bool
 
 // state holds all runtime data for one MapReduce job.
 type state struct {
@@ -132,12 +138,21 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /intermediate", s.handleIntermediate)
 	mux.HandleFunc("POST /reduce", s.handleReduce)
 	mux.HandleFunc("GET /result", s.handleResult)
+	if pprofEnabled {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 	return mux
 }
 
 func main() {
 	port := flag.String("port", "9090", "port to listen on")
+	enablePprof := flag.Bool("pprof", false, "expose Go profiling endpoints under /debug/pprof/")
 	flag.Parse()
+	pprofEnabled = *enablePprof
 
 	workDir, err := os.MkdirTemp("", "mr-worker-*")
 	if err != nil {
