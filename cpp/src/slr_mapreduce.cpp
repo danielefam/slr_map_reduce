@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -155,17 +156,21 @@ std::vector<std::string> health_ready(const std::vector<std::string>& peers, int
   return out;
 }
 
-void deploy_workers(const std::vector<std::string>& hosts, const std::string& worker_local_path, int port, const std::string& job_name, bool pprof, int parallel) {
+std::vector<std::string> deploy_workers(const std::vector<std::string>& hosts, const std::string& worker_local_path, int port, const std::string& job_name, bool pprof, int parallel) {
   const std::string worker_binary = worker_binary_path();
   const std::string worker_pid = worker_pid_path();
   const std::string worker_log = worker_log_path();
+  std::vector<std::string> deployed;
+  std::mutex deployed_mu;
   slr::parallel_for(hosts.size(), parallel, [&](size_t i) {
     const std::string& host = hosts[i];
     const std::string remote_binary = worker_binary + ".deploy-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(i);
     const std::string scp_cmd = "scp " + slr::ssh_options() + " " + slr::shell_quote(worker_local_path) + " " + slr::shell_quote(host + ":" + remote_binary);
     auto scp = slr::exec_capture(scp_cmd);
     if (scp.exit_code != 0) {
-      throw std::runtime_error("scp failed on " + host + ": " + scp.output);
+      std::lock_guard<std::mutex> lock(deployed_mu);
+      std::cerr << "warning: scp failed on " << host << ": " << scp.output;
+      return;
     }
 
     const std::string start_cmd =
@@ -179,9 +184,15 @@ void deploy_workers(const std::vector<std::string>& hosts, const std::string& wo
     const std::string ssh_cmd = "ssh " + slr::ssh_options() + " " + slr::shell_quote(host) + " " + slr::shell_quote(start_cmd);
     auto ssh = slr::exec_capture(ssh_cmd);
     if (ssh.exit_code != 0) {
-      throw std::runtime_error("ssh start failed on " + host + ": " + ssh.output);
+      std::lock_guard<std::mutex> lock(deployed_mu);
+      std::cerr << "warning: ssh start failed on " << host << ": " << ssh.output;
+      return;
     }
+
+    std::lock_guard<std::mutex> lock(deployed_mu);
+    deployed.push_back(host);
   });
+  return deployed;
 }
 
 std::vector<std::string> split_chunks_round_robin(const std::string& input, int n) {
@@ -262,7 +273,16 @@ void post_payload(const std::string& peer, const std::string& route, const std::
   const std::string cmd =
       "curl -fsS --max-time 1800 -X POST --data-binary @" + slr::shell_quote(tmp.string()) + " " +
       slr::shell_quote("http://" + peer + route) + " >/dev/null";
-  auto res = slr::exec_capture(cmd);
+  slr::CommandResult res{1, ""};
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    res = slr::exec_capture(cmd);
+    if (res.exit_code == 0) {
+      break;
+    }
+    if (attempt < 3) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500 * attempt));
+    }
+  }
   std::error_code ec;
   fs::remove(tmp, ec);
   if (res.exit_code != 0) {
@@ -272,7 +292,16 @@ void post_payload(const std::string& peer, const std::string& route, const std::
 
 std::string get_payload(const std::string& peer, const std::string& route) {
   const std::string cmd = "curl -fsS --max-time 1800 " + slr::shell_quote("http://" + peer + route);
-  auto res = slr::exec_capture(cmd);
+  slr::CommandResult res{1, ""};
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    res = slr::exec_capture(cmd);
+    if (res.exit_code == 0) {
+      break;
+    }
+    if (attempt < 3) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500 * attempt));
+    }
+  }
   if (res.exit_code != 0) {
     throw std::runtime_error("GET " + peer + route + " failed: " + res.output);
   }
@@ -333,7 +362,8 @@ int main(int argc, char** argv) {
     std::string job_name = detect_job_name(cfg.job);
     (void)slr::parse_job_kind(job_name);
 
-    auto hosts = slr::read_hosts(cfg.hosts_file, cfg.n);
+    const int requested_workers = cfg.n;
+    auto hosts = slr::read_hosts(cfg.hosts_file, 0);
     if (hosts.empty()) {
       throw std::runtime_error("no hosts available");
     }
@@ -345,8 +375,20 @@ int main(int argc, char** argv) {
     }
 
     std::cerr << "deploying workers...\n";
-    deploy_workers(hosts, worker_local, cfg.port, job_name, cfg.worker_pprof, cfg.parallel);
+    hosts = deploy_workers(hosts, worker_local, cfg.port, job_name, cfg.worker_pprof, cfg.parallel);
     deployed_hosts = hosts;
+    if (hosts.empty()) {
+      throw std::runtime_error("no workers deployed successfully");
+    }
+    if (requested_workers > 0 && static_cast<int>(hosts.size()) < requested_workers) {
+      throw std::runtime_error("only " + std::to_string(hosts.size()) + " workers deployed successfully; requested " + std::to_string(requested_workers));
+    }
+
+    peers.clear();
+    peers.reserve(hosts.size());
+    for (const auto& h : hosts) {
+      peers.push_back(h + ":" + std::to_string(cfg.port));
+    }
 
     std::cerr << "waiting health checks...\n";
     auto ready = health_ready(peers, 30, std::chrono::milliseconds(2000), cfg.parallel);
@@ -361,9 +403,12 @@ int main(int argc, char** argv) {
     hosts = ready_hosts;
     peers = ready;
 
-    if (cfg.n > 0 && cfg.n < static_cast<int>(peers.size())) {
-      peers.resize(static_cast<size_t>(cfg.n));
-      hosts.resize(static_cast<size_t>(cfg.n));
+    if (requested_workers > 0 && static_cast<int>(peers.size()) < requested_workers) {
+      throw std::runtime_error("only " + std::to_string(peers.size()) + " workers became healthy; requested " + std::to_string(requested_workers));
+    }
+    if (requested_workers > 0 && requested_workers < static_cast<int>(peers.size())) {
+      peers.resize(static_cast<size_t>(requested_workers));
+      hosts.resize(static_cast<size_t>(requested_workers));
     }
     if (peers.empty()) {
       throw std::runtime_error("no active workers after applying -n");

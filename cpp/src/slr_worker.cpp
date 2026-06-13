@@ -70,6 +70,20 @@ std::string run_cmd_or_throw(const std::string& cmd) {
   return result.output;
 }
 
+std::string run_cmd_with_retries(const std::string& cmd, int attempts) {
+  slr::CommandResult result{1, ""};
+  for (int attempt = 1; attempt <= attempts; ++attempt) {
+    result = slr::exec_capture(cmd);
+    if (result.exit_code == 0) {
+      return result.output;
+    }
+    if (attempt < attempts) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500 * attempt));
+    }
+  }
+  throw std::runtime_error("command failed: " + cmd + "\n" + result.output);
+}
+
 std::vector<std::string> split_body_lines(const std::string& body) {
   std::vector<std::string> out;
   for (const auto& line : slr::split_lines(body)) {
@@ -445,7 +459,7 @@ void serve(int port, slr::JobKind job) {
           std::vector<slr::KeyValue> all;
           for (const auto& peer : peers) {
             const std::string cmd = "curl -fsSL " + slr::shell_quote("http://" + peer + "/intermediate?reducer=" + std::to_string(worker_id) + "&n=" + std::to_string(peers.size()));
-            const std::string text = run_cmd_or_throw(cmd);
+            const std::string text = run_cmd_with_retries(cmd, 3);
             auto part = parse_kv_lines(text);
             all.insert(all.end(), part.begin(), part.end());
           }
