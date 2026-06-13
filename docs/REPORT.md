@@ -26,16 +26,17 @@
 | Component | Location | Role |
 | --------- | -------- | ---- |
 | Orchestrator | `bin/slr_mapreduce` (runs on the local machine) | deploys workers, splits input, drives phases, merges results, cleans up |
-| Worker | `bin/slr_worker` (one HTTP server per node, port 9090) | executes map/reduce, stores intermediate buckets on node-local disk, serves peers |
+| Worker | `bin/slr_worker_remote` on lab nodes (`bin/slr_worker` for local tests) | executes map/reduce, stores intermediate buckets on node-local disk, serves peers |
 | Jobs | built-in C++ job names (`wordcount`, `langdetect`, `domainpop`, `docdensity`) | selected via `-job <name>` |
 | Host discovery | `bin/slr_make_hosts` | queries `tp.telecom-paris.fr` for available lab machines → `hosts.txt` |
 
 ### 2.2 Job lifecycle
 
-1. **Build:** `scripts/build_cpp.sh` compiles C++ binaries (`slr_worker`, `slr_mapreduce`, and helper tools).
-2. **Deploy:** the binary is `scp`-ed to `/tmp/mr-worker` on every host and
-   started with `nohup` (PID recorded in `/tmp/mr-worker.pid`); operations are
-   bounded by `-parallel` (default 16) concurrent SSH/SCP sessions.
+1. **Build:** `scripts/build_cpp.sh` compiles local C++ binaries (`slr_worker`, `slr_mapreduce`, and helper tools). `scripts/build_remote_worker.sh` compiles the deployed worker on a lab host so the binary matches the lab glibc/libstdc++ runtime.
+2. **Deploy:** the lab-compatible worker is `scp`-ed to a user-scoped path in
+   `/tmp` on every host and started with `nohup` (PID/log files use matching
+   user-scoped names); operations are bounded by `-parallel` (default 16)
+   concurrent SSH/SCP sessions.
 3. **Input assignment:** local files are split into ≤ 64 MB chunks on newline
    boundaries (`POST /data`); in `-commoncrawl` mode WET URLs are resolved from
    the official index and assigned round-robin (`POST /load`, workers download
@@ -59,14 +60,13 @@ All jobs are selected at run time via `./mapreduce.sh -job <name> …`:
 | `domainpop` | domain → page count | domain popularity from `WARC-Target-URI` WET headers |
 | `docdensity` | `stat:*` / `hist:len.*` → sums | average line length, alphanumeric density, length histogram |
 
-**Design constraint:** the orchestrator's final merge sums values as integers
-(`mergeResults` does `strconv.Atoi` + `+=`). All four reducers therefore emit
-integer strings; `docdensity` emits *summable counters* (totals + histogram
-buckets) and derives averages/ratios offline, instead of emitting floats.
-_Alternative considered:_ a per-job merge strategy (e.g. a `Merger` interface
-in `mrjob` with `sum` as the default) would support non-integer outputs such
-as top-K lists; rejected for the final delivery as it changes the public job
-API for no current use case.
+**Design constraint:** the orchestrator's final merge sums values as integers.
+All four reducers therefore emit integer strings; `docdensity` emits
+*summable counters* (totals + histogram buckets) and derives averages/ratios
+offline, instead of emitting floats. A future C++ extension could add per-job
+merge policies, but the current implementation deliberately keeps the job
+contract small: `map_line` emits key/value pairs and `reduce_values` returns a
+single value for a key.
 
 ---
 
@@ -79,25 +79,22 @@ API for no current use case.
 | `/health` | GET | readiness + liveness probe |
 | `/data` | POST | receive a raw input chunk (local-file mode) |
 | `/load` | POST | download assigned Common Crawl WET URLs |
-| `/map` | POST | run map; body `{"id": i, "peers": [...]}` fixes slot identity and N |
+| `/map` | POST | run map; body is plain text: worker id on the first line, then one peer per line |
 | `/intermediate?reducer=i&n=N` | GET | serve the pre-partitioned bucket for reducer *i* |
-| `/reduce` | POST | pull buckets from all peers, run reduce; optional body updates the peer list after a replacement |
+| `/reduce` | POST | pull buckets from all peers and run reduce; body is the peer list, one peer per line |
 | `/result` | GET | final `key\tvalue` lines, sorted by key |
-| `/debug/pprof/*` | GET | profiling endpoints (only with `-pprof`, see §6) |
 
 ### 3.2 Partitioning: FNV-32a
 
 Every intermediate key is routed to reducer `FNV-32a(key) mod N`. FNV-32a is
 allocation-free, fast on short keys, and — critically — **deterministic across
 processes and machines**, so every mapper independently computes the same
-key→reducer assignment with zero coordination. N is fixed for the whole job
-(it is baked into the partition function), which is exactly why fault
-tolerance replaces *hosts behind slots* instead of changing N (§4).
+key→reducer assignment with zero coordination. N is fixed for the whole job.
 
 ### 3.3 The O(1) pull-based shuffle
 
 At the end of the map phase each worker writes its intermediate pairs into
-**N pre-partitioned bucket files** (`map-bucket-<N>-<idx>.jsonl`) on
+**N pre-partitioned bucket files** (`map-bucket-<reducer>-<idx>.tsv`) on
 node-local disk. When reducer *i* asks any peer for its data, the peer answers
 `GET /intermediate?reducer=i&n=N` by streaming exactly one file — **no
 scanning, no filtering, no index lookup**: O(1) file opens per request, O(N²)
@@ -105,48 +102,34 @@ total fetches for the whole shuffle, each carrying only the data the reducer
 actually needs.
 
 Pull-based (reducers fetch when ready) rather than push-based (mappers send
-eagerly) keeps the protocol idempotent: a replacement reducer can simply
-re-fetch all its buckets, and a re-run map phase atomically overwrites its
-bucket files before any peer reads them.
+eagerly) keeps the worker protocol simple and debuggable with `curl`.
 
 🔲 _Include the sequence diagram from `diagrams/mapreduce-pipeline.seq`._
 
 ---
 
-## 4. Fault Tolerance: the Slot-Based Coordinator ✅
+## 4. Operational Robustness ✅ / 🔲
 
-### 4.1 Concepts
+The C++ orchestrator is intentionally simpler than a production fault-tolerant
+coordinator. It performs bounded SSH/SCP fan-out, waits for `GET /health`,
+keeps only workers that become ready, and cleans up deployed workers on both
+success and failure. During a job, a failed phase request stops the run with a
+clear error instead of producing partial output.
 
-- **Slot** — one of the N logical workers (0…N−1). The FNV partition depends
-  on N, so slots are immutable; the *physical host* serving a slot is not.
-- **Spare** — a host that deployed successfully but holds no slot. Healthy
-  spares are the replacement pool.
-- **Phase state machine** — per slot: `pending → loaded → mapped → reduced →
-  done` (`sFailed` terminal). A replacement host re-plays all prerequisite
-  phases (re-load its input, re-map) before rejoining the current phase.
-- **Epoch** — a counter bumped on every host swap. Because reducers pull from
-  *all* peers, a swap invalidates every completed reduce: slots in `reduced`
-  state are demoted to `mapped` and re-run their reduce against the updated
-  peer list (sent in the `POST /reduce` body).
+Important robustness work completed during migration:
 
-### 4.2 Failure detection and attribution
+- **Remote ABI compatibility:** local g++ 13/glibc 2.38 binaries do not run on
+   the Debian lab nodes (glibc 2.36). `scripts/build_remote_worker.sh` now
+   compiles the deployed worker on a lab host with g++ 12 and copies back
+   `bin/slr_worker_remote`.
+- **Shared `/tmp` collisions:** worker executable, PID, and log paths are
+   user-scoped under `/tmp`, avoiding permission conflicts with stale files
+   created by other users or previous runs.
+- **Worker availability check:** the orchestrator retries health probes before
+   sending input.
 
-1. **Active health watcher** — a background goroutine polls `GET /health` on
-   every active host (default every 5 s); two consecutive failures mark the
-   host dead and cancel its in-flight requests.
-2. **Transport errors** — a failed `POST` to a slot's own host triggers
-   retry with exponential backoff (250 ms doubling, capped at 5 s, max
-   `-max-attempts`) and eventually replacement.
-3. **Peer-failure attribution** — if a reduce fails with
-   `fetch from peer X: …`, the coordinator parses the failing *peer* from the
-   error and replaces **X**, not the reporting worker.
-
-When no spare is available for a dead slot host, the job fails fast with a
-clear error instead of hanging.
-
-🔲 _Add the fault-injection experiment: kill a worker during map and during
-reduce; show the orchestrator log lines (`[slot i] replaced A -> B … epoch
-now k`) and the unchanged final output checksum._
+Future work: spare-host replacement during map/reduce, reduce replay after a
+peer swap, and per-host retry/backoff around transient SSH/SCP failures.
 
 ---
 
@@ -154,9 +137,22 @@ now k`) and the unchanged final output checksum._
 
 ### 5.1 Experimental setup
 
-🔲 _Fill in: number/spec of lab machines, dataset (crawl ID, WET file count,
-total bytes), Go version, repetitions per point, how compute time is defined
-(map+reduce+collect; `/data`–`/load` excluded — quote the `TIMING` log line)._
+Initial validation run completed on 2026-06-13:
+
+```bash
+./mapreduce.sh -job wordcount -commoncrawl -files-limit 3 -chunks-limit 3 \
+   -output result_commoncrawl_3files_3nodes.txt -n 3 -port 9193
+```
+
+Result: 3 lab nodes, 3 Common Crawl WET files, 2,094,920 distinct output keys,
+27 MB result file. Timing reported by the C++ orchestrator:
+
+```text
+TIMING nodes=3 map_seconds=23.671 reduce_seconds=18.409 collect_seconds=4.567 compute_seconds=46.647
+```
+
+`compute_seconds` covers map + reduce + collect; `/data` and `/load` input
+transfer are excluded.
 
 ### 5.2 Amdahl's Law analysis
 
@@ -173,7 +169,7 @@ total bytes), Go version, repetitions per point, how compute time is defined
 
 🔲 _Instructions:_
 - Deploy with `kafka/deploy_kafka.sh -n <same N>`; run
-  `kafka/run_kafka_wordcount.sh` on the **same input file** the Go framework
+   `kafka/run_kafka_wordcount.sh` on the **same input file** the C++ framework
   processed; both print a `TIMING compute_seconds=…` line (see
   `kafka/README.md` for what each timer covers).
 - Report a table: system × N × median compute_seconds (≥ 3 runs).
@@ -186,44 +182,29 @@ total bytes), Go version, repetitions per point, how compute time is defined
 
 ## 6. Performance Audit & Bottlenecks ✅ (findings) / 🔲 (profiles)
 
-Profiling support: workers expose `/debug/pprof/` when started with `-pprof`
-(orchestrator flag `-worker-pprof`). Capture during a run:
+The C++ worker currently exposes no built-in profiler endpoint. Capture CPU or
+memory profiles with system tools (`/usr/bin/time -v`, `perf` if permitted on
+the lab image, or periodic `/proc/<pid>/status` sampling over SSH).
 
-```bash
-go tool pprof "http://<host>:9090/debug/pprof/profile?seconds=30"   # CPU
-go tool pprof "http://<host>:9090/debug/pprof/heap"                 # memory
-```
+Audit findings (code reading; confirm each with a profile):
 
-Audit findings (code reading; confirm each with a pprof capture):
+1. **Common Crawl load memory.** `/load` downloads and decompresses WET files
+   through `curl | gzip -dc` and stores the resulting text in worker memory.
+   For larger file counts, streaming map directly from the decompressor would
+   reduce peak memory.
+2. **Map intermediate size.** `map_line` emits one key/value pair per token for
+   `wordcount`. An in-mapper combiner for associative jobs could turn repeated
+   words into local counts before bucket writes.
+3. **Shuffle fan-out.** Reduce performs O(N²) HTTP fetches (`N` reducers × `N`
+   peers). This is simple and correct but becomes visible at high N.
+4. **NFS exposure is avoided.** Intermediate buckets and WET downloads live in
+   node-local `/tmp`, not NFS home; the orchestrator writes only the final
+   output file locally.
+5. **Serial final merge.** Result merge and output sort run single-threaded in
+   the orchestrator — part of the serial fraction measured in §5.2.
 
-1. **Map-phase memory (highest impact).** `runMap` materialises
-   `map[string][]string` with one `"1"` string *per token occurrence*, then
-   `handleMap` builds a second full copy in per-reducer bucket slices before
-   writing. Peak memory ≈ 2× the expanded intermediate data; for word-count
-   this dwarfs the input itself. _Proposal:_ in-mapper combining (count into
-   `map[string]int` for jobs whose reduce is associative) and streaming bucket
-   writes (append to the N bucket files as lines are mapped) would cut peak
-   memory by an order of magnitude.
-2. **Shuffle JSON overhead.** `/intermediate` reads the whole bucket file into
-   a `[]KeyValue`, then re-encodes it as one JSON array; the fetching side
-   decodes the full array into memory. Each shuffled byte is deserialized and
-   reserialized once on each side plus held twice in RAM. _Proposal:_ stream
-   the `.jsonl` file directly with `io.Copy` (the format on disk is already
-   line-delimited JSON) and decode line-by-line on the reducer; this makes the
-   transfer zero-copy on the serving side.
-3. **Buffer over-allocation.** Every `runMap`/`readKVFlat` call allocates a
-   64 MB scanner buffer up front, even for tiny buckets — N buckets fetched
-   concurrently in reduce allocate N × 64 MB transiently.
-4. **NFS exposure is already avoided (good).** Intermediate buckets and WET
-   downloads live in `os.MkdirTemp` (node-local `/tmp`), not NFS home; the
-   only NFS writes are the orchestrator-side output file. No change needed,
-   but worth stating in the report.
-5. **Serial final merge.** `mergeResults` and the output sort run
-   single-threaded in the orchestrator — part of the serial fraction measured
-   in §5.2.
-
-🔲 _Insert flame graphs / `pprof top` tables for one map-heavy and one
-reduce-heavy run proving items 1–3._
+🔲 _Insert profile tables for one map-heavy and one reduce-heavy run proving
+items 1–3._
 
 ---
 

@@ -1,5 +1,5 @@
 // WordCountJob — minimal Kafka Streams word-count used to benchmark against
-// the custom Go MapReduce framework.
+// the custom C++ MapReduce framework.
 //
 // Reads lines from topic "bench-input", splits them into lowercase
 // alphanumeric tokens, counts each word, and writes (word, count) updates to
@@ -10,7 +10,7 @@
 // (lag == 0, observed twice in a row), the job prints a machine-parseable
 //   TIMING compute_seconds=<float>
 // line (time from Streams start to lag-zero) and exits. This mirrors the
-// "compute_seconds" metric reported by the Go orchestrator: input production
+// "compute_seconds" metric reported by the C++ orchestrator: input production
 // is excluded, processing time is included.
 //
 // Build (no Maven needed — uses the jars bundled with the Kafka distribution):
@@ -61,7 +61,7 @@ public class WordCountJob {
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-bench/streams-state");
-        // Larger batches: fairer comparison with the batch-oriented Go system.
+        // Larger batches: fairer comparison with the batch-oriented C++ system.
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);
         props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 64 * 1024 * 1024L);
 

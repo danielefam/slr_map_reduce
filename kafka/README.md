@@ -1,6 +1,6 @@
 # Kafka Streams Comparison Setup
 
-Benchmarks Apache Kafka Streams against the custom Go MapReduce framework on
+Benchmarks Apache Kafka Streams against the custom C++ MapReduce framework on
 the same lab machines — **no root, no Docker**. Everything runs from the user
 account; Kafka lives on node-local `/tmp` (never NFS, which would corrupt
 Kafka's log segments and skew measurements).
@@ -32,7 +32,7 @@ cd kafka
 ./clean_kafka.sh                             # always clean up when done
 ```
 
-Common Crawl runs: download the same WET split the Go framework used,
+Common Crawl runs: download the same WET split the C++ framework used,
 decompress, and feed it as `-input`:
 
 ```bash
@@ -46,7 +46,7 @@ Both systems report a directly comparable, machine-parseable line:
 
 | System            | Where                              | What is timed                                                       |
 | ----------------- | ---------------------------------- | -------------------------------------------------------------------- |
-| Go MapReduce      | orchestrator log: `TIMING nodes=… compute_seconds=…` | map + reduce + collect (input upload `/data` is **excluded**)  |
+| C++ MapReduce     | orchestrator log: `TIMING nodes=… compute_seconds=…` | map + reduce + collect (input upload `/data` is **excluded**)  |
 | Kafka Streams     | `run_kafka_wordcount.sh` output: `TIMING compute_seconds=…` | Streams processing from `streams.start()` until consumer-group lag on `bench-input` reaches 0 (input production is **excluded**, done before the job starts) |
 
 The Streams job (`WordCountJob.java`) self-terminates: a watchdog thread
@@ -61,6 +61,6 @@ for a bounded dataset on an unbounded streaming engine).
   same parallelism the MapReduce slots get.
 - Run each measurement ≥ 3 times; report median (lab machines are shared).
 - Note the architectural asymmetry in the report: Kafka persists every
-  record to its replicated log (durability the Go framework doesn't offer),
-  so Kafka pays an I/O cost per record while the Go system pays per-phase
+  record to its replicated log (durability the C++ framework doesn't offer),
+  so Kafka pays an I/O cost per record while the C++ system pays per-phase
   HTTP costs. This is a key discussion point, not a flaw in either system.

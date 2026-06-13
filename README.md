@@ -33,6 +33,7 @@ deployment, load-stats collection, cleanup) and a Kafka Streams comparison job.
 │       └── slr_mapreduce.cpp   # MapReduce orchestrator (client)
 ├── scripts/
 │   ├── build_cpp.sh            # builds all binaries into bin/
+│   ├── build_remote_worker.sh  # builds lab-compatible slr_worker remotely
 │   └── test_distributed.sh     # local multi-worker end-to-end test
 ├── bin/                        # compiled binaries (created by build_cpp.sh)
 ├── experiments/
@@ -70,7 +71,14 @@ This produces six binaries in `bin/`:
 | `bin/slr_collect` | Fetch CPU-load/memory stats from every host into `stats.txt` |
 | `bin/slr_cleanup` | Kill remote servers and remove deployed files |
 | `bin/slr_worker` | MapReduce worker: HTTP server executing map/reduce locally |
+| `bin/slr_worker_remote` | Lab-compatible worker built on a remote Debian host |
 | `bin/slr_mapreduce` | MapReduce orchestrator: deploys workers, drives the pipeline |
+
+The lab machines currently run an older glibc/libstdc++ than the local laptop.
+`mapreduce.sh` therefore builds `bin/slr_worker_remote` on the first selected
+lab host before deployment when the worker is missing or stale. This keeps the
+orchestrator local while ensuring the remote worker binary matches the lab
+runtime.
 
 ---
 
@@ -115,8 +123,7 @@ word count. Exits non-zero on any mismatch.
 
 ## Built-in jobs
 
-Unlike the original Go version (which compiled user job packages on the fly),
-jobs are **compiled into the worker binary** and selected at runtime with
+Jobs are **compiled into the worker binary** and selected at runtime with
 `-job <name>`:
 
 | Job | Emits | Description |
@@ -177,9 +184,10 @@ sequenceDiagram
     C->>W2: ssh kill + cleanup
 ```
 
-1. **Deploy** — the client `scp`s `bin/slr_worker` to each host as
-   `/tmp/mr-worker` and starts it with `nohup … -port <p> -job <name>`,
-   recording the PID in `/tmp/mr-worker.pid`.
+1. **Deploy** — the client `scp`s `bin/slr_worker_remote` when present
+  (falling back to `bin/slr_worker`) to each host as a user-scoped path under
+  `/tmp`, then starts it with `nohup … -port <p> -job <name>`, recording a
+  matching PID file.
 2. **Health** — polls `GET /health` until every worker answers (30 × 2 s).
 3. **Input** — local files are split into ≤ 64 MB newline-aligned chunks and
    `POST /data`-ed round-robin; in Common Crawl mode the client resolves the
@@ -199,7 +207,7 @@ sequenceDiagram
    ```
    TIMING nodes=N map_seconds=… reduce_seconds=… collect_seconds=… compute_seconds=…
    ```
-7. **Cleanup** — workers are killed and `/tmp/mr-worker*` removed over SSH,
+7. **Cleanup** — workers are killed and the user-scoped worker files are removed over SSH,
    on both success and failure paths.
 
 ### Worker HTTP API
@@ -256,19 +264,19 @@ The Kafka Streams comparison lives in `kafka/` — see `kafka/README.md`.
 
 ---
 
-## Notes on the C++ port
+## Notes on the C++ implementation
 
-This codebase is a C++ rewrite of an earlier Go implementation. Key paradigm
-differences:
+Key design choices:
 
-- **Compiled-in jobs** instead of Go's dynamic job-package compilation: the
-  worker binary embeds all four jobs and selects one with `-job`.
+- **Compiled-in jobs**: the worker binary embeds all four jobs and selects one
+  with `-job`.
 - **Plain-text line protocol** instead of JSON bodies: worker endpoints accept
   and return newline-separated text/TSV, parsed without a JSON library.
 - **Shell delegation**: HTTP client calls use `curl`, JSON manifest parsing
   uses `jq`, and decompression uses `gzip` — keeping the C++ code dependency-free.
 - **Concurrency** via `std::thread` + a small `parallel_for` helper (with
-  exception propagation) instead of goroutines; the worker handles each
-  connection on a detached thread.
-- The Go sources are retained under `scripts/` for reference but are no longer
-  used by any script or documented command.
+  exception propagation); the worker handles each connection on a detached
+  thread.
+- **Remote-compatible worker builds**: the local orchestrator can be built on
+  the laptop, while `scripts/build_remote_worker.sh` compiles the deployed
+  worker on a lab host to avoid glibc/libstdc++ version mismatches.

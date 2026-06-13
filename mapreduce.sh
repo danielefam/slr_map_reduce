@@ -89,8 +89,27 @@ if [[ ! -x "$BIN_DIR/slr_make_hosts" || ! -x "$BIN_DIR/slr_mapreduce" || ! -x "$
   "$SCRIPTS/build_cpp.sh"
 fi
 
+remote_worker_needs_build() {
+  if [[ ! -x "$BIN_DIR/slr_worker_remote" ]]; then
+    return 0
+  fi
+  while IFS= read -r -d '' src; do
+    if [[ "$src" -nt "$BIN_DIR/slr_worker_remote" ]]; then
+      return 0
+    fi
+  done < <(find "$ROOT/cpp/src" -type f \( -name '*.cpp' -o -name '*.hpp' \) -print0)
+  return 1
+}
+
 echo "=== Step 1: Fetching hosts ==="
 "$BIN_DIR/slr_make_hosts" -n "$N" -f "$HOSTS"
+
+if remote_worker_needs_build; then
+  echo ""
+  echo "=== Step 1b: Building lab-compatible worker ==="
+  FIRST_HOST="$(head -n 1 "$HOSTS")"
+  "$SCRIPTS/build_remote_worker.sh" -host "$FIRST_HOST"
+fi
 
 echo ""
 echo "=== Step 2: Running MapReduce ==="

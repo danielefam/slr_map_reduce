@@ -321,7 +321,11 @@ int main(int argc, char** argv) {
     Config cfg = parse_args(argc, argv);
 
     const std::string root = scripts_root();
-    const std::string worker_local = fs::weakly_canonical(fs::path(root) / "bin" / "slr_worker").string();
+    fs::path worker_path = fs::path(root) / "bin" / "slr_worker_remote";
+    if (!fs::exists(worker_path)) {
+      worker_path = fs::path(root) / "bin" / "slr_worker";
+    }
+    const std::string worker_local = fs::weakly_canonical(worker_path).string();
     if (!fs::exists(worker_local)) {
       throw std::runtime_error("missing worker binary: " + worker_local + " (run scripts/build_cpp.sh)");
     }

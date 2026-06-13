@@ -7,7 +7,7 @@
 #   2. Compile WordCountJob.java on the controller node (bundled Kafka jars,
 #      no Maven required)
 #   3. Produce the input file into bench-input        (NOT timed — mirrors
-#      the Go orchestrator, which excludes /data uploads from compute time)
+#      the C++ orchestrator, which excludes /data uploads from compute time)
 #   4. Start WordCountJob; it self-reports TIMING compute_seconds=… once the
 #      consumer-group lag on bench-input reaches zero
 #   5. Consume bench-output into a local result file (latest count per word)
@@ -67,7 +67,7 @@ echo "--- Compiling WordCountJob on $CONTROLLER_HOST ---"
 scp -q "$SCRIPT_DIR/WordCountJob.java" "$CONTROLLER_HOST:$REMOTE_ROOT/"
 kssh "cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java"
 
-# ── Step 3: produce input (untimed, like the Go /data phase) ───────────────
+# ── Step 3: produce input (untimed, like the C++ /data phase) ──────────────
 echo "--- Producing input ($(wc -l < "$INPUT") lines) ---"
 # Stream the local file through ssh into the console producer on the node.
 ssh -o BatchMode=yes "$CONTROLLER_HOST" \
@@ -95,4 +95,4 @@ kssh "
 echo ""
 echo "Results: $OUTPUT ($(wc -l < "$OUTPUT") distinct words)"
 echo "$TIMING_LINE"
-echo "Compare with the Go framework's log line: 'TIMING nodes=… compute_seconds=…'"
+echo "Compare with the C++ framework's log line: 'TIMING nodes=… compute_seconds=…'"
