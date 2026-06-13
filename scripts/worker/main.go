@@ -18,11 +18,13 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -320,8 +322,20 @@ func (s *server) handleIntermediate(w http.ResponseWriter, r *http.Request) {
 }
 
 // intermediateClient is used for fetching pre-partitioned map buckets from peers.
-// A 10-minute timeout is generous enough for large buckets over a LAN.
-var intermediateClient = &http.Client{Timeout: 10 * time.Minute}
+// The lab hostnames publish IPv6 addresses that are not routable between all
+// machines, so shuffle traffic is forced onto IPv4.
+var intermediateClient = &http.Client{
+	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
+	},
+}
 
 // fetchIntermediate GETs /intermediate from peer, requesting the KV pairs destined
 // for reducerID out of n total workers.
@@ -389,6 +403,9 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(idx int, addr string) {
 			defer wg.Done()
+			if addr == "" {
+				return
+			}
 			kvs, err := fetchIntermediate(addr, id, n)
 			if err != nil {
 				errs[idx] = err

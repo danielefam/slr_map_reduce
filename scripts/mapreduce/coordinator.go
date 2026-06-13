@@ -144,6 +144,23 @@ func (c *coordinator) peers() []string {
 	return out
 }
 
+// mapPeers returns the peer list reducers should pull from. The slice length is
+// still the full slot count so worker bucket numbering remains FNV(key) % N, but
+// slots with no input are left blank because they cannot contain intermediate data.
+func (c *coordinator) mapPeers() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.slots))
+	for i, s := range c.slots {
+		s.mu.Lock()
+		if len(s.urls) > 0 || len(s.chunk) > 0 {
+			out[i] = s.host
+		}
+		s.mu.Unlock()
+	}
+	return out
+}
+
 // allHosts returns slot hosts + spare hosts, used by the health watcher.
 func (c *coordinator) allHosts() []string {
 	c.mu.Lock()
@@ -425,7 +442,7 @@ func (c *coordinator) tryOneStep(ctx context.Context, s *slot, target slotState)
 		err = c.mapOnHost(ctx, host, s, peers)
 		next = sMapped
 	case sMapped:
-		peers := c.peers()
+		peers := c.mapPeers()
 		err = c.reduceOnHost(ctx, host, peers)
 		next = sReduced
 	case sReduced:
