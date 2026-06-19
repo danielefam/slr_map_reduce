@@ -906,7 +906,11 @@ func fetchResult(peer string) ([]KeyValue, error) {
 }
 
 func fetchResultCtx(ctx context.Context, peer string) ([]KeyValue, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+peer+"/result", nil)
+	return fetchSlotResultCtx(ctx, peer, 0)
+}
+
+func fetchSlotResultCtx(ctx context.Context, peer string, slotID int) ([]KeyValue, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s/result?slot=%d", peer, slotID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -917,7 +921,7 @@ func fetchResultCtx(ctx context.Context, peer string) ([]KeyValue, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GET %s/result returned %d: %s", peer, resp.StatusCode, b)
+		return nil, fmt.Errorf("GET %s/result?slot=%d returned %d: %s", peer, slotID, resp.StatusCode, b)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

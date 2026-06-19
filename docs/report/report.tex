@@ -1,0 +1,511 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{graphicx}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black
+}
+
+\newcommand{\placeholder}[1]{%
+  \noindent\colorbox{yellow!20}{\parbox{\dimexpr\linewidth-2\fboxsep\relax}{\textbf{Placeholder:} #1}}%
+}
+\newcommand{\codepath}[1]{\path{#1}}
+
+\lstdefinestyle{codeblock}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\title{\textbf{SLR Project P4 Report}\\MapReduce}
+\author{Guilherme Caporali}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+This project implements two distributed workflows for the Telecom Paris lab
+machines. The first one is the main deliverable: a custom MapReduce framework
+in Go. The second one is a generic deploy/collect/cleanup workflow used to
+start a program on many hosts and collect system information. The MapReduce
+system builds a worker binary locally, deploys it over SSH/SCP, assigns input,
+executes map and reduce through HTTP, then merges the final result locally.
+
+The project works under the practical constraints of the lab: no root access,
+no Docker, shared machines, and frequent host churn. For that reason the
+implementation deliberately uses only Go binaries, SSH/SCP, HTTP, and
+\texttt{/tmp}. The strongest part of the project is the MapReduce orchestration
+itself: worker deployment, phase execution, deterministic partitioning,
+fault-aware slot reassignment, and pluggable jobs.
+
+What was achieved:
+\begin{itemize}[leftmargin=1.5em]
+  \item a complete single-stage MapReduce pipeline with local-file and Common
+  Crawl input modes;
+  \item a generic deployment script pipeline (\texttt{run.sh});
+  \item a Kafka comparison path prepared for later benchmarking;
+  \item a validated strong-scaling experiment on one fixed 64-file workload.
+\end{itemize}
+
+What remains incomplete:
+\begin{itemize}[leftmargin=1.5em]
+  \item no second MapReduce stage exists in the current design;
+  \item the local-file scheduler still assigns at most one chunk per active slot;
+  \item very large Common Crawl wordcount runs exposed memory pressure in the
+  current worker map path;
+  \item the Kafka experiment has not been executed yet;
+  \item the report still lacks a real cross-login validation by another student.
+\end{itemize}
+
+The largest \emph{validated} dataset processed for this report is a fixed
+64-file corpus (\(833{,}953\) bytes) used for the Amdahl experiment.
+
+\section{How to use}
+
+\subsection{Prerequisites}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Go 1.25+ on the local machine.
+  \item SSH key-based access to the lab hosts.
+  \item Access to \url{https://tp.telecom-paris.fr/ajax.php}.
+  \item For Kafka only: Java 17+ on the remote machines.
+\end{itemize}
+
+\subsection{Build and test}
+
+\begin{lstlisting}[style=codeblock]
+cd scripts
+go test ./...
+\end{lstlisting}
+
+\subsection{Run the MapReduce pipeline}
+
+\begin{lstlisting}[style=codeblock]
+./mapreduce.sh -job scripts/jobs/wordcount -input data/simple.txt \
+  -output result.txt -n 10 -port 9090
+\end{lstlisting}
+
+Common Crawl mode:
+
+\begin{lstlisting}[style=codeblock]
+./mapreduce.sh -job scripts/jobs/wordcount -commoncrawl \
+  -crawl CC-MAIN-2026-21 -files-limit 4 -output result.txt -n 10
+\end{lstlisting}
+
+\subsection{Run the deploy/collect pipeline}
+
+\begin{lstlisting}[style=codeblock]
+./run.sh
+\end{lstlisting}
+
+This script fetches hosts, deploys a simple HTTP server, collects
+\texttt{hostname}, \texttt{uptime}, and memory statistics, then cleans up.
+
+\subsection{What must change for another student login}
+
+The MapReduce path is mostly login-agnostic because it deploys workers to
+\texttt{/tmp/mr-worker}. The main login-sensitive points are:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \texttt{run.sh}: the variable \texttt{N} controls how many hosts are
+  targeted by the deploy/collect workflow.
+  \item \texttt{manifest.json}: field \texttt{n} must match \texttt{N} from
+  \texttt{run.sh}.
+  \item \texttt{manifest.json}: field \texttt{nfs} must be changed if a student
+  wants to use NFS-based file deployment.
+  \item \texttt{manifest.json}: the command, collect, and cleanup strings must
+  match the program the student wants to launch remotely.
+  \item The student must already have passwordless SSH configured for the lab.
+\end{enumerate}
+
+Cross-login validation is still pending, so this report states the exact
+variables to change, but not yet a verified second-student execution result.
+
+\section{Components}
+
+\subsection{High-level view}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners, align=center, minimum width=4.0cm, minimum height=1.0cm},
+  service/.style={draw, rounded corners, fill=blue!6, align=center, minimum width=4.1cm, minimum height=1.0cm},
+  data/.style={draw, rounded corners, fill=green!6, align=center, minimum width=4.1cm, minimum height=1.0cm},
+  ->, >=Latex
+]
+  \node[box, fill=gray!10] (user) at (0,2) {User shell\\\texttt{mapreduce.sh} / \texttt{run.sh}};
+  \node[service] (discover) at (-5,0) {Host discovery\\\codepath{scripts/make_hosts}};
+  \node[service] (orchestrator) at (0,0) {MapReduce orchestrator\\\codepath{scripts/mapreduce}};
+  \node[service] (stats) at (5.0,0) {Deploy / collect / cleanup\\\codepath{scripts/deploy}, etc.};
+  \node[data] (machines) at (-3,-2) {Lab machines\\workers or remote commands};
+  \node[data] (io) at (3,-2) {Outputs\\\codepath{result.txt}, \codepath{stats.txt}, CSVs};
+
+  \draw (user) -- (discover);
+  \draw (user) -- (orchestrator);
+  \draw (user) -- (stats);
+  \draw (discover) -- (machines);
+  \draw (orchestrator) -- (machines);
+  \draw (stats) -- (machines);
+  \draw (machines) -- (io);
+\end{tikzpicture}
+\caption{Repository-level architecture. The same discovered host list is reused
+by the deploy script path and by the MapReduce path.}
+\end{figure}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.8cm} >{\raggedright\arraybackslash}p{3.8cm} X}
+\toprule
+\textbf{Component} & \textbf{Location} & \textbf{Role} \\
+\midrule
+Wrapper scripts & \texttt{mapreduce.sh}, \texttt{run.sh} & User-facing entry points. \\
+Host discovery & \codepath{scripts/make_hosts} & Builds \codepath{hosts.txt}. \\
+Orchestrator & \codepath{scripts/mapreduce} & Builds workers, deploys them, coordinates phases, merges results. \\
+Worker & \codepath{scripts/worker} & HTTP server that performs load, map, reduce, and result serving. \\
+Jobs & \codepath{scripts/jobs/*} & Job-specific map/reduce logic. \\
+Remote helpers & \codepath{scripts/internal/remote} & Bounded-parallel SSH/SCP helpers. \\
+Kafka path & \codepath{kafka/*} & Separate comparison setup. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Deploy script}
+
+The deploy script path is the simpler of the two systems. \texttt{run.sh}
+performs four steps:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item fetch \(N\) available hosts with \codepath{scripts/make_hosts};
+  \item execute the commands from \texttt{manifest.json} on each host;
+  \item collect the configured remote outputs;
+  \item execute cleanup commands even if a previous step fails.
+\end{enumerate}
+
+In the current repository state, \texttt{manifest.json} starts a Python HTTP
+server on each machine, then collects \texttt{hostname}, \texttt{uptime}, and
+\texttt{free -m}. The implementation is intentionally generic: only the
+manifest changes, not the deploy tool itself.
+
+\subsection{Map Reduce implementation}
+
+\subsubsection{Design}
+
+The MapReduce system is client-orchestrated. There is no permanent master
+inside the cluster. Instead, the local machine:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item reads \texttt{hosts.txt};
+  \item builds a Linux worker binary with the selected job already linked in;
+  \item deploys that binary to every candidate host;
+  \item starts each worker as an HTTP server;
+  \item assigns input, broadcasts phases, and merges the final output locally.
+\end{enumerate}
+
+The key design choice is that the total reducer count \(N\) stays fixed during a
+job. This matters because the partition function is
+\[
+\mathrm{FNV32a}(key) \bmod N.
+\]
+If a machine dies, the coordinator preserves the logical slot number and
+reassigns that slot to a spare or to a surviving worker host.
+
+\subsubsection{Worker API and phase sequence}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.0cm} >{\raggedright\arraybackslash}p{1.0cm} X}
+\toprule
+\textbf{Endpoint} & \textbf{Method} & \textbf{Role} \\
+\midrule
+\texttt{/health} & GET & Readiness probe. \\
+\texttt{/data} & POST & Accept one local chunk in local-file mode. \\
+\texttt{/load} & POST & Accept a JSON list of input URLs in Common Crawl mode. \\
+\texttt{/map} & POST & Run map and write one bucket file per reducer. \\
+\texttt{/intermediate} & GET & Serve one reducer bucket. \\
+\texttt{/reduce} & POST & Pull peer buckets and run reduce. \\
+\texttt{/result} & GET & Return final key/value lines. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  stage/.style={draw, rounded corners, fill=blue!6, align=center, minimum width=3.8cm, minimum height=1.0cm},
+  detail/.style={draw, rounded corners, fill=gray!8, align=left, text width=8.5cm, inner sep=4pt},
+  ->, >=Latex
+]
+  \node[stage] (p1) at (0,0) {\textbf{1. Load}};
+  \node[detail] (d1) at (6.6,0) {Either push local chunks with \texttt{/data} or send URL lists with \texttt{/load}.};
+  \node[stage] (p2) at (0,-1.8) {\textbf{2. Map}};
+  \node[detail] (d2) at (6.6,-1.8) {Each worker maps its local input and writes \(N\) bucket files on local disk.};
+  \node[stage] (p3) at (0,-3.6) {\textbf{3. Shuffle + reduce}};
+  \node[detail] (d3) at (6.6,-3.6) {Each reducer fetches bucket \(i\) from every peer, regroups by key, and reduces locally.};
+  \node[stage] (p4) at (0,-5.4) {\textbf{4. Collect}};
+  \node[detail] (d4) at (6.6,-5.4) {The client fetches \texttt{/result?slot=i}, merges counts, sorts, and writes the final file.};
+  \draw (p1) -- (p2);
+  \draw (p2) -- (p3);
+  \draw (p3) -- (p4);
+  \draw[-] (p1.east) -- (d1.west);
+  \draw[-] (p2.east) -- (d2.west);
+  \draw[-] (p3.east) -- (d3.west);
+  \draw[-] (p4.east) -- (d4.west);
+\end{tikzpicture}
+\caption{Single-stage MapReduce execution. There is no second MapReduce stage in
+the current project.}
+\end{figure}
+
+\subsubsection{Input splitting and dispatch}
+
+The project supports two input modes.
+
+\paragraph{Local-file mode.}
+The client splits the file into chunks of at most 64 MB, preferably on newline
+boundaries. This is the ``splitting'' phase of the assignment. The current
+limitation is important: the main path assigns at most one chunk per active
+slot, so if the file produces more than \(N\) chunks, the extra chunks are not
+yet scheduled.
+
+\paragraph{Common Crawl mode.}
+The client resolves WET URLs and assigns them round-robin. Slot \(i\) receives
+URL indices \(i, i+N, i+2N,\ldots\). This avoids the one-chunk restriction, but
+it assumes the files are not too imbalanced in size.
+
+\subsubsection{Timing of each phase}
+
+The code reports explicit timings for:
+\begin{itemize}[leftmargin=1.5em]
+  \item map;
+  \item reduce;
+  \item result collection;
+  \item total compute time.
+\end{itemize}
+
+Split and load happen before the compute timer. Shuffle is partly embedded in
+reduce, because reducers fetch their peer buckets during \texttt{/reduce}. The
+project therefore has one measured MapReduce stage:
+\[
+\text{split/load} \rightarrow \text{map} \rightarrow \text{shuffle+reduce} \rightarrow \text{collect}.
+\]
+
+\subsubsection{Storage and communication}
+
+Intermediate data uses both memory and disk:
+\begin{itemize}[leftmargin=1.5em]
+  \item map first builds in-memory structures
+  (\texttt{map[string][]string});
+  \item bucketized intermediate files are then written to node-local disk under
+  \texttt{/tmp};
+  \item reduce reads those bucket files back and rebuilds grouped values in
+  memory.
+\end{itemize}
+
+The system does \textbf{not} use FTP. Communication is:
+\begin{itemize}[leftmargin=1.5em]
+  \item SSH/SCP for deployment and cleanup;
+  \item HTTP over TCP for worker control and shuffle;
+  \item HTTP for Common Crawl downloads.
+\end{itemize}
+
+\subsubsection{Threads and concurrency}
+
+In Go, concurrency is implemented with goroutines. They are used in three main
+places:
+\begin{enumerate}[leftmargin=1.5em]
+  \item bounded-parallel SSH/SCP fan-out in
+  \codepath{scripts/internal/remote};
+  \item concurrent phase broadcasts, health checks, and result fetches in the
+  orchestrator;
+  \item concurrent peer fetches during reduce inside the worker.
+\end{enumerate}
+
+Further parallelization would still be possible inside one worker, especially
+for parallel input downloads, map over multiple local files, and streaming
+shuffle decoding.
+
+\subsubsection{Crash behavior and remaining problems}
+
+The coordinator tracks logical slots rather than binding forever to one host. If
+a host fails, the slot can be rebound to a spare host or to a surviving active
+worker. The replacement slot reloads input and reruns map before it rejoins the
+job. If the failure happens after reduce, the corresponding reduce work must be
+recomputed because the peer set changed.
+
+The main remaining problems are:
+\begin{itemize}[leftmargin=1.5em]
+  \item local-file scheduling beyond \(N\) chunks is incomplete;
+  \item map and shuffle are still memory-heavy for large wordcount jobs;
+  \item there is no durable replicated intermediate state;
+  \item orchestrator-level experiments at very large node counts are sensitive to
+  SSH/network instability.
+\end{itemize}
+
+\subsubsection{Optimization ideas}
+
+The most useful next optimizations would be:
+\begin{enumerate}[leftmargin=1.5em]
+  \item streaming map output directly into bucket files instead of materializing
+  everything in memory first;
+  \item a local combiner for associative jobs such as wordcount;
+  \item true multi-chunk scheduling in local-file mode;
+  \item parallel final merge on the client;
+  \item bucket replication if stronger fault tolerance is needed.
+\end{enumerate}
+
+\subsection{Kafka}
+
+The Kafka path under \codepath{kafka/*} is intentionally separate from the main
+Go implementation. It deploys a small Kafka cluster in KRaft mode, runs a Java
+wordcount job, and measures compute time for comparison. Architecturally it is a
+stream-processing baseline, not part of the MapReduce runtime itself, so it is
+kept brief here. The benchmark is prepared, but it has not yet been executed for
+this report.
+
+\section{Experiments}
+
+\subsection{Methodology}
+
+The first idea was to run wordcount on 64 Common Crawl WET files for the Amdahl
+plot. In practice, that workload was not stable enough for this environment:
+large wordcount runs exposed memory pressure in the worker map path. For that
+reason, the validated scaling experiment was redone on a fixed 64-file corpus
+(\(833{,}953\) bytes) listed in \codepath{experiments/amdahl/go64_urls.txt}.
+Each file is fetched from \texttt{raw.githubusercontent.com}, so the workload is
+fixed and reproducible.
+
+The final validated sweep used the same algorithm and the same 64-file dataset,
+then varied only the number of active nodes. That is the correct methodology for
+Amdahl's law.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{r r r r r r r l}
+\toprule
+\textbf{Nodes} & \textbf{Load (s)} & \textbf{Map (s)} & \textbf{Reduce (s)} & \textbf{Collect (s)} & \textbf{Compute (s)} & \textbf{Speedup} \\
+\midrule
+1   & 0.804 & 0.552 & 0.357 & 0.064 & 0.973  & 1.0000 \\
+2   & 0.587 & 0.255 & 0.136 & 0.103 & 0.494  & 1.9696\\
+4   & 0.406 & 0.168 & 0.072 & 0.143 & 0.383  & 2.5405\\
+8   & 0.324 & 0.090 & 0.097 & 0.079 & 0.266  & 3.6579\\
+16  & 0.295 & 0.078 & 1.250 & 0.084 & 1.412  & 0.6891\\
+32  & 0.442 & 0.082 & 5.161 & 0.086 & 5.329  & 0.1826\\
+64  & 0.165 & 0.119 & 10.182 & 0.151 & 10.452 & 0.0931\\
+\bottomrule
+\end{tabular}
+\caption{Validated strong-scaling run on the fixed 64-file dataset. Speedup is
+\(T(1)/T(N)\), using the same MapReduce implementation and the same dataset.}
+\end{table}
+
+The main observation is that scaling is good only at small node counts. Up to 8
+nodes, the compute time decreases as expected. Starting at 16 nodes, reduce
+dominates and the total runtime becomes worse than the 8-node case. At 32 and
+64 nodes, the system is still correct, but the communication and coordination
+overhead overwhelms the useful work.
+
+\subsection{Amdahl's Law}
+
+The correct reference for Amdahl speedup is the 1-node run of the same
+algorithm:
+\[
+S(N) = \frac{T(1)}{T(N)}.
+\]
+So the baseline is the 1-node MapReduce run, not the 2-node run and not a
+separate sequential implementation.
+
+For this dataset, the measured curve rises from 1 to 8 nodes and then bends
+strongly downward. This still validates the qualitative expectation behind
+Amdahl's law:
+\begin{itemize}[leftmargin=1.5em]
+  \item first, parallel work dominates and speedup rises;
+  \item then communication, synchronization, and the serial merge cost dominate;
+  \item finally the system stops scaling and can even slow down.
+\end{itemize}
+
+If only the first four points (1, 2, 4, 8) are used, the measured curve is
+compatible with an effective parallel fraction of about \(p \approx 0.83\).
+That estimate is useful for the ``good'' scaling region. However, the larger
+node counts show that one global \(p\) is not enough to describe the full
+system once reduce and orchestration costs dominate.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}[t]{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{go64_amdahl.png}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{go64_amdahl_loglog.png}
+\end{minipage}
+\caption{Measured speedup for the validated sweep. The left figure is the main
+Amdahl view with linear speedup on the \(y\)-axis; the right figure shows the
+same data on a log-log scale to emphasize the high-node-count collapse.}
+\end{figure}
+
+Could the graph change with multiple dataset sizes? Yes. Small datasets would
+saturate even earlier, while larger datasets would usually delay the point where
+fixed coordination costs become dominant. In this session, however, only one
+dataset size was fully validated.
+
+\subsection{Batch x Stream Processing}
+
+\placeholder{Kafka has not yet been benchmarked in this session. Keep this
+section as a placeholder for the future report revision that compares the
+batch-oriented Go MapReduce system with the streaming Kafka path on the same
+workload.}
+
+\section{Conclusion}
+
+The project successfully implements a coherent distributed MapReduce system in
+Go, together with a reusable deployment pipeline and a prepared Kafka
+comparison path. The main technical success is the detailed MapReduce runtime:
+worker build injection, deployment, HTTP coordination, slot-preserving recovery,
+and pluggable jobs all work end to end.
+
+For the report experiments, the validated maximum dataset processed was the
+fixed 64-file corpus used in the strong-scaling sweep. The measured results show
+that the system scales well only up to a modest number of nodes for wordcount.
+The best compute time was obtained at 8 nodes; after that, the reduce phase
+dominates and speedup collapses.
+
+In short:
+\begin{itemize}[leftmargin=1.5em]
+  \item the project works and is technically complete as a single-stage
+  MapReduce system;
+  \item the main remaining engineering work is scalability of the map/shuffle
+  implementation, especially memory use and high-node-count reduce behavior;
+  \item the Kafka comparison and cross-login validation still need to be added
+  before the report is fully final.
+\end{itemize}
+
+\end{document}

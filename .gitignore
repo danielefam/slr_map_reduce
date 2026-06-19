@@ -23,3 +23,6 @@ data/
 *.txt
 
 kafka/dist
+*.aux
+docs/report/build/
+experiments/

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,18 +24,21 @@ import (
 type fakeWorker struct {
 	mu sync.Mutex
 
-	failNext       map[string]int   // path -> times to fail with 500
-	failPeerReduce string           // if non-empty, /reduce returns "fetch from peer X: died"
-	stopAfter      map[string]int   // path -> after N successes, srv.Close()
-	pathCounts     map[string]int   // observed counts per path
-	urls           []string         // last received /load body
-	peers          []string         // peers passed in /map (or /reduce)
-	id             int              // id from last /map
-	results        []KeyValue       // /result payload to return
+	failNext       map[string]int // path -> times to fail with 500
+	failPeerReduce string         // if non-empty, /reduce returns "fetch from peer X: died"
+	stopAfter      map[string]int // path -> after N successes, srv.Close()
+	pathCounts     map[string]int // observed counts per path
+	slotData       map[int]*fakeSlot
 	srv            *httptest.Server // injected after construction
 	loaded         bool
 	mapped         bool
 	reduced        bool
+}
+
+type fakeSlot struct {
+	urls   []string
+	peers  []string
+	result []KeyValue
 }
 
 func newFakeWorker() *fakeWorker {
@@ -42,6 +46,7 @@ func newFakeWorker() *fakeWorker {
 		failNext:   make(map[string]int),
 		stopAfter:  make(map[string]int),
 		pathCounts: make(map[string]int),
+		slotData:   make(map[int]*fakeSlot),
 	}
 }
 
@@ -55,14 +60,17 @@ func (w *fakeWorker) handler() http.Handler {
 		var req loadRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.mu.Lock()
-		w.urls = req.URLs
+		slot := w.slotLocked(req.ID)
+		slot.urls = append([]string(nil), req.URLs...)
 		w.loaded = true
 		w.mu.Unlock()
 		rw.WriteHeader(200)
 	}))
 	mux.HandleFunc("POST /data", w.wrap("/data", func(rw http.ResponseWriter, r *http.Request) {
+		slotID, _ := strconv.Atoi(r.URL.Query().Get("slot"))
 		_, _ = io.ReadAll(r.Body)
 		w.mu.Lock()
+		w.slotLocked(slotID)
 		w.loaded = true
 		w.mu.Unlock()
 		rw.WriteHeader(200)
@@ -71,18 +79,19 @@ func (w *fakeWorker) handler() http.Handler {
 		var req mapRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.mu.Lock()
-		w.id = req.ID
-		w.peers = req.Peers
+		slot := w.slotLocked(req.ID)
+		slot.peers = append([]string(nil), req.Peers...)
 		w.mapped = true
 		w.mu.Unlock()
 		rw.WriteHeader(200)
 	}))
 	mux.HandleFunc("POST /reduce", w.wrap("/reduce", func(rw http.ResponseWriter, r *http.Request) {
-		var body struct{ Peers []string }
+		var body reduceRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.mu.Lock()
+		slot := w.slotLocked(body.ID)
 		if len(body.Peers) > 0 {
-			w.peers = body.Peers
+			slot.peers = append([]string(nil), body.Peers...)
 		}
 		failPeer := w.failPeerReduce
 		w.mu.Unlock()
@@ -95,9 +104,10 @@ func (w *fakeWorker) handler() http.Handler {
 		w.mu.Unlock()
 		rw.WriteHeader(200)
 	}))
-	mux.HandleFunc("GET /result", w.wrap("/result", func(rw http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /result", w.wrap("/result", func(rw http.ResponseWriter, r *http.Request) {
+		slotID, _ := strconv.Atoi(r.URL.Query().Get("slot"))
 		w.mu.Lock()
-		results := w.results
+		results := append([]KeyValue(nil), w.slotLocked(slotID).result...)
 		w.mu.Unlock()
 		rw.WriteHeader(200)
 		for _, kv := range results {
@@ -105,6 +115,17 @@ func (w *fakeWorker) handler() http.Handler {
 		}
 	}))
 	return mux
+}
+
+func (w *fakeWorker) slotLocked(slotID int) *fakeSlot {
+	slot := w.slotData[slotID]
+	if slot == nil {
+		slot = &fakeSlot{
+			result: []KeyValue{{Key: fmt.Sprintf("k%d", slotID), Value: "1"}},
+		}
+		w.slotData[slotID] = slot
+	}
+	return slot
 }
 
 func (w *fakeWorker) wrap(path string, h http.HandlerFunc) http.HandlerFunc {
@@ -133,7 +154,6 @@ func startFake(t *testing.T, n, spareCount int) (workers []*fakeWorker, slotPeer
 	all := make([]string, total)
 	for i := range total {
 		w := newFakeWorker()
-		w.results = []KeyValue{{Key: fmt.Sprintf("k%d", i), Value: "1"}}
 		w.srv = httptest.NewServer(w.handler())
 		workers[i] = w
 		u, _ := url.Parse(w.srv.URL)
@@ -252,7 +272,7 @@ func TestCoordinator_ReplacePeerOnReduceFailure(t *testing.T) {
 	}
 }
 
-func TestCoordinator_NoSpareLeftFailsJob(t *testing.T) {
+func TestCoordinator_ReassignsToActiveWorkerWhenNoSpareRemains(t *testing.T) {
 	workers, slots, spares := startFake(t, 2, 0) // zero spares
 	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
 	for _, s := range c.slots {
@@ -263,10 +283,34 @@ func TestCoordinator_NoSpareLeftFailsJob(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.drive(ctx, sMapped); err == nil {
-		t.Fatal("expected drive to fail with no spare")
-	} else if !strings.Contains(err.Error(), "no spare") {
-		t.Errorf("expected 'no spare' error, got: %v", err)
+	mustDrive(t, c, ctx, sMapped, "map")
+	mustDrive(t, c, ctx, sReduced, "reduce")
+	mustDrive(t, c, ctx, sDone, "result")
+
+	if got, want := c.slots[0].host, slots[1]; got != want {
+		t.Fatalf("slot 0 host = %s, want fallback onto surviving worker %s", got, want)
+	}
+	if got, want := c.slots[1].host, slots[1]; got != want {
+		t.Fatalf("slot 1 host = %s, want surviving worker to keep original slot %s", got, want)
+	}
+}
+
+func TestExtractFailedSlot(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+		ok   bool
+	}{
+		{`POST x/reduce returned 500: fetch from slot 1 peer 1.2.3.4:9090: died`, 1, true},
+		{`fetch from slot 0 peer host.local:80 ran away`, 0, true},
+		{`fetch from peer host.local:80 ran away`, 0, false},
+		{`some other error`, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := extractFailedSlot(c.in)
+		if ok != c.ok || got != c.want {
+			t.Errorf("extractFailedSlot(%q) = (%d, %v), want (%d, %v)", c.in, got, ok, c.want, c.ok)
+		}
 	}
 }
 

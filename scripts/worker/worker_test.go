@@ -41,10 +41,30 @@ func mustPost(t *testing.T, url, contentType string, body []byte) {
 	}
 }
 
-// getResult fetches /result and returns the parsed word→count map.
-func getResult(t *testing.T, baseURL string) map[string]int {
+func dataURL(baseURL string, slotID int) string {
+	return fmt.Sprintf("%s/data?slot=%d", baseURL, slotID)
+}
+
+func resultURL(baseURL string, slotID int) string {
+	return fmt.Sprintf("%s/result?slot=%d", baseURL, slotID)
+}
+
+func mustMap(t *testing.T, baseURL string, slotID int, peers []string) {
 	t.Helper()
-	resp, err := http.Get(baseURL + "/result")
+	body, _ := json.Marshal(mapRequest{ID: slotID, Peers: peers})
+	mustPost(t, baseURL+"/map", "application/json", body)
+}
+
+func mustReduce(t *testing.T, baseURL string, slotID int, peers []string) {
+	t.Helper()
+	body, _ := json.Marshal(reduceRequest{ID: slotID, Peers: peers})
+	mustPost(t, baseURL+"/reduce", "application/json", body)
+}
+
+// getResult fetches /result and returns the parsed word→count map.
+func getResult(t *testing.T, baseURL string, slotID int) map[string]int {
+	t.Helper()
+	resp, err := http.Get(resultURL(baseURL, slotID))
 	if err != nil {
 		t.Fatalf("GET /result: %v", err)
 	}
@@ -85,7 +105,7 @@ func TestHandleData(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
 
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello world\n"))
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte("hello world\n"))
 }
 
 func TestHandleLoadDownloadsAndCleansInputs(t *testing.T) {
@@ -104,19 +124,18 @@ func TestHandleLoadDownloadsAndCleansInputs(t *testing.T) {
 	}))
 	defer source.Close()
 
-	body, _ := json.Marshal(loadRequest{URLs: []string{source.URL + "/segment-00000.wet.gz"}})
+	body, _ := json.Marshal(loadRequest{ID: 0, URLs: []string{source.URL + "/segment-00000.wet.gz"}})
 	mustPost(t, ts.URL+"/load", "application/json", body)
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
-	got := getResult(t, ts.URL)
+	got := getResult(t, ts.URL, 0)
 	if got["hello"] != 2 || got["crawl"] != 1 || got["web"] != 1 {
 		t.Fatalf("unexpected result counts: %v", got)
 	}
-	matches, err := filepath.Glob(filepath.Join(workDir, "cc-input-*"))
+	matches, err := filepath.Glob(filepath.Join(workDir, "slot-0-cc-input-*"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,14 +150,13 @@ func TestSingleWorkerPipeline(t *testing.T) {
 	defer ts.Close()
 
 	input := "hello world\nhello go\nworld cup\n"
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(input))
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte(input))
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
-	got := getResult(t, ts.URL)
+	got := getResult(t, ts.URL, 0)
 
 	want := map[string]int{"hello": 2, "world": 2, "go": 1, "cup": 1}
 	for word, count := range want {
@@ -170,24 +188,23 @@ func TestMultiWorkerPipeline(t *testing.T) {
 		"fast car\nhello car\n",
 	}
 	for i, ts := range servers {
-		mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(chunks[i]))
+		mustPost(t, dataURL(ts.URL, i), "application/octet-stream", []byte(chunks[i]))
 	}
 
 	// Map phase.
 	for i, ts := range servers {
-		req, _ := json.Marshal(mapRequest{ID: i, Peers: peers})
-		mustPost(t, ts.URL+"/map", "application/json", req)
+		mustMap(t, ts.URL, i, peers)
 	}
 
 	// Reduce phase: each worker pulls intermediate data from all peers.
-	for _, ts := range servers {
-		mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	for i, ts := range servers {
+		mustReduce(t, ts.URL, i, nil)
 	}
 
 	// Merge results from all workers.
 	merged := make(map[string]int)
-	for _, ts := range servers {
-		for word, count := range getResult(t, ts.URL) {
+	for i, ts := range servers {
+		for word, count := range getResult(t, ts.URL, i) {
 			merged[word] += count
 		}
 	}
@@ -217,16 +234,15 @@ func TestIntermediateEndpoint(t *testing.T) {
 	defer ts.Close()
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("hello world\nhello go\n"))
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte("hello world\nhello go\n"))
 
 	// Use n=3 peers so the map phase writes 3 bucket files; the two extra
 	// addresses are never contacted during this test (no reduce phase runs).
 	const n = 3
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer, "unused1:9090", "unused2:9090"}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
+	mustMap(t, ts.URL, 0, []string{peer, "unused1:9090", "unused2:9090"})
 
 	for r := 0; r < n; r++ {
-		url := fmt.Sprintf("%s/intermediate?reducer=%d&n=%d", ts.URL, r, n)
+		url := fmt.Sprintf("%s/intermediate?slot=%d&reducer=%d&n=%d", ts.URL, 0, r, n)
 		resp, err := http.Get(url) //nolint:gosec
 		if err != nil {
 			t.Fatalf("GET /intermediate reducer=%d: %v", r, err)
@@ -254,18 +270,16 @@ func TestDataResetsState(t *testing.T) {
 	peer := strings.TrimPrefix(ts.URL, "http://")
 
 	// First job.
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("apple apple\n"))
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte("apple apple\n"))
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
 	// Second job with different data — /data must reset state.
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte("banana\n"))
-	mapReq2, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq2)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte("banana\n"))
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
-	got := getResult(t, ts.URL)
+	got := getResult(t, ts.URL, 0)
 	if got["apple"] != 0 {
 		t.Errorf("apple should be gone after reset, got %d", got["apple"])
 	}
@@ -280,7 +294,8 @@ func TestHandleReduceNoMapPhase(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/reduce", "application/octet-stream", bytes.NewReader(nil))
+	body, _ := json.Marshal(reduceRequest{ID: 0})
+	resp, err := http.Post(ts.URL+"/reduce", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,28 +324,27 @@ func TestConcurrentReducePipeline(t *testing.T) {
 		"fox and dog\n",
 	}
 	for i, ts := range servers {
-		mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(chunks[i]))
+		mustPost(t, dataURL(ts.URL, i), "application/octet-stream", []byte(chunks[i]))
 	}
 
 	for i, ts := range servers {
-		req, _ := json.Marshal(mapRequest{ID: i, Peers: peers})
-		mustPost(t, ts.URL+"/map", "application/json", req)
+		mustMap(t, ts.URL, i, peers)
 	}
 
 	// All reduces run concurrently; each worker pulls /intermediate from all peers.
 	var reduceWg sync.WaitGroup
-	for _, ts := range servers {
+	for i, ts := range servers {
 		reduceWg.Add(1)
-		go func(s *httptest.Server) {
+		go func(slotID int, s *httptest.Server) {
 			defer reduceWg.Done()
-			mustPost(t, s.URL+"/reduce", "application/octet-stream", nil)
-		}(ts)
+			mustReduce(t, s.URL, slotID, nil)
+		}(i, ts)
 	}
 	reduceWg.Wait()
 
 	merged := make(map[string]int)
-	for _, ts := range servers {
-		for word, count := range getResult(t, ts.URL) {
+	for i, ts := range servers {
+		for word, count := range getResult(t, ts.URL, i) {
 			merged[word] += count
 		}
 	}
@@ -369,22 +383,21 @@ func TestWorkersReceiveEmptyData(t *testing.T) {
 	}
 
 	// Only the first worker receives data; the others get an empty payload.
-	mustPost(t, servers[0].URL+"/data", "application/octet-stream", []byte("hello world\nhello\n"))
-	mustPost(t, servers[1].URL+"/data", "application/octet-stream", []byte{})
-	mustPost(t, servers[2].URL+"/data", "application/octet-stream", []byte{})
+	mustPost(t, dataURL(servers[0].URL, 0), "application/octet-stream", []byte("hello world\nhello\n"))
+	mustPost(t, dataURL(servers[1].URL, 1), "application/octet-stream", []byte{})
+	mustPost(t, dataURL(servers[2].URL, 2), "application/octet-stream", []byte{})
 
 	for i, ts := range servers {
-		req, _ := json.Marshal(mapRequest{ID: i, Peers: peers})
-		mustPost(t, ts.URL+"/map", "application/json", req)
+		mustMap(t, ts.URL, i, peers)
 	}
 
-	for _, ts := range servers {
-		mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	for i, ts := range servers {
+		mustReduce(t, ts.URL, i, nil)
 	}
 
 	merged := make(map[string]int)
-	for _, ts := range servers {
-		for word, count := range getResult(t, ts.URL) {
+	for i, ts := range servers {
+		for word, count := range getResult(t, ts.URL, i) {
 			merged[word] += count
 		}
 	}
@@ -408,12 +421,11 @@ func TestUnicodeInput(t *testing.T) {
 
 	input := "café naïve résumé\nfoo café bar\n"
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(input))
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte(input))
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
-	got := getResult(t, ts.URL)
+	got := getResult(t, ts.URL, 0)
 	for word, wantCount := range map[string]int{"café": 2, "naïve": 1, "résumé": 1, "foo": 1, "bar": 1} {
 		if got[word] != wantCount {
 			t.Errorf("%q: want %d, got %d", word, wantCount, got[word])
@@ -433,12 +445,11 @@ func TestHighFrequencyWord(t *testing.T) {
 	}
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(sb.String()))
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte(sb.String()))
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
-	got := getResult(t, ts.URL)
+	got := getResult(t, ts.URL, 0)
 	if got["word"] != count {
 		t.Errorf("word: want %d, got %d", count, got["word"])
 	}
@@ -459,16 +470,48 @@ func TestLargeInput(t *testing.T) {
 	input := sb.String()
 
 	peer := strings.TrimPrefix(ts.URL, "http://")
-	mustPost(t, ts.URL+"/data", "application/octet-stream", []byte(input))
-	mapReq, _ := json.Marshal(mapRequest{ID: 0, Peers: []string{peer}})
-	mustPost(t, ts.URL+"/map", "application/json", mapReq)
-	mustPost(t, ts.URL+"/reduce", "application/octet-stream", nil)
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte(input))
+	mustMap(t, ts.URL, 0, []string{peer})
+	mustReduce(t, ts.URL, 0, nil)
 
-	got := getResult(t, ts.URL)
+	got := getResult(t, ts.URL, 0)
 	if got["the"] != 2000 {
 		t.Errorf("the: want 2000, got %d", got["the"])
 	}
 	if got["fox"] != 1000 {
 		t.Errorf("fox: want 1000, got %d", got["fox"])
+	}
+}
+
+func TestSingleWorkerHostsMultipleSlots(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	peer := strings.TrimPrefix(ts.URL, "http://")
+	peers := []string{peer, peer}
+
+	mustPost(t, dataURL(ts.URL, 0), "application/octet-stream", []byte("alpha beta\nalpha\n"))
+	mustPost(t, dataURL(ts.URL, 1), "application/octet-stream", []byte("beta gamma\ngamma\n"))
+
+	mustMap(t, ts.URL, 0, peers)
+	mustMap(t, ts.URL, 1, peers)
+	mustReduce(t, ts.URL, 0, peers)
+	mustReduce(t, ts.URL, 1, peers)
+
+	merged := make(map[string]int)
+	for _, slotID := range []int{0, 1} {
+		for word, count := range getResult(t, ts.URL, slotID) {
+			merged[word] += count
+		}
+	}
+
+	want := map[string]int{"alpha": 2, "beta": 2, "gamma": 2}
+	for word, count := range want {
+		if merged[word] != count {
+			t.Errorf("word %q: want %d, got %d", word, count, merged[word])
+		}
+	}
+	if len(merged) != len(want) {
+		t.Errorf("merged has %d words, want %d: %v", len(merged), len(want), merged)
 	}
 }

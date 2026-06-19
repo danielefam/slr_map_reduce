@@ -86,7 +86,13 @@ type slot struct {
 }
 
 type loadRequest struct {
+	ID   int      `json:"id"`
 	URLs []string `json:"urls"`
+}
+
+type reduceRequest struct {
+	ID    int      `json:"id"`
+	Peers []string `json:"peers"`
 }
 
 // coordinator owns the slot table, the spare pool, and the configuration
@@ -166,14 +172,24 @@ func (c *coordinator) allHosts() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	hosts := make([]string, 0, len(c.slots)+len(c.spares))
+	seen := make(map[string]struct{}, len(c.slots)+len(c.spares))
 	for _, s := range c.slots {
 		s.mu.Lock()
 		if s.host != "" {
-			hosts = append(hosts, s.host)
+			if _, ok := seen[s.host]; !ok {
+				seen[s.host] = struct{}{}
+				hosts = append(hosts, s.host)
+			}
 		}
 		s.mu.Unlock()
 	}
-	hosts = append(hosts, c.spares...)
+	for _, host := range c.spares {
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
 	return hosts
 }
 
@@ -218,6 +234,40 @@ func (c *coordinator) claimSpare() (string, bool) {
 	return "", false
 }
 
+// claimActiveHost picks a currently healthy slot host to temporarily own another
+// logical slot when the spare pool is empty. The least-loaded host is chosen so
+// fallback reassignments spread out when possible.
+func (c *coordinator) claimActiveHost(exclude string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	loads := make(map[string]int, len(c.slots))
+	for _, s := range c.slots {
+		s.mu.Lock()
+		host := s.host
+		s.mu.Unlock()
+		if host == "" || host == exclude {
+			continue
+		}
+		if _, dead := c.dead[host]; dead {
+			continue
+		}
+		loads[host]++
+	}
+	bestHost := ""
+	bestLoad := 0
+	for host, load := range loads {
+		if bestHost == "" || load < bestLoad || (load == bestLoad && host < bestHost) {
+			bestHost = host
+			bestLoad = load
+		}
+	}
+	if bestHost == "" {
+		return "", false
+	}
+	return bestHost, true
+}
+
 // markDead records that host should never be reused as a slot host.
 func (c *coordinator) markDead(host string) {
 	if host == "" {
@@ -250,8 +300,11 @@ func (c *coordinator) replaceHost(s *slot, reason string) (string, bool) {
 
 	newHost, ok := c.claimSpare()
 	if !ok {
-		log.Printf("[slot %d] no spare available to replace %s (%s)", s.id, oldHost, reason)
-		return "", false
+		newHost, ok = c.claimActiveHost(oldHost)
+		if !ok {
+			log.Printf("[slot %d] no spare or active fallback host available to replace %s (%s)", s.id, oldHost, reason)
+			return "", false
+		}
 	}
 
 	s.mu.Lock()
@@ -281,10 +334,10 @@ func (c *coordinator) backoff(attempt int) time.Duration {
 // loadOnHost calls POST /load (Common Crawl URL mode) or POST /data (chunk mode) on host.
 func (c *coordinator) loadOnHost(ctx context.Context, host string, s *slot) error {
 	if len(s.urls) > 0 {
-		body, _ := json.Marshal(loadRequest{URLs: s.urls})
+		body, _ := json.Marshal(loadRequest{ID: s.id, URLs: s.urls})
 		return postJSONCtx(ctx, dataClient, host, "/load", body)
 	}
-	return postRawCtx(ctx, dataClient, host, "/data", s.chunk)
+	return postRawCtx(ctx, dataClient, host, fmt.Sprintf("/data?slot=%d", s.id), s.chunk)
 }
 
 // mapOnHost calls POST /map on host with the slot's id and the current peer list.
@@ -297,15 +350,13 @@ func (c *coordinator) mapOnHost(ctx context.Context, host string, s *slot, peers
 // reduceOnHost calls POST /reduce on host. The peer list is included in the
 // request body so worker uses the up-to-date routing (necessary if any slot
 // has been replaced since the host's last /map).
-func (c *coordinator) reduceOnHost(ctx context.Context, host string, peers []string) error {
-	body, _ := json.Marshal(struct {
-		Peers []string `json:"peers"`
-	}{peers})
+func (c *coordinator) reduceOnHost(ctx context.Context, host string, s *slot, peers []string) error {
+	body, _ := json.Marshal(reduceRequest{ID: s.id, Peers: peers})
 	return postJSONCtx(ctx, longClient, host, "/reduce", body)
 }
 
-func (c *coordinator) resultOnHost(ctx context.Context, host string) ([]KeyValue, error) {
-	return fetchResultCtx(ctx, host)
+func (c *coordinator) resultOnHost(ctx context.Context, host string, s *slot) ([]KeyValue, error) {
+	return fetchSlotResultCtx(ctx, host, s.id)
 }
 
 // ── phase drivers ───────────────────────────────────────────────────────────
@@ -443,11 +494,11 @@ func (c *coordinator) tryOneStep(ctx context.Context, s *slot, target slotState)
 		next = sMapped
 	case sMapped:
 		peers := c.mapPeers()
-		err = c.reduceOnHost(ctx, host, peers)
+		err = c.reduceOnHost(ctx, host, s, peers)
 		next = sReduced
 	case sReduced:
 		var kvs []KeyValue
-		kvs, err = c.resultOnHost(ctx, host)
+		kvs, err = c.resultOnHost(ctx, host, s)
 		if err == nil {
 			s.mu.Lock()
 			s.result = kvs
@@ -495,15 +546,35 @@ func identifyCulprit(c *coordinator, r stepResult) *slot {
 	if r.err != nil {
 		msg = r.err.Error()
 	}
+	if slotID, ok := extractFailedSlot(msg); ok {
+		return c.slotByID(slotID)
+	}
 	if dead := extractFailedPeer(msg); dead != "" {
 		if s := c.slotByHost(dead); s != nil {
 			return s
 		}
 	}
-	if r.host == "" {
-		return nil
+	return r.slot
+}
+
+// extractFailedSlot scans msg for the worker's reduce error pattern
+// "fetch from slot <id> peer HOST:PORT" and returns the slot id.
+func extractFailedSlot(msg string) (int, bool) {
+	const marker = "fetch from slot "
+	i := indexOf(msg, marker)
+	if i < 0 {
+		return 0, false
 	}
-	return c.slotByHost(r.host)
+	rest := msg[i+len(marker):]
+	end := indexOfAny(rest, " ")
+	if end <= 0 {
+		return 0, false
+	}
+	slotID, err := strconv.Atoi(rest[:end])
+	if err != nil || slotID < 0 {
+		return 0, false
+	}
+	return slotID, true
 }
 
 // extractFailedPeer scans msg for the worker's reduce error pattern
@@ -576,6 +647,13 @@ func (c *coordinator) slotByHost(h string) *slot {
 		}
 	}
 	return nil
+}
+
+func (c *coordinator) slotByID(id int) *slot {
+	if id < 0 || id >= len(c.slots) {
+		return nil
+	}
+	return c.slots[id]
 }
 
 // hostOf returns the slot's current host (helper for log messages).
