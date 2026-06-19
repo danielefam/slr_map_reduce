@@ -13,7 +13,7 @@
 #   5. Consume bench-output into a local result file (latest count per word)
 #
 # Usage:
-#   ./run_kafka_wordcount.sh -input ../test_input.txt [-output kafka_result.txt]
+#   ./run_kafka_wordcount.sh -input /path/to/data.txt [-output kafka_result.txt]
 #
 # Comparison with the custom framework:
 #   ../mapreduce.sh -job scripts/jobs/wordcount -input <same file> ... prints
@@ -27,6 +27,7 @@ REMOTE_ROOT="/tmp/kafka-bench"
 KAFKA_VERSION="4.3.0"
 SCALA_VERSION="2.13"
 BROKER_PORT=9092
+MAX_MESSAGE_BYTES=33554432
 INPUT=""
 OUTPUT="kafka_result.txt"
 
@@ -49,18 +50,43 @@ N_PARTITIONS="$(grep -cv '^[[:space:]]*$' "$HOSTS_FILE")"
 
 kssh() { ssh -o BatchMode=yes "$CONTROLLER_HOST" "$@"; }
 
+wait_for_kafka() {
+  local attempt
+  for attempt in $(seq 1 60); do
+    if kssh "cd $KAFKA_HOME && bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --list >/dev/null 2>&1"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 echo "=== Kafka Streams word-count benchmark (bootstrap: $BOOTSTRAP) ==="
 
 # ── Step 1: topics ──────────────────────────────────────────────────────────
 echo "--- Recreating topics ---"
-kssh "
+if ! wait_for_kafka; then
+  echo "ERROR: Kafka broker did not become ready in time; check the deploy logs on $CONTROLLER_HOST." >&2
+  exit 1
+fi
+
+attempt=1
+until kssh "
   cd $KAFKA_HOME
   bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --delete --topic bench-input  2>/dev/null || true
   bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --delete --topic bench-output 2>/dev/null || true
   sleep 2
-  bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic bench-input  --partitions $N_PARTITIONS --replication-factor 1
-  bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic bench-output --partitions $N_PARTITIONS --replication-factor 1
-"
+  bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic bench-input  --partitions $N_PARTITIONS --replication-factor 1 --config max.message.bytes=$MAX_MESSAGE_BYTES
+  bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic bench-output --partitions $N_PARTITIONS --replication-factor 1 --config max.message.bytes=$MAX_MESSAGE_BYTES
+"; do
+  if (( attempt >= 5 )); then
+    echo "ERROR: failed to create Kafka topics after $attempt attempts." >&2
+    exit 1
+  fi
+  echo "Kafka is still settling; retrying topic creation (attempt $((attempt + 1))/5)..."
+  sleep $((attempt * 3))
+  attempt=$((attempt + 1))
+done
 
 # ── Step 2: compile the Streams app remotely ───────────────────────────────
 echo "--- Compiling WordCountJob on $CONTROLLER_HOST ---"
@@ -71,7 +97,7 @@ kssh "cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java"
 echo "--- Producing input ($(wc -l < "$INPUT") lines) ---"
 # Stream the local file through ssh into the console producer on the node.
 ssh -o BatchMode=yes "$CONTROLLER_HOST" \
-  "$KAFKA_HOME/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic bench-input" \
+  "$KAFKA_HOME/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic bench-input --producer-property max.request.size=$MAX_MESSAGE_BYTES" \
   < "$INPUT"
 
 # ── Step 4: run the Streams job; it exits once lag == 0 and prints TIMING ──

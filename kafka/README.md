@@ -22,13 +22,15 @@ Kafka's log segments and skew measurements).
   Kafka 4.x requires it). Kafka itself needs Java anyway, and
   `WordCountJob.java` is compiled remotely against the jars **bundled** in
   the Kafka distribution (`libs/*`) — no Maven/Gradle anywhere.
+- The deployed Kafka cluster is configured for larger Common Crawl WET records
+  (messages up to 32 MB) so the benchmark can ingest the same data as MapReduce.
 
 ## Usage
 
 ```bash
 cd kafka
 ./deploy_kafka.sh -n 3                       # 1 controller+broker, 2 brokers
-./run_kafka_wordcount.sh -input ../test_input.txt -output kafka_result.txt
+./run_kafka_wordcount.sh -input /path/to/data.txt -output kafka_result.txt
 ./clean_kafka.sh                             # always clean up when done
 ```
 

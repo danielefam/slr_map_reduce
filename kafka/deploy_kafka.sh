@@ -26,6 +26,7 @@ SCALA_VERSION="2.13"
 BROKER_PORT=9092
 CONTROLLER_PORT=9093
 REMOTE_ROOT="/tmp/kafka-bench"
+MAX_MESSAGE_BYTES=33554432
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -118,6 +119,9 @@ listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
 inter.broker.listener.name=PLAINTEXT
 log.dirs=${REMOTE_ROOT}/logs
 num.partitions=${N}
+message.max.bytes=${MAX_MESSAGE_BYTES}
+replica.fetch.max.bytes=${MAX_MESSAGE_BYTES}
+socket.request.max.bytes=${MAX_MESSAGE_BYTES}
 offsets.topic.replication.factor=1
 transaction.state.log.replication.factor=1
 transaction.state.log.min.isr=1

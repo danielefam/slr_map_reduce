@@ -21,3 +21,6 @@ vgcore.*
 *.swo
 data/
 *.txt
+
+kafka/.DS_Store
+kafka/dist/*.tgz
