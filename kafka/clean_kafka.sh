@@ -8,7 +8,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
+CLUSTER_ENV_FILE="$SCRIPT_DIR/kafka_cluster.env"
 REMOTE_ROOT="/tmp/kafka-bench-${USER:-$(id -un)}"
+
+if [[ -f "$CLUSTER_ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CLUSTER_ENV_FILE"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,7 +49,7 @@ for h in "${HOSTS[@]}"; do
 done
 
 if (( FAILED == 0 )); then
-  rm -f "$HOSTS_FILE"
+  rm -f "$HOSTS_FILE" "$CLUSTER_ENV_FILE"
   echo "Done."
 else
   echo "Cleanup incomplete; keeping $HOSTS_FILE so you can retry." >&2

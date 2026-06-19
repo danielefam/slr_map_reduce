@@ -69,6 +69,21 @@ cd kafka
 ./clean_kafka.sh                             # always clean up when done
 ```
 
+On shared lab machines, default Kafka ports may already be used by another
+process. Pick high free ports when scaling to many nodes; the deploy script
+writes them to `kafka_cluster.env`, and the runner reads that file automatically:
+
+```bash
+KAFKA_REMOTE_DOWNLOAD=1 KAFKA_DEPLOY_PARALLELISM=10 \
+  ./deploy_kafka.sh -n 50 -hosts /tmp/kafka_hosts_50_reachable.txt \
+  -port 19092 -controller-port 19093
+./run_kafka_wordcount.sh -input /tmp/cc_full.wet -output kafka_full_50nodes_result.txt
+```
+
+`KAFKA_REMOTE_DOWNLOAD=1` lets each lab host download the Kafka archive directly
+instead of copying the 130 MB archive from the laptop to every node. This is much
+faster for large clusters and avoids local SSH/SCP fan-out bottlenecks.
+
 Common Crawl runs: download the same WET split the Go framework used,
 decompress, and feed it as `-input`:
 

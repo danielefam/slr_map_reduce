@@ -111,7 +111,7 @@ public class WordCountJob {
                     }
                 }
                 double seconds = (System.nanoTime() - t0) / 1e9;
-                System.out.printf("TIMING compute_seconds=%.3f%n", seconds);
+                System.out.printf(Locale.ROOT, "TIMING compute_seconds=%.3f%n", seconds);
                 done.countDown();
             } catch (Exception e) {
                 e.printStackTrace();

@@ -23,18 +23,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
+CLUSTER_ENV_FILE="$SCRIPT_DIR/kafka_cluster.env"
 REMOTE_ROOT="/tmp/kafka-bench-${USER:-$(id -un)}"
 KAFKA_VERSION="4.3.0"
 SCALA_VERSION="2.13"
 BROKER_PORT=9092
 INPUT=""
 OUTPUT="kafka_result.txt"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+
+if [[ -f "$CLUSTER_ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CLUSTER_ENV_FILE"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -input)   INPUT="$2";         shift 2 ;;
     -output)  OUTPUT="$2";        shift 2 ;;
     -version) KAFKA_VERSION="$2"; shift 2 ;;
+    -port)    BROKER_PORT="$2";   shift 2 ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -52,7 +60,7 @@ INPUT_TOPIC="bench-input-${RUN_ID}"
 OUTPUT_TOPIC="bench-output-${RUN_ID}"
 APP_ID="bench-wordcount-${RUN_ID}"
 
-kssh() { ssh -o BatchMode=yes "$CONTROLLER_HOST" "$@"; }
+kssh() { ssh "${SSH_OPTS[@]}" "$CONTROLLER_HOST" "$@"; }
 
 wait_topic_deleted() {
   local topic="$1"
@@ -113,13 +121,13 @@ kssh "
 
 # ── Step 2: compile the Streams app remotely ───────────────────────────────
 echo "--- Compiling WordCountJob on $CONTROLLER_HOST ---"
-scp -q "$SCRIPT_DIR/WordCountJob.java" "$CONTROLLER_HOST:$REMOTE_ROOT/"
+scp "${SSH_OPTS[@]}" -q "$SCRIPT_DIR/WordCountJob.java" "$CONTROLLER_HOST:$REMOTE_ROOT/"
 kssh "cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java"
 
 # ── Step 3: produce input (untimed, like the Go /data phase) ───────────────
 echo "--- Producing input ($(wc -l < "$INPUT") lines) ---"
 # Stream the local file through ssh into the console producer on the node.
-ssh -o BatchMode=yes "$CONTROLLER_HOST" \
+ssh "${SSH_OPTS[@]}" "$CONTROLLER_HOST" \
   "$KAFKA_HOME/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic $INPUT_TOPIC" \
   < "$INPUT"
 
@@ -127,7 +135,7 @@ ssh -o BatchMode=yes "$CONTROLLER_HOST" \
 echo "--- Running Kafka Streams job ---"
 kssh "cd $REMOTE_ROOT && KAFKA_BENCH_ROOT=$REMOTE_ROOT KAFKA_STREAM_THREADS=$STREAM_THREADS timeout 1800 java -cp '$KAFKA_HOME/libs/*:.' WordCountJob $BOOTSTRAP $INPUT_TOPIC $OUTPUT_TOPIC $APP_ID" \
   | tee /tmp/kafka_bench_run.log >/dev/null
-TIMING_LINE="$(grep -E '^TIMING ' /tmp/kafka_bench_run.log | tail -1)"
+TIMING_LINE="$(grep -E '^TIMING ' /tmp/kafka_bench_run.log | tail -1 | sed -E 's/(compute_seconds=[0-9]+),/\1./')"
 [[ -n "$TIMING_LINE" ]] || { echo "ERROR: WordCountJob did not report TIMING" >&2; exit 1; }
 
 # ── Step 5: collect final counts ───────────────────────────────────────────

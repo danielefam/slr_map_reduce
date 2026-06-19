@@ -233,6 +233,72 @@ multi-node runs:
 - Final counts are exported from the Kafka Streams state store as `RESULT`
   lines instead of consuming every intermediate update from the output topic.
 
+## Test 5: 50-node Full Common Crawl Kafka Streams Benchmark
+
+The same full WET input was used for a larger Kafka test on 50 reachable lab
+machines selected from `hosts_go_pool_300_filtered.txt`:
+
+```text
+50 kafka_hosts.txt
+4023713 /tmp/cc_full.wet
+167M    /tmp/cc_full.wet
+```
+
+The first 50-node attempt exposed a shared-lab port collision: the default
+KRaft controller port `9093` was already bound on the selected controller host,
+causing follower brokers to report `INCONSISTENT_CLUSTER_ID`. The deploy script
+was updated to support a separate `-controller-port`, to persist cluster settings
+in `kafka_cluster.env`, and to wait for the controller before starting followers.
+The successful run used high free ports on all 50 nodes:
+
+```text
+BROKER_PORT=19092
+CONTROLLER_PORT=19093
+KAFKA_VERSION=4.3.0
+SCALA_VERSION=2.13
+REMOTE_ROOT=/tmp/kafka-bench-daniele
+```
+
+Successful deployment evidence:
+
+```text
+Kafka cluster ready. Bootstrap server: tp-1a201-02.enst.fr:19092
+50 brokers accepted connections on port 19092
+```
+
+Final benchmark command:
+
+```bash
+./run_kafka_wordcount.sh -input /tmp/cc_full.wet -output kafka_full_50nodes_result.txt
+```
+
+Observed final run:
+
+```text
+Run ID: 20260619215336
+Stream threads: 50
+Input topic offsets: 50 partitions, 4,023,713 records
+Results: kafka_full_50nodes_result.txt (1738969 distinct words)
+TIMING compute_seconds=47,363
+```
+
+Result file evidence:
+
+```text
+-rw-rw-r-- 1 daniele daniele 30M juin  19 21:56 kafka_full_50nodes_result.txt
+1738969 kafka_full_50nodes_result.txt
+the     239298
+to      189824
+de      180013
+and     178385
+a       173826
+warc    169316
+```
+
+This run validates the new Kafka part at 50 nodes. It also confirms that the
+final counts match the 8-node run for the same input, while stressing deployment
+and startup behavior at a much larger node count.
+
 ## Hadoop / Kafka Comparison Summary
 
 The custom framework is closer to educational batch MapReduce: it splits a finite input, sends work to workers, aggregates intermediate key/value pairs, and writes a final result file.
@@ -269,9 +335,16 @@ Done. To redeploy: ./deploy_streams.sh
 --- tp-1a201-08.enst.fr ---
   ✓ cleaned
 Done.
+=== Cleaning Kafka from 50 node(s) ===
+--- tp-1a201-02.enst.fr ---
+  ✓ cleaned
+...
+--- tp-1a252-14.enst.fr ---
+  ✓ cleaned
+Done.
 ```
 
-The local Kafka setup was clean, and the 8-node remote Kafka cluster was
-removed from `/tmp/kafka-bench-$USER` on all benchmark hosts. During cleanup
-validation, `clean_kafka.sh` was hardened so `pkill -f` patterns cannot match
-and kill their own SSH shell.
+The local Kafka setup was clean, and the 8-node and 50-node remote Kafka
+clusters were removed from `/tmp/kafka-bench-$USER` on all benchmark hosts.
+During cleanup validation, `clean_kafka.sh` was hardened so `pkill -f` patterns
+cannot match and kill their own SSH shell.
