@@ -3,9 +3,9 @@
 # machines from hosts.txt — WITHOUT root privileges and WITHOUT Docker.
 #
 # Layout per node (all on node-local disk, not NFS):
-#   /tmp/kafka-bench/kafka_<scala>-<version>/   extracted distribution
-#   /tmp/kafka-bench/logs/                      Kafka log.dirs
-#   /tmp/kafka-bench/kafka.pid                  broker PID
+#   /tmp/kafka-bench-<user>/kafka_<scala>-<version>/   extracted distribution
+#   /tmp/kafka-bench-<user>/logs/                      Kafka log.dirs
+#   /tmp/kafka-bench-<user>/kafka.pid                  broker PID
 #
 # Topology: node 1 = combined broker+controller, nodes 2..N = brokers
 # (static KRaft quorum with a single controller — sufficient for benchmarks).
@@ -25,7 +25,7 @@ KAFKA_VERSION="4.3.0"
 SCALA_VERSION="2.13"
 BROKER_PORT=9092
 CONTROLLER_PORT=9093
-REMOTE_ROOT="/tmp/kafka-bench"
+REMOTE_ROOT="/tmp/kafka-bench-${USER:-$(id -un)}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

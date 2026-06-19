@@ -22,6 +22,8 @@ This note records how the Kafka part satisfies the four requested objectives and
 | `clean_streams.sh` | Stops WordCountDemo and Kafka broker, then removes `/tmp/kafka-streams`. |
 | `produce_commoncrawl_wet.sh` | Streams a compressed Common Crawl WET URL directly into the Kafka input topic. |
 | `README.md` | Documents usage, batch vs stream, Hadoop comparison, and Common Crawl source idea. |
+| `deploy_kafka.sh` / `run_kafka_wordcount.sh` / `clean_kafka.sh` | Deploy, run, and clean the multi-node Kafka Streams benchmark. |
+| `WordCountJob.java` | Custom Kafka Streams wordcount with timing, all-topic lag detection, unique run topics, and final state-store result export. |
 
 ## Test 1: Minimal Kafka Streams WordCount
 
@@ -152,6 +154,85 @@ Common Crawl HTTP .wet.gz -> gunzip stream -> Kafka input topic -> Kafka Streams
 
 It avoids creating a large decompressed Common Crawl file on shared NFS.
 
+No-limit validation was also run against the same WET file without `-max-lines`.
+The input topic reached 4,023,713 records, proving the direct source path can
+stream the full compressed Common Crawl split into Kafka without staging the
+decompressed file on shared NFS.
+
+## Test 4: 8-node Full Common Crawl Kafka Streams Benchmark
+
+Remote cluster deployment used 8 lab machines from `hosts_go_pool_300_filtered.txt`:
+
+```text
+tp-1a201-01.enst.fr ... tp-1a201-08.enst.fr
+```
+
+The deployment script verified Java 17 on each machine and started all 8 Kafka
+KRaft brokers. Kafka was installed under user-specific node-local `/tmp`:
+
+```text
+/tmp/kafka-bench-$USER
+```
+
+The full WET input was prepared on local `/tmp`, not shared NFS:
+
+```bash
+curl -fsL https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-21/segments/1778213376756.47/wet/CC-MAIN-20260508074046-20260508104046-00000.warc.wet.gz \
+  | gunzip -c > /tmp/cc_full.wet
+wc -l /tmp/cc_full.wet
+du -h /tmp/cc_full.wet
+```
+
+Observed input size:
+
+```text
+4023713 /tmp/cc_full.wet
+167M    /tmp/cc_full.wet
+```
+
+Final benchmark command:
+
+```bash
+./run_kafka_wordcount.sh -input /tmp/cc_full.wet -output kafka_full_8nodes_result.txt
+```
+
+Observed final run:
+
+```text
+Run ID: 20260619115916
+Stream threads: 8
+Results: kafka_full_8nodes_result.txt (1738969 distinct words)
+TIMING compute_seconds=36,253
+```
+
+Result file evidence:
+
+```text
+-rw-rw-r-- 1 daniele daniele 30M juin  19 12:00 kafka_full_8nodes_result.txt
+1738969 kafka_full_8nodes_result.txt
+the     239298
+to      189824
+de      180013
+and     178385
+a       173826
+warc    169316
+```
+
+The large test exposed and fixed several issues that only appear under repeated
+multi-node runs:
+
+- Remote Kafka files now use `/tmp/kafka-bench-$USER`, avoiding permission
+  collisions with old `/tmp/kafka-bench` directories from other users/runs.
+- The runner uses a unique input topic, output topic, and Kafka Streams
+  application id per run, avoiding stale internal repartition topics with the
+  wrong partition count.
+- `WordCountJob` waits for total lag across all assigned non-internal topics,
+  including the Streams repartition topic, not just the original input topic.
+- `KAFKA_STREAM_THREADS` defaults to the partition count, so the 8-partition
+  benchmark uses 8 local stream threads instead of bottlenecking on one thread.
+- Final counts are exported from the Kafka Streams state store as `RESULT`
+  lines instead of consuming every intermediate update from the output topic.
+
 ## Hadoop / Kafka Comparison Summary
 
 The custom framework is closer to educational batch MapReduce: it splits a finite input, sends work to workers, aggregates intermediate key/value pairs, and writes a final result file.
@@ -173,13 +254,24 @@ After validation, Kafka was stopped with:
 
 ```bash
 ./clean_streams.sh
+./clean_kafka.sh
 ```
 
 Observed cleanup:
 
 ```text
-Stopping WordCountDemo
-Stopping Kafka broker
-Removing /tmp/kafka-streams
+=== Cleaning Kafka Streams local setup ===
+Done. To redeploy: ./deploy_streams.sh
+=== Cleaning Kafka from 8 node(s) ===
+--- tp-1a201-01.enst.fr ---
+  ✓ cleaned
+...
+--- tp-1a201-08.enst.fr ---
+  ✓ cleaned
 Done.
 ```
+
+The local Kafka setup was clean, and the 8-node remote Kafka cluster was
+removed from `/tmp/kafka-bench-$USER` on all benchmark hosts. During cleanup
+validation, `clean_kafka.sh` was hardened so `pkill -f` patterns cannot match
+and kill their own SSH shell.

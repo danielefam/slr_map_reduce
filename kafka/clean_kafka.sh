@@ -8,7 +8,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
-REMOTE_ROOT="/tmp/kafka-bench"
+REMOTE_ROOT="/tmp/kafka-bench-${USER:-$(id -un)}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +25,7 @@ fi
 mapfile -t HOSTS < <(grep -v '^[[:space:]]*$' "$HOSTS_FILE")
 echo "=== Cleaning Kafka from ${#HOSTS[@]} node(s) ==="
 
+FAILED=0
 for h in "${HOSTS[@]}"; do
   echo "--- $h ---"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" "
@@ -34,11 +35,17 @@ for h in "${HOSTS[@]}"; do
       sleep 3
       kill -9 \$(cat $REMOTE_ROOT/kafka.pid) 2>/dev/null || true
     fi
-    pkill -u \$(id -un) -f 'kafka\.Kafka' 2>/dev/null || true
-    pkill -u \$(id -un) -f 'kafka-streams' 2>/dev/null || true
+    pkill -u \$(id -un) -f '[k]afka\.Kafka' 2>/dev/null || true
+    pkill -u \$(id -un) -f '[W]ordCountJob' 2>/dev/null || true
+    pkill -u \$(id -un) -f '[k]afka-streams' 2>/dev/null || true
     rm -rf $REMOTE_ROOT
-  " && echo "  ✓ cleaned" || echo "  ✗ ssh failed (host unreachable?)"
+  " && echo "  ✓ cleaned" || { echo "  ✗ ssh failed (host unreachable?)"; FAILED=1; }
 done
 
-rm -f "$HOSTS_FILE"
-echo "Done."
+if (( FAILED == 0 )); then
+  rm -f "$HOSTS_FILE"
+  echo "Done."
+else
+  echo "Cleanup incomplete; keeping $HOSTS_FILE so you can retry." >&2
+  exit 1
+fi

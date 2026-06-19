@@ -95,18 +95,23 @@ Both systems report a directly comparable, machine-parseable line:
 | System            | Where                              | What is timed                                                       |
 | ----------------- | ---------------------------------- | -------------------------------------------------------------------- |
 | Go MapReduce      | orchestrator log: `TIMING nodes=… compute_seconds=…` | map + reduce + collect (input upload `/data` is **excluded**)  |
-| Kafka Streams     | `run_kafka_wordcount.sh` output: `TIMING compute_seconds=…` | Streams processing from `streams.start()` until consumer-group lag on `bench-input` reaches 0 (input production is **excluded**, done before the job starts) |
+| Kafka Streams     | `run_kafka_wordcount.sh` output: `TIMING compute_seconds=…` | Streams processing from `streams.start()` until consumer-group lag reaches 0 on all non-internal topics assigned to the app, including the input topic and the Streams repartition topic (input production is **excluded**, done before the job starts) |
 
 The Streams job (`WordCountJob.java`) self-terminates: a watchdog thread
 polls the app's consumer-group lag via the Admin API and prints the TIMING
-line when the lag is 0 twice in a row (a stable "all input processed" signal
-for a bounded dataset on an unbounded streaming engine).
+line when total lag is 0 twice in a row (a stable "all input processed" signal
+for a bounded dataset on an unbounded streaming engine). The runner creates a
+unique input topic, output topic, and application id for each benchmark run so
+old Streams internal topics cannot poison a later run with a different
+partition count.
 
 ### Fair-comparison checklist
 
 - Use the **same input file** and the **same number of nodes** (`-n`).
-- `bench-input` is created with one partition per node, so Streams gets the
-  same parallelism the MapReduce slots get.
+- The input and output topics are created with one partition per node, and
+  `KAFKA_STREAM_THREADS` defaults to that same value, so one JVM can consume all
+  partitions concurrently. Override it when you want a different number of
+  local Streams threads.
 - Run each measurement ≥ 3 times; report median (lab machines are shared).
 - Note the architectural asymmetry in the report: Kafka persists every
   record to its replicated log (durability the Go framework doesn't offer),
