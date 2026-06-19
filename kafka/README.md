@@ -13,6 +13,10 @@ Kafka's log segments and skew measurements).
 | `clean_kafka.sh`          | Stop brokers and remove every Kafka file from the nodes            |
 | `WordCountJob.java`       | Kafka Streams word-count with built-in compute-time self-reporting |
 | `run_kafka_wordcount.sh`  | End-to-end benchmark driver: topics → compile → produce → run → collect |
+| `deploy_streams.sh`       | Local Kafka 4.3 quickstart deploy: downloaded files, KRaft standalone, no Docker/root |
+| `run_streams_wordcount.sh` | Local bounded-file test for the bundled Kafka Streams WordCountDemo |
+| `produce_commoncrawl_wet.sh` | Stream a compressed Common Crawl WET URL directly into a Kafka topic |
+| `clean_streams.sh`        | Stop local WordCountDemo + broker and remove `/tmp/kafka-streams`  |
 
 ## Prerequisites
 
@@ -24,6 +28,39 @@ Kafka's log segments and skew measurements).
   the Kafka distribution (`libs/*`) — no Maven/Gradle anywhere.
 
 ## Usage
+
+### Local quickstart mode
+
+This is the lightweight Kafka Streams demo path. It follows the official Kafka
+4.3 quickstart using downloaded files, starts a single local KRaft broker, and
+runs the bundled `org.apache.kafka.streams.examples.wordcount.WordCountDemo`.
+
+```bash
+cd kafka
+./deploy_streams.sh
+./run_streams_wordcount.sh -input ../test_input.txt -output streams_result.txt
+./clean_streams.sh
+```
+
+For a live stream demo, keep `deploy_streams.sh` running and use Kafka's console
+tools directly:
+
+```bash
+# Terminal 1: watch incremental word-count updates
+/tmp/kafka-streams/kafka_2.13-4.3.0/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic streams-wordcount-output --from-beginning \
+  --formatter-property print.key=true \
+  --formatter-property print.value=true \
+  --formatter-property key.deserializer=org.apache.kafka.common.serialization.StringDeserializer \
+  --formatter-property value.deserializer=org.apache.kafka.common.serialization.LongDeserializer
+
+# Terminal 2: type lines; each Enter sends one Kafka record
+/tmp/kafka-streams/kafka_2.13-4.3.0/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic streams-plaintext-input
+```
+
+### Multi-node benchmark mode
 
 ```bash
 cd kafka
@@ -39,6 +76,17 @@ decompress, and feed it as `-input`:
 curl -sL https://data.commoncrawl.org/<WET-PATH> | gunzip > /tmp/cc_split.txt
 ./run_kafka_wordcount.sh -input /tmp/cc_split.txt
 ```
+
+To avoid writing the decompressed Common Crawl split to shared NFS, stream a WET
+URL directly into Kafka instead:
+
+```bash
+./deploy_streams.sh
+./produce_commoncrawl_wet.sh -url https://data.commoncrawl.org/<WET-PATH>.wet.gz -max-lines 10000
+```
+
+`-max-lines` is optional but useful for a quick live test. Without it, the full
+compressed WET file is decompressed and sent to the input topic.
 
 ## How compute time is measured
 
@@ -64,3 +112,48 @@ for a bounded dataset on an unbounded streaming engine).
   record to its replicated log (durability the Go framework doesn't offer),
   so Kafka pays an I/O cost per record while the Go system pays per-phase
   HTTP costs. This is a key discussion point, not a flaw in either system.
+
+## Batch vs stream
+
+The custom MapReduce framework is batch-oriented: a bounded input file is split,
+workers map chunks, reducers aggregate intermediate keys, and the job finishes
+with a final result file. Kafka Streams is stream-oriented: records arrive in a
+topic over time, the WordCount topology updates a persistent local state store,
+and each changed word count is emitted to an output topic immediately.
+
+For benchmark comparison we feed the whole input file and then collect the final
+latest value per word, which makes Kafka behave like a bounded batch workload.
+For a streaming demonstration, type or send lines while WordCountDemo is already
+running; the output topic will show count updates such as `fox -> 1`, then
+`fox -> 2`, without rerunning a whole job.
+
+## Hadoop / Kafka comparison notes
+
+- Hadoop MapReduce normally uses HDFS for distributed, replicated input and
+  output storage. This project intentionally does not implement HDFS; it uses
+  local files, HTTP transfers, and worker-local temporary files.
+- Hadoop provides mature scheduling, data locality, retry semantics, speculative
+  execution, and fault-tolerant distributed storage. The custom framework is a
+  simplified educational MapReduce runtime and does not aim to match those
+  platform features.
+- Kafka Streams is not Hadoop-style batch MapReduce. It is a Java stream
+  processing library where Kafka topics are the input/output log and RocksDB
+  state stores hold incremental aggregation state.
+- Kafka is a good contrast point because it processes new records continuously;
+  MapReduce is a good fit when the input is finite and the desired output is a
+  final batch result.
+
+## Optional Common Crawl source idea
+
+The advanced extension would avoid staging large files through shared NFS by
+feeding Common Crawl records directly into Kafka. This repository includes a
+lightweight standalone source producer, `produce_commoncrawl_wet.sh`, that does:
+
+```bash
+curl <Common-Crawl-WET.gz> | gunzip | kafka-console-producer
+```
+
+That is not a full Kafka Connect connector, but it demonstrates the same data
+path: Common Crawl HTTP source to Kafka topic without an intermediate NFS file.
+A production version would package the same idea as a Kafka Connect SourceTask
+with offset tracking, retries, and per-record parsing.
