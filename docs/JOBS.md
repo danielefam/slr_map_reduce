@@ -1,10 +1,11 @@
 # MapReduce Job Model
 
-This project currently ships with one built-in job: distributed word count. The
-pipeline itself is more general than that job. Deployment, health checks, input
-distribution, map, shuffle, reduce, result collection, retries, and cleanup are
-all driven by the orchestrator and worker HTTP API. The job-specific part is only
-the pair of functions passed to the worker server.
+This project currently ships with multiple built-in jobs, selected via the
+required `-job` flag. The pipeline itself is more general than any one job:
+deployment, health checks, input distribution, map, shuffle, reduce, result
+collection, retries, and cleanup are all driven by the orchestrator and worker
+HTTP API. The job-specific part is the pair of functions provided by the job
+package.
 
 ## Current Contract
 
@@ -30,10 +31,10 @@ where `N` is the active worker count for the job. During reduce, worker `i`
 fetches bucket `i` from every peer, then applies `ReduceFunc` to each key and
 its full value list.
 
-The orchestrator's final merge currently parses output values as integers and
-sums values for identical keys. That means reducer values must be integer
-strings. For metrics such as averages, percentages, or ratios, emit summable
-counters and compute the derived metric after the output file is produced.
+The orchestrator's final merge parses output values as integers and sums values
+for identical keys. That means reducer values must be integer strings. For
+metrics such as averages, percentages, or ratios, emit summable counters and
+compute the derived metric after the output file is produced.
 
 ## Built-In Job: Word Count
 
@@ -58,14 +59,14 @@ hello 2
 world 1
 ```
 
-This is implemented by `wordCountMap` and `wordCountReduce` in
-`scripts/worker/wordcount.go`. It tokenizes Unicode letters and numbers,
-lowercases tokens, emits `"1"` for every token, and reduces by counting values.
+This is implemented by the job package at `scripts/jobs/wordcount`. It
+tokenizes Unicode letters and numbers, lowercases tokens, emits `"1"` for
+every token, and reduces by counting values.
 
 ## Example Non-Word-Count Jobs
 
 These examples fit the current integer-valued output contract. They are useful
-next jobs because they reuse the existing Common Crawl input path and shuffle
+jobs because they reuse the existing Common Crawl input path and shuffle
 mechanics without changing the protocol.
 
 ### Domain Popularity
@@ -145,32 +146,20 @@ bytes:10k-100k	276
 
 ## How To Add A Job Today
 
-There is no active `-job` flag in this checkout. To run a different job today:
+The CLI already accepts `-job`. To add a new job today:
 
-1. Add a new Go file under `scripts/worker/` implementing a `MapFunc` and
-   `ReduceFunc`.
-2. Change the worker binding in `scripts/worker/main.go` from:
-
-```go
-srv := newServer(wordCountMap, wordCountReduce, workDir)
-```
-
-to the new functions, for example:
-
-```go
-srv := newServer(domainPopularityMap, countValuesReduce, workDir)
-```
-
-3. Run the normal MapReduce command. The orchestrator builds and deploys the
-   worker binary automatically:
+1. Add a new package under `scripts/jobs/<name>/` exporting `NewMapper()` and
+   `NewReducer()`.
+2. Keep reducer outputs integer-valued so the orchestrator can merge them.
+3. Run the normal MapReduce command with the new job path:
 
 ```bash
-./mapreduce.sh -input test_input.txt -output result.txt -n 10 -port 9090
+./mapreduce.sh -job scripts/jobs/<name> -input test_input.txt -output result.txt -n 10 -port 9090
 ```
 
 ## Recommended Future CLI
 
-A clean next step is to add a job registry and expose it as a flag:
+A clean next step is to add a short-name registry for the existing `-job` flag:
 
 ```bash
 ./mapreduce.sh -job wordcount -input test_input.txt -output result.txt -n 10

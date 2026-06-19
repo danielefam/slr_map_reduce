@@ -72,10 +72,13 @@ descending count then alphabetically.
 
 ### MapReduce Jobs Beyond Word Count
 
-The current command-line entry point runs the built-in word-count job. The worker
-is deliberately structured around `MapFunc` and `ReduceFunc`, so other jobs can
-use the same deployment, shuffle, reduce, result collection, retry, and cleanup
-pipeline by swapping those two functions.
+The current command-line entry point selects the job package with `-job`.
+Built-in jobs live under `scripts/jobs/` and currently include:
+
+- `scripts/jobs/wordcount`
+- `scripts/jobs/domainpop`
+- `scripts/jobs/langdetect`
+- `scripts/jobs/docdensity`
 
 See [docs/JOBS.md](docs/JOBS.md) for the job contract and examples of non-word-count
 jobs such as domain popularity, language-signal counting, and document-density
