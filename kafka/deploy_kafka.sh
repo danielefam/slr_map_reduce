@@ -44,14 +44,32 @@ DIST_CACHE="$SCRIPT_DIR/dist"
 PRIMARY_URL="https://dlcdn.apache.org/kafka/${KAFKA_VERSION}/${TARBALL}"
 ARCHIVE_URL="https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/${TARBALL}"
 KAFKA_HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
+JAVA_CHECK='v=$(java -version 2>&1 | sed -nE "s/.*version \"([0-9]+).*/\\1/p"); [ -n "$v" ] && [ "$v" -ge 17 ]'
 
-# ── Step 1: pick the first N hosts ──────────────────────────────────────────
+# ── Step 1: pick the first N available hosts ────────────────────────────────
 mapfile -t ALL_HOSTS < <(grep -v '^[[:space:]]*$' "$HOSTS_FILE")
 if (( ${#ALL_HOSTS[@]} < N )); then
   echo "ERROR: need $N hosts but $HOSTS_FILE only has ${#ALL_HOSTS[@]}" >&2
   exit 1
 fi
-HOSTS=("${ALL_HOSTS[@]:0:$N}")
+HOSTS=()
+echo "--- Selecting first $N available hosts ---"
+for h in "${ALL_HOSTS[@]}"; do
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o LogLevel=ERROR \
+      "$h" "$JAVA_CHECK" >/dev/null 2>&1; then
+    HOSTS+=("$h")
+    echo "  ✓ $h"
+    if (( ${#HOSTS[@]} == N )); then
+      break
+    fi
+  else
+    echo "  - $h"
+  fi
+done
+if (( ${#HOSTS[@]} < N )); then
+  echo "ERROR: only ${#HOSTS[@]} available host(s) found in $HOSTS_FILE; need $N" >&2
+  exit 1
+fi
 printf '%s\n' "${HOSTS[@]}" > "$KAFKA_HOSTS_FILE"
 CONTROLLER_HOST="${HOSTS[0]}"
 echo "=== Deploying Kafka $KAFKA_VERSION to $N nodes (controller: $CONTROLLER_HOST) ==="
@@ -67,20 +85,7 @@ else
   echo "--- Using cached $TARBALL ---"
 fi
 
-# ── Step 3: verify Java >= 17 on every node ─────────────────────────────────
-echo "--- Checking Java on remote nodes ---"
-for h in "${HOSTS[@]}"; do
-  ver=$(ssh -o BatchMode=yes "$h" \
-    "java -version 2>&1 | head -1" || echo "none")
-  echo "  $h: $ver"
-  if ! ssh -o BatchMode=yes "$h" \
-      'v=$(java -version 2>&1 | sed -nE "s/.*version \"([0-9]+).*/\1/p"); [[ -n "$v" && "$v" -ge 17 ]]'; then
-    echo "ERROR: $h lacks Java 17+ (Kafka 4.x requirement)" >&2
-    exit 1
-  fi
-done
-
-# ── Step 4: upload + extract on every node (node-local /tmp) ────────────────
+# ── Step 3: upload + extract on every node (node-local /tmp) ────────────────
 echo "--- Uploading and extracting distribution ---"
 for h in "${HOSTS[@]}"; do
   echo "  $h"
@@ -90,12 +95,12 @@ for h in "${HOSTS[@]}"; do
     "cd $REMOTE_ROOT && rm -rf $KAFKA_DIST && tar xzf $TARBALL && rm -f $TARBALL"
 done
 
-# ── Step 5: generate one cluster ID (on the controller node) ───────────────
+# ── Step 4: generate one cluster ID (on the controller node) ───────────────
 CLUSTER_ID=$(ssh -o BatchMode=yes "$CONTROLLER_HOST" \
   "$REMOTE_ROOT/$KAFKA_DIST/bin/kafka-storage.sh random-uuid" | tr -d '[:space:]')
 echo "--- Cluster ID: $CLUSTER_ID ---"
 
-# ── Step 6: write per-node config, format storage, start broker ────────────
+# ── Step 5: write per-node config, format storage, start broker ────────────
 QUORUM="1@${CONTROLLER_HOST}:${CONTROLLER_PORT}"
 node_id=1
 for h in "${HOSTS[@]}"; do
@@ -140,7 +145,7 @@ EOF
   node_id=$((node_id + 1))
 done
 
-# ── Step 7: health check ────────────────────────────────────────────────────
+# ── Step 6: health check ────────────────────────────────────────────────────
 echo "--- Waiting for brokers to come up ---"
 for h in "${HOSTS[@]}"; do
   ok=0

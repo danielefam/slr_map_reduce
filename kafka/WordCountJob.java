@@ -16,7 +16,7 @@
 // Build (no Maven needed — uses the jars bundled with the Kafka distribution):
 //   javac -cp "$KAFKA_HOME/libs/*" WordCountJob.java
 // Run:
-//   java -cp "$KAFKA_HOME/libs/*:." WordCountJob <bootstrap-server>
+//   java -cp "$KAFKA_HOME/libs/*:." WordCountJob <bootstrap-server> <application-id>
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Locale;
@@ -46,21 +46,22 @@ public class WordCountJob {
 
     static final String INPUT_TOPIC = "bench-input";
     static final String OUTPUT_TOPIC = "bench-output";
-    static final String APP_ID = "bench-wordcount";
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) {
-            System.err.println("usage: WordCountJob <bootstrap-server>");
+        if (args.length != 2) {
+            System.err.println("usage: WordCountJob <bootstrap-server> <application-id>");
             System.exit(2);
         }
         final String bootstrap = args[0];
+        final String appId = args[1];
+        final String stateDir = "/tmp/kafka-bench/streams-state/" + appId.replaceAll("[^A-Za-z0-9._-]", "_");
 
         Properties props = new Properties();
-        props.put(StreamsConfig.APPLICATION_ID_CONFIG, APP_ID);
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, appId);
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
-        props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-bench/streams-state");
+        props.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
         // Larger batches: fairer comparison with the batch-oriented Go system.
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);
         props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 64 * 1024 * 1024L);
@@ -92,7 +93,7 @@ public class WordCountJob {
                 int zeroStreak = 0;
                 while (zeroStreak < 2) {
                     Thread.sleep(2000);
-                    long lag = totalLag(admin);
+                    long lag = totalLag(admin, appId);
                     if (lag == 0) {
                         zeroStreak++;
                     } else {
@@ -115,9 +116,9 @@ public class WordCountJob {
     }
 
     /** Total lag of the streams app's consumer group on the input topic. */
-    static long totalLag(Admin admin) throws Exception {
+    static long totalLag(Admin admin, String appId) throws Exception {
         Map<TopicPartition, OffsetAndMetadata> committed =
-                admin.listConsumerGroupOffsets(APP_ID)
+                admin.listConsumerGroupOffsets(appId)
                         .partitionsToOffsetAndMetadata().get();
         Set<TopicPartition> inputParts = committed.keySet().stream()
                 .filter(tp -> tp.topic().equals(INPUT_TOPIC))

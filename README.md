@@ -20,7 +20,7 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 ├── hosts.txt           # Auto-generated list of available remote hosts
 ├── mapreduce.sh        # Entry point for the MapReduce pipeline
 ├── run.sh              # Entry point for the stats-collection pipeline
-├── kafka_streams/      # Kafka Streams comparison setup (downloaded Kafka tarball, no Docker)
+├── kafka/              # Kafka Streams comparison setup (downloaded Kafka tarball, no Docker)
 ├── scripts/
     ├── go.mod
     ├── make_hosts/     # Fetches available hosts from tp.telecom-paris.fr
@@ -93,17 +93,18 @@ MapReduce output is written.
 
 ### Kafka Streams Comparison Setup
 
-The Kafka Streams baseline runs from `kafka_streams/` and uses downloaded Kafka
+The Kafka Streams baseline runs from `kafka/` and uses downloaded Kafka
 files on the lab machines, not Docker.
 
 ```bash
-cd kafka_streams
+cd kafka
 ./deploy_kafka.sh -n 3
-./kafka_streams.sh -input /path/to/data.txt -output kafka_result.txt
+./run_kafka_wordcount.sh -input /path/to/data.txt -output kafka_result.txt
 ./clean_kafka.sh
 ```
 
-`deploy_kafka.sh` writes `kafka_hosts.txt` for the run script, and
+`deploy_kafka.sh` writes `kafka_hosts.txt` for the run script, automatically
+skipping unavailable hosts until it finds the first `N` reachable machines.
 `clean_kafka.sh` removes the Kafka installation and generated files from all
 selected hosts.
 

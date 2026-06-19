@@ -30,6 +30,9 @@ BROKER_PORT=9092
 MAX_MESSAGE_BYTES=33554432
 INPUT=""
 OUTPUT="kafka_result.txt"
+RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
+APP_ID="bench-wordcount-${RUN_ID}"
+REMOTE_STATE_DIR="$REMOTE_ROOT/streams-state/${APP_ID}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -91,7 +94,7 @@ done
 # ── Step 2: compile the Streams app remotely ───────────────────────────────
 echo "--- Compiling WordCountJob on $CONTROLLER_HOST ---"
 scp -q "$SCRIPT_DIR/WordCountJob.java" "$CONTROLLER_HOST:$REMOTE_ROOT/"
-kssh "cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java"
+kssh "mkdir -p '$REMOTE_STATE_DIR' && cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java"
 
 # ── Step 3: produce input (untimed, like the Go /data phase) ───────────────
 echo "--- Producing input ($(wc -l < "$INPUT") lines) ---"
@@ -102,21 +105,37 @@ ssh -o BatchMode=yes "$CONTROLLER_HOST" \
 
 # ── Step 4: run the Streams job; it exits once lag == 0 and prints TIMING ──
 echo "--- Running Kafka Streams job ---"
-kssh "cd $REMOTE_ROOT && java -cp '$KAFKA_HOME/libs/*:.' WordCountJob $BOOTSTRAP" \
+kssh "cd $REMOTE_ROOT && java -cp '$KAFKA_HOME/libs/*:.' WordCountJob $BOOTSTRAP $APP_ID" \
   | tee /tmp/kafka_bench_run.log
 TIMING_LINE="$(grep -E '^TIMING ' /tmp/kafka_bench_run.log | tail -1)"
 
 # ── Step 5: collect final counts ───────────────────────────────────────────
 echo "--- Collecting results into $OUTPUT ---"
-kssh "
-  cd $KAFKA_HOME
-  timeout 30 bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
-    --topic bench-output --from-beginning \
-    --property print.key=true --property key.separator=\$'\t' \
-    --value-deserializer org.apache.kafka.common.serialization.LongDeserializer \
-    2>/dev/null || true
-" | awk -F'\t' '{count[$1]=$2} END {for (w in count) printf "%s\t%s\n", w, count[w]}' \
+declare -A END_OFFSETS=()
+while IFS=':' read -r topic partition offset; do
+  [[ "$topic" == "bench-output" ]] || continue
+  END_OFFSETS["$partition"]="$offset"
+done < <(
+  kssh "cd $KAFKA_HOME && bin/kafka-run-class.sh org.apache.kafka.tools.GetOffsetShell \
+    --bootstrap-server $BOOTSTRAP --topic bench-output --time -1"
+)
+
+{
+  for ((p=0; p<N_PARTITIONS; p++)); do
+    count="${END_OFFSETS[$p]:-0}"
+    if (( count == 0 )); then
+      continue
+    fi
+    kssh "cd $KAFKA_HOME && bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+      --topic bench-output --partition $p --offset 0 --max-messages $count \
+      --property print.key=true --property key.separator=\$'\t' \
+      --value-deserializer org.apache.kafka.common.serialization.LongDeserializer \
+      2>/dev/null"
+  done
+} | awk -F'\t' '{count[$1]=$2} END {for (w in count) printf "%s\t%s\n", w, count[w]}' \
   | sort -k2,2nr -k1,1 > "$OUTPUT"
+
+ssh -o BatchMode=yes "$CONTROLLER_HOST" "rm -rf '$REMOTE_STATE_DIR'" 2>/dev/null || true
 
 echo ""
 echo "Results: $OUTPUT ($(wc -l < "$OUTPUT") distinct words)"
