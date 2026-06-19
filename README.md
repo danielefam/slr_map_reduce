@@ -82,9 +82,27 @@ runtime.
 
 ---
 
-## Quick start
+## How to Run
 
-### 1. Cluster stats pipeline
+### MapReduce on a local file
+
+```bash
+./mapreduce.sh -job wordcount -input test_input.txt -output result.txt -n 10
+```
+
+This runs word count over 10 worker nodes on the lab cluster.
+
+### MapReduce on Common Crawl
+
+```bash
+./mapreduce.sh -job langdetect -commoncrawl -files-limit 20 -output langs.txt -n 10
+```
+
+Workers download WET chunks directly from `data.commoncrawl.org` (the
+orchestrator only ships URLs, never the data itself). Useful for large-scale
+testing on real web data without pre-staging files.
+
+### Cluster stats pipeline
 
 ```bash
 ./run.sh
@@ -94,34 +112,62 @@ Fetches up to 100 reachable hosts, deploys an HTTP load server on each,
 collects 1/5/15-minute load averages and memory stats into `stats.txt`, then
 cleans everything up (also on Ctrl-C, via an EXIT trap).
 
-### 2. MapReduce on a local file
+---
 
-```bash
-./mapreduce.sh -job wordcount -input test_input.txt -output result.txt -n 10
-```
+## How to Test
 
-### 3. MapReduce on Common Crawl
-
-```bash
-./mapreduce.sh -job langdetect -commoncrawl -files-limit 20 -output langs.txt -n 10
-```
-
-Workers download WET chunks directly from `data.commoncrawl.org` (the
-orchestrator only ships URLs, never the data itself).
-
-### 4. Local end-to-end test (no SSH needed)
+### Local end-to-end test (no SSH needed)
 
 ```bash
 scripts/test_distributed.sh -n 3
 ```
 
 Starts 3 workers on localhost, runs the full distributed pipeline over real
-TCP, and diffs the merged output against an independently computed reference
+TCP, and compares the merged output against an independently computed reference
 word count. Exits non-zero on any mismatch.
+
+This is useful for quick validation without needing SSH access to the lab
+cluster.
 
 ---
 
-## Built-in jobs
+## How to Benchmark
+
+### MapReduce scaling (Amdahl curve)
+
+```bash
+experiments/run_benchmark.sh
+```
+
+Runs the MapReduce pipeline for multiple node counts (1, 2, 4, 8, 16, 32…),
+parses the TIMING line from each run, and generates CSV data for speedup
+analysis. Results show how close the system comes to linear speedup (Amdahl's
+law with a fixed serial fraction).
+
+### Deploy/collect scaling
+
+```bash
+experiments/run_deploy_benchmark.sh
+```
+
+Similar to `run_benchmark.sh`, but measures the deployment and stats collection
+pipeline instead of MapReduce, useful for understanding cluster setup overhead.
+
+### Plot speedup curves
+
+```bash
+gnuplot experiments/amdahl.gnuplot
+```
+
+Generates PNG plots comparing observed speedup against the theoretical Amdahl
+curve. Review the results to identify bottlenecks (I/O, network, or scheduler
+contention).
+
+---
+
+## Reference
+
+### Built-in jobs
 
 Jobs are **compiled into the worker binary** and selected at runtime with
 `-job <name>`:
@@ -157,7 +203,9 @@ Adding a job means adding a `JobKind`, its map/reduce logic in
 
 ---
 
-## How the MapReduce pipeline works
+## Debugging & Reference
+
+### How the MapReduce pipeline works
 
 ```mermaid
 sequenceDiagram
@@ -222,13 +270,7 @@ sequenceDiagram
 | `POST /reduce` | peers, one per line | Pull buckets from all peers, reduce |
 | `GET /result` | — | Final TSV (`key\tvalue` per line) |
 
-The worker is a thread-per-connection HTTP server built on raw POSIX sockets —
-no external networking libraries. All payloads are plain text (line-oriented
-or TSV), so every step is debuggable with `curl`.
-
----
-
-## Stats pipeline tools
+### Stats pipeline tools
 
 Each tool reads `manifest.json` (via `jq`) for defaults and accepts:
 
@@ -246,37 +288,13 @@ configurable fan-out (default 16 concurrent hosts).
 
 ---
 
-## Benchmarks
+## Architecture & Design
 
-```bash
-# MapReduce scaling: runs the pipeline for several node counts and
-# parses the TIMING line into a CSV for the Amdahl plot.
-experiments/run_benchmark.sh
-
-# Deploy/collect scaling for the stats pipeline.
-experiments/run_deploy_benchmark.sh
-
-# Plot speedup curves.
-gnuplot experiments/amdahl.gnuplot
-```
-
-The Kafka Streams comparison lives in `kafka/` — see `kafka/README.md`.
+For implementation details (C++ design, shuffle architecture, fault tolerance),
+see [docs/DESIGN.md](docs/DESIGN.md).
 
 ---
 
-## Notes on the C++ implementation
+## Additional resources
 
-Key design choices:
-
-- **Compiled-in jobs**: the worker binary embeds all four jobs and selects one
-  with `-job`.
-- **Plain-text line protocol** instead of JSON bodies: worker endpoints accept
-  and return newline-separated text/TSV, parsed without a JSON library.
-- **Shell delegation**: HTTP client calls use `curl`, JSON manifest parsing
-  uses `jq`, and decompression uses `gzip` — keeping the C++ code dependency-free.
-- **Concurrency** via `std::thread` + a small `parallel_for` helper (with
-  exception propagation); the worker handles each connection on a detached
-  thread.
-- **Remote-compatible worker builds**: the local orchestrator can be built on
-  the laptop, while `scripts/build_remote_worker.sh` compiles the deployed
-  worker on a lab host to avoid glibc/libstdc++ version mismatches.
+The Kafka Streams comparison lives in `kafka/` — see `kafka/README.md`.
