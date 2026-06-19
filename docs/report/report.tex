@@ -1,6 +1,6 @@
 \documentclass[11pt,a4paper]{article}
 
-\usepackage[margin=2.2cm]{geometry}
+\usepackage[margin=1.4cm]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
@@ -43,7 +43,7 @@
 
 \title{\textbf{SLR Project P4 Report}\\Distributed MapReduce and Remote Experiment Infrastructure}
 \author{Guilherme Caporali \and \inlineplaceholder{add teammate names if needed}}
-\date{\today}
+\date{}
 
 \begin{document}
 
@@ -99,14 +99,14 @@ queries \url{https://tp.telecom-paris.fr/ajax.php} to generate
   \node[service] (discover) at (-5.3,0.5) {Host discovery\\\codepath{scripts/make_hosts}\\writes \codepath{hosts.txt}};
   \node[service] (orchestrator) at (0,0.5) {MapReduce orchestrator\\\codepath{scripts/mapreduce}\\reads \codepath{hosts.txt}};
   \node[service] (stats) at (5.3,0.5) {Remote stats tools\\\texttt{deploy / collect / cleanup}\\read \codepath{hosts.txt}};
-  \node[data] (machines) at (0,-2.5) {Selected lab hosts\\worker binaries in \texttt{/tmp}\\and remote command targets};
-  \node[data] (inputs) at (-5.3,-4.9) {External inputs\\local files or\\Common Crawl WET URLs};
-  \node[data] (outputs) at (5.3,-4.9) {Outputs\\\codepath{result.txt}, \codepath{stats.txt},\\experiment CSV files};
+  \node[data] (machines) at (0,-2) {Selected lab hosts\\worker binaries in \texttt{/tmp}\\and remote command targets};
+  \node[data] (inputs) at (-5.3,-2) {External inputs\\local files or\\Common Crawl WET URLs};
+  \node[data] (outputs) at (5.3,-2) {Outputs\\\codepath{result.txt}, \codepath{stats.txt},\\experiment CSV files};
 
   \draw (user) -- (discover);
   \draw (user) -- (orchestrator);
   \draw (user) -- (stats);
-  \draw (inputs.east) -- (orchestrator.west);
+  \draw (inputs.north) -- (orchestrator.south west);
   \draw (orchestrator.south) -- (machines.north);
   \draw (stats.south) -- (machines.north east);
   \draw (machines.east) -- (outputs.west);
@@ -166,17 +166,19 @@ master that stays permanently deployed in the cluster.
   \item Each worker runs map locally and writes \(N\) intermediate bucket files
   to its node-local working directory in \texttt{/tmp}. The partition function
   is \(\mathrm{FNV32a}(key) \bmod N\).
-  \item Each reducer then pulls exactly one bucket from each peer via HTTP,
-  reconstructs the key groups in memory, applies the reducer, and exposes the
-  final key/value lines at \texttt{/result}.
+  \item Each reducer then pulls exactly one bucket from each logical slot via
+  HTTP, reconstructs the key groups in memory, applies the reducer, and exposes
+  the final key/value lines at \texttt{/result?slot=i}.
   \item The orchestrator collects every worker result, merges integer counts
   locally, sorts the final output, and writes the target file.
 \end{enumerate}
 
 Architecturally, the most important decision is that \textbf{\(N\) is fixed
 for the whole job}. Since the partition function depends on \(N\), elasticity
-is handled by replacing a failed \emph{host behind a logical slot} rather than
-by changing the number of reducers in the middle of the run.
+is handled by preserving the logical slot identifiers and rebinding them to a
+different host when needed, rather than by changing the number of reducers in
+the middle of the run. When no spare host remains, one healthy worker can
+temporarily own multiple logical slots while \(N\) stays unchanged.
 
 \section{Build, execution, and deployment}
 
@@ -375,29 +377,29 @@ and final outcome.}
 \centering
 \begin{tikzpicture}[
   font=\small,
-  stage/.style={draw, rounded corners, fill=blue!6, align=center, minimum width=4.4cm, minimum height=1.0cm},
-  detail/.style={draw, rounded corners, fill=gray!8, align=left, text width=8.2cm, inner sep=6pt},
+  stage/.style={draw, rounded corners, fill=blue!6, align=center, minimum width=4cm, minimum height=1.0cm},
+  detail/.style={draw, rounded corners, fill=gray!8, align=left, text width=10cm, inner sep=4pt},
   ->, >=Latex
 ]
   \node[stage] (p1) at (0,0) {\textbf{1. Load}};
-  \node[detail] (d1) at (7.1,0) {Push local chunks with \texttt{POST /data} or assign Common Crawl URLs with \texttt{POST /load}.};
+  \node[detail] (d1) at (8,0) {Push local chunks with \texttt{POST /data?slot=i} or assign Common Crawl URLs with \texttt{POST /load \{id, urls\}}.};
 
   \node[stage] (p2) at (0,-2.0) {\textbf{2. Map}};
-  \node[detail] (d2) at (7.1,-2.0) {Broadcast \texttt{POST /map \{id, peers\}}. Each worker maps its local input and writes \(N\) hash-partitioned bucket files.};
+  \node[detail] (d2) at (8,-2.0) {Broadcast \texttt{POST /map \{id, peers\}}. Each worker maps its local input and writes \(N\) hash-partitioned bucket files.};
 
   \node[stage] (p3) at (0,-4.0) {\textbf{3. Shuffle + reduce}};
-  \node[detail] (d3) at (7.1,-4.0) {Broadcast \texttt{POST /reduce}. Each reducer fetches \texttt{GET /intermediate?reducer=i\&n=N} from every peer and reduces locally.};
+  \node[detail] (d3) at (8,-4.0) {Broadcast \texttt{POST /reduce \{id, peers\}}. Each reducer fetches \texttt{GET /intermediate?slot=s\&reducer=i\&n=N} from every logical slot and reduces locally.};
 
   \node[stage] (p4) at (0,-6.0) {\textbf{4. Collect}};
-  \node[detail] (d4) at (7.1,-6.0) {Fetch \texttt{GET /result}, merge integer-valued outputs, sort, and write the final result file.};
+  \node[detail] (d4) at (8,-6.0) {Fetch \texttt{GET /result?slot=i}, merge integer-valued outputs, sort, and write the final result file.};
 
   \draw[->] (p1) -- (p2);
   \draw[->] (p2) -- (p3);
   \draw[->] (p3) -- (p4);
-  \draw[->] (p1.east) -- (d1.west);
-  \draw[->] (p2.east) -- (d2.west);
-  \draw[->] (p3.east) -- (d3.west);
-  \draw[->] (p4.east) -- (d4.west);
+  \draw[-] (p1.east) -- (d1.west);
+  \draw[-] (p2.east) -- (d2.west);
+  \draw[-] (p3.east) -- (d3.west);
+  \draw[-] (p4.east) -- (d4.west);
 \end{tikzpicture}
 \caption{Single-job execution flow. The implementation has one MapReduce stage:
 load, map, shuffle-by-pull, reduce, then result collection.}
@@ -505,84 +507,6 @@ reduce, collect, and total compute; split and load can be measured around the
 wrapper or orchestrator.}
 \end{table}
 
-\section{Project status: achieved functionality, unmet objectives, and remaining issues}
-
-\subsection{Achieved}
-
-\begin{itemize}[leftmargin=1.5em]
-  \item A distributed MapReduce framework in Go, deployable on shared
-  lab machines without root privileges.
-  \item Pluggable job logic via a small \texttt{Mapper}/\texttt{Reducer} API.
-  \item Support for both local files and Common Crawl WET inputs.
-  \item A pull-based shuffle built on pre-partitioned bucket files.
-  \item Bounded parallel SSH/SCP fan-out for deployment, collection, and
-  cleanup.
-  \item Fault handling through a slot-based coordinator with spare hosts,
-  replacement, epoch tracking, and active health checks.
-  \item Experiment scripts for Amdahl-law benchmarking and deployment-path
-  benchmarking.
-  \item A separate Kafka Streams benchmark path to support a system-level
-  comparison.
-\end{itemize}
-
-\subsection{Outstanding items}
-
-\begin{itemize}[leftmargin=1.5em]
-  \item Fully general local-file scheduling for datasets larger than the number
-  of available slots times one chunk. The code contains a round-robin
-  multi-chunk helper, but the main execution path presently assigns only one chunk
-  per slot.
-  \item A fully populated empirical section in the report. The repository
-  contains the scripts and plotting support, but the actual measurements remain
-  to be produced and inserted.
-  \item Durable storage or replicated intermediate data. The system is a batch
-  engine, not a persistent data platform.
-  \item Multi-stage job chaining inside one execution graph.
-\end{itemize}
-
-\subsection{Validated job executions recorded in the repository}
-
-The current repository documentation now includes concrete single-worker
-protocol validation results for the three analytical jobs added beyond word
-count. These executions used the actual worker HTTP pipeline locally
-(\texttt{/data} \(\rightarrow\) \texttt{/map} \(\rightarrow\)
-\texttt{/reduce} \(\rightarrow\) \texttt{/result}), thereby exercising the real
-map/reduce code paths while excluding only remote SSH/SCP deployment.
-
-\begin{center}
-\small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.2cm} >{\raggedright\arraybackslash}p{4.0cm} X}
-\toprule
-\textbf{Job} & \textbf{Recorded output} & \textbf{Interpretation} \\
-\midrule
-\texttt{langdetect} & \texttt{lang:en 15} & All 15 input lines were classified as English, which matches the reference corpus used in the documented validation run. \\
-\addlinespace[0.35em]
-\texttt{domainpop} & \texttt{example.com 2}, \texttt{golang.org 1}, \texttt{news.ycombinator.com 2} & The reducer preserved the expected domain counts from the synthetic WARC-style input used for validation. \\
-\addlinespace[0.35em]
-\texttt{docdensity} & \texttt{hist:len.00000-00079 15}, \texttt{stat:chars.alnum 386}, \texttt{stat:chars.other 73}, \texttt{stat:chars.total 459}, \texttt{stat:lines 15} & The derived metrics reported in the repository documentation are \texttt{avg\_line\_length = 30.600} and \texttt{alnum\_density = 0.840959}, confirming that the counter-based output contract is sufficient for post-processing. \\
-\bottomrule
-\end{tabularx}
-\end{center}
-
-These documented validation results do not replace the distributed benchmark
-section of this report, but they do confirm that the new job implementations
-remain consistent with the worker protocol and integer-valued merge contract.
-
-\subsection{Remaining problems}
-
-\begin{enumerate}[leftmargin=1.5em]
-  \item \textbf{Scalability bottleneck in local-file mode:} at present the
-  largest correct local dataset is limited by the one-chunk-per-slot behavior.
-  \item \textbf{Memory pressure in map and shuffle:} workers materialize large
-  in-memory maps and arrays before writing or serving buckets.
-  \item \textbf{Serial final merge:} the orchestrator continues to merge and sort
-  results on one machine.
-  \item \textbf{No data replication:} if a slot fails and no spare host is
-  available, the whole job fails.
-  \item \textbf{Skew sensitivity:} URL round-robin is straightforward but does not account for
-  the true byte size or complexity of each WET file.
-\end{enumerate}
-
 \section{Maximum dataset size achieved}
 
 The empirical maximum dataset size should be reported from real experiments, so
@@ -611,12 +535,13 @@ local-file or Common Crawl based.}
 The coordinator tracks each logical worker slot through the states
 \texttt{pending -> loaded -> mapped -> reduced -> done}. A slot is not bound
 permanently to one physical machine. If a host fails, the coordinator can
-rebind the same slot number to a spare host, replay prerequisite phases, and
-preserve the same global reducer count \(N\).
+rebind the same slot number to a spare host or, if no spare remains, to an
+already healthy worker host. In both cases it replays prerequisite phases and
+preserves the same global reducer count \(N\).
 
 \begin{figure}[H]
 \centering
-\resizebox{0.68\linewidth}{!}{%
+\resizebox{0.4\linewidth}{!}{%
 \begin{tikzpicture}[
   font=\small,
   phasebox/.style={draw, rounded corners, minimum width=5.0cm, minimum height=1.0cm, align=center, fill=blue!6},
@@ -624,9 +549,9 @@ preserve the same global reducer count \(N\).
   ->, >=Latex
 ]
   \node[phasebox] (s1) at (0,0) {\textbf{Logical slot \(i\)}\\slot identifier remains fixed};
-  \node[phasebox] (s2) at (0,-2.0) {\textbf{Host A executes slot \(i\)}\\phase state advances normally};
-  \node[failurebox] (s3) at (0,-4.0) {\textbf{Failure detected}\\health check or RPC error marks Host A unusable};
-  \node[phasebox] (s4) at (0,-6.0) {\textbf{Spare host B takes over slot \(i\)}\\slot state resets to \texttt{pending}};
+  \node[phasebox] (s2) at (0,-1.5) {\textbf{Host A executes slot \(i\)}\\phase state advances normally};
+  \node[failurebox] (s3) at (0,-3.0) {\textbf{Failure detected}\\health check or RPC error marks Host A unusable};
+  \node[phasebox] (s4) at (0,-4.5) {\textbf{Spare host B or healthy host C takes over slot \(i\)}\\slot state resets to \texttt{pending}};
 
   \draw (s1) -- (s2);
   \draw (s2) -- (s3);
@@ -634,8 +559,9 @@ preserve the same global reducer count \(N\).
 \end{tikzpicture}
 }
 \caption{Alternative view of fault handling. The logical slot identifier is
-preserved, while the physical host can be replaced and the necessary phases are
-replayed before execution continues.}
+preserved, while the physical host can be replaced---either by a spare or by a
+surviving active worker---and the necessary phases are replayed before
+execution continues.}
 \end{figure}
 
 \noindent When a replacement occurs, the new host must replay the prerequisite
@@ -653,25 +579,31 @@ If a node crashes during the job:
   as dead after consecutive failures;
   \item transport or HTTP errors during phase execution also identify a culprit
   slot or failing peer;
-  \item the coordinator removes that host from future use and claims a spare;
+  \item the coordinator removes that host from future use and first claims a
+  spare; if no spare is available, it reassigns the failed logical slot to a
+  surviving healthy worker host;
   \item the replaced slot is reset to \texttt{pending}, so it reloads input and
   re-runs map before rejoining later phases;
   \item if the failure happened after reduce had already been completed by some
   workers, an epoch counter forces those reduce results to be recomputed because
   their previous peer set is now stale;
-  \item if no spare host is available, the job stops with an explicit error.
+  \item the job stops only if there is neither a spare nor any surviving healthy
+  host that can absorb the failed slot.
 \end{enumerate}
 
 \subsection{Potential resilience improvements}
 
-\begin{itemize}[leftmargin=1.5em]
-  \item replicate intermediate buckets to another worker;
-  \item checkpoint map completion and input assignment outside the process so
-  recovery survives orchestrator crashes as well;
-  \item replace in-memory state with a persistent metadata log;
-  \item support multiple spare tiers or automatic host re-discovery;
-  \item stream intermediate data so restart cost is lower for very large jobs.
-\end{itemize}
+The current recovery logic already handles worker crashes, but several
+extensions would make it more resilient. Replicating intermediate buckets to a
+second worker would reduce the dependence on a single local disk copy during
+recovery. Persisting map-completion state and input assignment outside the
+orchestrator process would allow recovery to survive an orchestrator crash as
+well, especially if the current in-memory metadata were replaced with a durable
+log. The system could also be strengthened by rediscovering additional
+replacement hosts automatically once both the spare pool and the currently
+healthy workers are saturated. Finally, streaming intermediate data would lower
+restart cost for very large jobs because less data would need to be
+re-materialized after failure.
 
 \section{Threads, concurrency, and additional parallelization opportunities}
 
@@ -681,27 +613,24 @@ In Go, the project uses goroutines rather than manual POSIX threads; however,
 for the purposes of the assignment, these goroutines constitute the active
 thread-level concurrency mechanism of the system.
 
-\begin{center}
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.2cm} >{\raggedright\arraybackslash}p{4.0cm} X}
-\toprule
-\textbf{Location} & \textbf{Concurrent work} & \textbf{Reason} \\
-\midrule
-\codepath{scripts/internal/remote} & Bounded worker pools & Limit SSH/SCP fan-out while preserving parallel execution across many hosts. \\
-\addlinespace[0.35em]
-\codepath{scripts/deploy} & One goroutine per host copy/command batch & Reduce deployment latency across many machines. \\
-\addlinespace[0.35em]
-\codepath{scripts/collect} & Parallel SSH command execution & Reduce collection latency for remote statistics. \\
-\addlinespace[0.35em]
-\codepath{scripts/cleanup} & Parallel remote cleanup & Reduce shutdown time. \\
-\addlinespace[0.35em]
-\codepath{scripts/mapreduce} & Parallel deployment, health checks, phase broadcasts, result fetches & Drive all workers concurrently rather than serially. \\
-\addlinespace[0.35em]
-\codepath{scripts/mapreduce/coordinator.go} & One goroutine per slot in each pass; one health watcher thread & Advance slots independently and detect failures continuously. \\
-\addlinespace[0.35em]
-\codepath{scripts/worker} & One goroutine per peer during reduce fetch & Pull shuffle data from all peers concurrently. \\
-\bottomrule
-\end{tabularx}
-\end{center}
+Concurrency appears in several layers of the implementation. In
+\codepath{scripts/internal/remote}, bounded worker pools execute SSH and SCP
+operations in parallel so deployment-related fan-out remains concurrent without
+overwhelming the available machines. The deployment, collection, and cleanup
+utilities build on that pattern by issuing per-host copy, command, and cleanup
+work through goroutines, which reduces end-to-end latency for operational
+steps.
+
+The main orchestrator in \codepath{scripts/mapreduce} also relies heavily on
+goroutines: it deploys workers concurrently, performs health checks in the
+background, broadcasts phase transitions in parallel, and fetches results from
+multiple workers at the same time instead of serializing those actions. Inside
+\codepath{scripts/mapreduce/coordinator.go}, each scheduling pass can advance
+multiple logical slots concurrently, while a dedicated health-watcher goroutine
+monitors failures continuously. At the worker level, the reduce phase fetches
+shuffle data from peer workers concurrently as well, so each reducer can gather
+its partition from all peers without waiting on a strictly sequential transfer
+order.
 
 \subsection{Areas where additional threads could be beneficial}
 
@@ -920,7 +849,7 @@ Execution model & Batch, phase-oriented job & Continuous stream processing on to
 \addlinespace[0.35em]
 Persistence & Intermediate data is local and temporary & Records are persisted in Kafka topics \\
 \addlinespace[0.35em]
-Fault tolerance & Spare-host replacement if available, but no durable replicated buckets & Built-in broker replication and consumer-group recovery \\
+Fault tolerance & Slot-preserving reassignment onto spares or surviving workers, but no durable replicated buckets & Built-in broker replication and consumer-group recovery \\
 \addlinespace[0.35em]
 Operational weight & Relatively light: Go binary + SSH + HTTP & More substantial: Java, Kafka brokers, topics, partitioning, cluster management \\
 \addlinespace[0.35em]

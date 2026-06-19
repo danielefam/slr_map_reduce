@@ -43,21 +43,19 @@ import (
 // production benchmark runs are not perturbed.
 var pprofEnabled bool
 
-// state holds all runtime data for one MapReduce job.
-type state struct {
-	mu sync.Mutex
-
+type slotState struct {
 	// input data written directly by the client in local-file mode
 	inputData string
 	// inputFiles are Common Crawl WET files downloaded under workDir.
 	inputFiles []string
+	peers      []string // "host:port" for all logical slots including self
+	output     []KeyValue
+}
 
-	// index of this worker in the peer list (set at map phase)
-	workerID int
-	peers    []string // "host:port" for all workers including self
-
-	// final reduce output
-	output []KeyValue
+// state holds runtime data for every logical slot currently assigned to the worker.
+type state struct {
+	mu    sync.Mutex
+	slots map[int]*slotState
 }
 
 // server wraps per-instance state and the map/reduce functions so that multiple
@@ -72,13 +70,18 @@ type server struct {
 
 // newServer creates a worker server that stores intermediate files under workDir.
 func newServer(mapFn MapFunc, reduceFn ReduceFunc, workDir string) *server {
-	return &server{state: &state{}, mapFn: mapFn, reduceFn: reduceFn, workDir: workDir}
+	return &server{
+		state:    &state{slots: make(map[int]*slotState)},
+		mapFn:    mapFn,
+		reduceFn: reduceFn,
+		workDir:  workDir,
+	}
 }
 
 // bucketFile returns the path for the pre-partitioned intermediate file
 // for reducer idx out of n total reducers.
-func (s *server) bucketFile(n, idx int) string {
-	return filepath.Join(s.workDir, fmt.Sprintf("map-bucket-%d-%d.jsonl", n, idx))
+func (s *server) bucketFile(slotID, n, idx int) string {
+	return filepath.Join(s.workDir, fmt.Sprintf("slot-%d-map-bucket-%d-%d.jsonl", slotID, n, idx))
 }
 
 // writeKVLines writes kvs to path as JSON lines, overwriting any existing file.
@@ -122,9 +125,9 @@ func readKVFlat(path string) ([]KeyValue, error) {
 	return out, scanner.Err()
 }
 
-// removeIntermediate deletes all pre-partitioned map bucket files.
-func (s *server) removeIntermediate() {
-	matches, _ := filepath.Glob(filepath.Join(s.workDir, "map-bucket-*.jsonl"))
+// removeIntermediate deletes all pre-partitioned map bucket files for slotID.
+func (s *server) removeIntermediate(slotID int) {
+	matches, _ := filepath.Glob(filepath.Join(s.workDir, fmt.Sprintf("slot-%d-map-bucket-*.jsonl", slotID)))
 	for _, f := range matches {
 		_ = os.Remove(f)
 	}
@@ -181,7 +184,13 @@ type mapRequest struct {
 }
 
 type loadRequest struct {
+	ID   int      `json:"id"`
 	URLs []string `json:"urls"`
+}
+
+type reduceRequest struct {
+	ID    int      `json:"id"`
+	Peers []string `json:"peers,omitempty"`
 }
 
 var commonCrawlDownloadClient = &http.Client{Timeout: 30 * time.Minute}
@@ -192,22 +201,28 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
+	slotID, err := slotIDFromQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := s.resetInputs(); err != nil {
+	if err := s.resetInputs(slotID); err != nil {
 		http.Error(w, "reset inputs: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.state.mu.Lock()
-	s.state.inputData = string(body)
-	s.state.inputFiles = nil
-	s.state.output = nil
+	slot := s.slotStateLocked(slotID)
+	slot.inputData = string(body)
+	slot.inputFiles = nil
+	slot.output = nil
 	s.state.mu.Unlock()
 
-	s.removeIntermediate()
+	s.removeIntermediate(slotID)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -219,22 +234,23 @@ func (s *server) handleLoad(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.resetInputs(); err != nil {
+	if err := s.resetInputs(req.ID); err != nil {
 		http.Error(w, "reset inputs: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	paths, err := s.downloadInputs(req.URLs)
+	paths, err := s.downloadInputs(req.ID, req.URLs)
 	if err != nil {
 		http.Error(w, "download inputs: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.state.mu.Lock()
-	s.state.inputData = ""
-	s.state.inputFiles = paths
-	s.state.output = nil
+	slot := s.slotStateLocked(req.ID)
+	slot.inputData = ""
+	slot.inputFiles = paths
+	slot.output = nil
 	s.state.mu.Unlock()
 
-	s.removeIntermediate()
+	s.removeIntermediate(req.ID)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -246,16 +262,16 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.state.mu.Lock()
-	data := s.state.inputData
-	files := append([]string(nil), s.state.inputFiles...)
-	s.state.workerID = req.ID
-	s.state.peers = req.Peers
-	s.state.output = nil
+	slot := s.slotStateLocked(req.ID)
+	data := slot.inputData
+	files := append([]string(nil), slot.inputFiles...)
+	slot.peers = append([]string(nil), req.Peers...)
+	slot.output = nil
 	s.state.mu.Unlock()
 
 	// Ensure idempotency: a repeat /map call (e.g. a replacement worker
 	// re-running the task) must not see stale buckets from a previous run.
-	s.removeIntermediate()
+	s.removeIntermediate(req.ID)
 
 	n := len(req.Peers)
 	var err error
@@ -280,13 +296,13 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for i, kvs := range buckets {
-		if err := writeKVLines(s.bucketFile(n, i), kvs); err != nil {
+		if err := writeKVLines(s.bucketFile(req.ID, n, i), kvs); err != nil {
 			http.Error(w, "write map bucket: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 	if len(files) > 0 {
-		if err := s.clearMappedInputs(files); err != nil {
+		if err := s.clearMappedInputs(req.ID, files); err != nil {
 			http.Error(w, "cleanup mapped inputs: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -299,6 +315,11 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 // handleIntermediate serves the pre-partitioned bucket file for the requested
 // reducer. Query params: reducer (0-based index), n (total workers).
 func (s *server) handleIntermediate(w http.ResponseWriter, r *http.Request) {
+	slotID, err := slotIDFromQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	reducer, err1 := strconv.Atoi(r.URL.Query().Get("reducer"))
 	n, err2 := strconv.Atoi(r.URL.Query().Get("n"))
 	if err1 != nil || err2 != nil || n <= 0 || reducer < 0 || reducer >= n {
@@ -306,7 +327,7 @@ func (s *server) handleIntermediate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kvs, err := readKVFlat(s.bucketFile(n, reducer))
+	kvs, err := readKVFlat(s.bucketFile(slotID, n, reducer))
 	if err != nil {
 		http.Error(w, "read map bucket: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -339,8 +360,8 @@ var intermediateClient = &http.Client{
 
 // fetchIntermediate GETs /intermediate from peer, requesting the KV pairs destined
 // for reducerID out of n total workers.
-func fetchIntermediate(peer string, reducerID, n int) ([]KeyValue, error) {
-	url := fmt.Sprintf("http://%s/intermediate?reducer=%d&n=%d", peer, reducerID, n)
+func fetchIntermediate(peer string, sourceSlotID, reducerID, n int) ([]KeyValue, error) {
+	url := fmt.Sprintf("http://%s/intermediate?slot=%d&reducer=%d&n=%d", peer, sourceSlotID, reducerID, n)
 	resp, err := intermediateClient.Get(url) //nolint:gosec
 	if err != nil {
 		return nil, err
@@ -357,13 +378,6 @@ func fetchIntermediate(peer string, reducerID, n int) ([]KeyValue, error) {
 	return kvs, nil
 }
 
-// reduceRequest is the optional JSON body of POST /reduce. When Peers is
-// non-empty it overrides the peer list stored by the most recent /map call,
-// allowing the orchestrator to update routing after replacing a dead host.
-type reduceRequest struct {
-	Peers []string `json:"peers,omitempty"`
-}
-
 // handleReduce pulls intermediate data from all peers via /intermediate, then runs
 // the reduce function over the merged KV pairs.
 //
@@ -373,19 +387,27 @@ type reduceRequest struct {
 func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 	var req reduceRequest
 	if r.Body != nil {
-		// Body is optional; ignore decode errors for empty/short bodies.
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	s.state.mu.Lock()
-	peers := s.state.peers
-	id := s.state.workerID
+	slot, ok := s.state.slots[req.ID]
+	if !ok {
+		s.state.mu.Unlock()
+		http.Error(w, fmt.Sprintf("unknown slot %d: run load/data and map first", req.ID), http.StatusBadRequest)
+		return
+	}
+	peers := append([]string(nil), slot.peers...)
 	s.state.mu.Unlock()
 
 	if len(req.Peers) > 0 {
-		peers = req.Peers
+		peers = append([]string(nil), req.Peers...)
 		s.state.mu.Lock()
-		s.state.peers = req.Peers
+		slot = s.slotStateLocked(req.ID)
+		slot.peers = append([]string(nil), req.Peers...)
 		s.state.mu.Unlock()
 	}
 
@@ -406,7 +428,7 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 			if addr == "" {
 				return
 			}
-			kvs, err := fetchIntermediate(addr, id, n)
+			kvs, err := fetchIntermediate(addr, idx, req.ID, n)
 			if err != nil {
 				errs[idx] = err
 				return
@@ -422,7 +444,7 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 
 	for i, err := range errs {
 		if err != nil {
-			http.Error(w, fmt.Sprintf("fetch from peer %s: %v", peers[i], err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("fetch from slot %d peer %s: %v", i, peers[i], err), http.StatusInternalServerError)
 			return
 		}
 	}
@@ -430,7 +452,8 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 	output := runReduce(intermediate, s.reduceFn)
 
 	s.state.mu.Lock()
-	s.state.output = output
+	slot = s.slotStateLocked(req.ID)
+	slot.output = output
 	s.state.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
@@ -439,9 +462,20 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 
 // handleResult returns the reduce output as newline-delimited "key\tvalue" pairs,
 // sorted by key.
-func (s *server) handleResult(w http.ResponseWriter, _ *http.Request) {
+func (s *server) handleResult(w http.ResponseWriter, r *http.Request) {
+	slotID, err := slotIDFromQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	s.state.mu.Lock()
-	output := s.state.output
+	slot, ok := s.state.slots[slotID]
+	if !ok {
+		s.state.mu.Unlock()
+		http.Error(w, fmt.Sprintf("unknown slot %d", slotID), http.StatusBadRequest)
+		return
+	}
+	output := append([]KeyValue(nil), slot.output...)
 	s.state.mu.Unlock()
 
 	sort.Slice(output, func(i, j int) bool { return output[i].Key < output[j].Key })
@@ -453,12 +487,14 @@ func (s *server) handleResult(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-func (s *server) resetInputs() error {
+func (s *server) resetInputs(slotID int) error {
 	s.state.mu.Lock()
-	stale := append([]string(nil), s.state.inputFiles...)
-	s.state.inputData = ""
-	s.state.inputFiles = nil
-	s.state.output = nil
+	slot := s.slotStateLocked(slotID)
+	stale := append([]string(nil), slot.inputFiles...)
+	slot.inputData = ""
+	slot.inputFiles = nil
+	slot.peers = nil
+	slot.output = nil
 	s.state.mu.Unlock()
 	return removeFiles(stale)
 }
@@ -500,22 +536,23 @@ func (s *server) runMapFile(file string) (map[string][]string, error) {
 	return intermediate, nil
 }
 
-func (s *server) clearMappedInputs(files []string) error {
+func (s *server) clearMappedInputs(slotID int, files []string) error {
 	if err := removeFiles(files); err != nil {
 		return err
 	}
 	s.state.mu.Lock()
-	if equalStringSlices(s.state.inputFiles, files) {
-		s.state.inputFiles = nil
+	slot := s.slotStateLocked(slotID)
+	if equalStringSlices(slot.inputFiles, files) {
+		slot.inputFiles = nil
 	}
 	s.state.mu.Unlock()
 	return nil
 }
 
-func (s *server) downloadInputs(urls []string) ([]string, error) {
+func (s *server) downloadInputs(slotID int, urls []string) ([]string, error) {
 	paths := make([]string, 0, len(urls))
 	for i, rawURL := range urls {
-		path, err := s.downloadInput(i, rawURL)
+		path, err := s.downloadInput(slotID, i, rawURL)
 		if err != nil {
 			_ = removeFiles(paths)
 			return nil, err
@@ -525,7 +562,7 @@ func (s *server) downloadInputs(urls []string) ([]string, error) {
 	return paths, nil
 }
 
-func (s *server) downloadInput(index int, rawURL string) (string, error) {
+func (s *server) downloadInput(slotID, index int, rawURL string) (string, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return "", fmt.Errorf("parse url %q: %w", rawURL, err)
@@ -534,7 +571,7 @@ func (s *server) downloadInput(index int, rawURL string) (string, error) {
 	if base == "" || base == "." || base == "/" {
 		base = "input.wet.gz"
 	}
-	finalPath := filepath.Join(s.workDir, fmt.Sprintf("cc-input-%05d-%s", index, base))
+	finalPath := filepath.Join(s.workDir, fmt.Sprintf("slot-%d-cc-input-%05d-%s", slotID, index, base))
 
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
@@ -601,4 +638,25 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func slotIDFromQuery(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("slot")
+	if raw == "" {
+		return 0, fmt.Errorf("missing required slot query parameter")
+	}
+	slotID, err := strconv.Atoi(raw)
+	if err != nil || slotID < 0 {
+		return 0, fmt.Errorf("bad request: slot must be a non-negative integer")
+	}
+	return slotID, nil
+}
+
+func (s *server) slotStateLocked(slotID int) *slotState {
+	slot := s.state.slots[slotID]
+	if slot == nil {
+		slot = &slotState{}
+		s.state.slots[slotID] = slot
+	}
+	return slot
 }

@@ -106,6 +106,7 @@ This gives O(1) bucket selection per request and O(N²) total peer requests for 
 
 - A **slot** is a logical worker index `0..N-1`.
 - A **spare** is a deployed healthy host not currently owning a slot.
+- When spares run out, a healthy worker may temporarily own more than one slot so `N` stays fixed.
 - Slot state machine: `pending -> loaded -> mapped -> reduced -> done`.
 - Replacing a failed slot host resets that slot to replay required prerequisites.
 
@@ -113,7 +114,7 @@ This gives O(1) bucket selection per request and O(N²) total peer requests for 
 
 1. Background health watcher probes `/health` and marks hosts dead after repeated failures.
 2. Phase calls retry with exponential backoff and bounded attempts.
-3. Reduce failures that indicate `fetch from peer X` are attributed to `X` and replace that peer.
+3. Reduce failures that indicate `fetch from slot X peer ...` are attributed to slot `X`, even if multiple slots currently share the same physical host.
 4. On slot-host replacement, coordinator epoch increments and previously reduced slots are demoted to mapped (reduce replay).
 
 This prevents stale peer topology from leaking into final reduce outputs.

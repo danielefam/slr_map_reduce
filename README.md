@@ -601,8 +601,9 @@ experiments/run_benchmark.sh -crawl CC-MAIN-2026-05 -chunks-limit 256 \
 
 The orchestrator uses a **slot-based coordinator** with a **spare pool**:
 
-- `N` (target `-n`) logical slots map 1:1 to physical hosts. Partitioning
-  uses `FNV-32a(key) % N`, so `N` is fixed for the duration of the job.
+- `N` (target `-n`) logical slots initially map 1:1 to physical hosts.
+  Partitioning uses `FNV-32a(key) % N`, so `N` is fixed for the duration of
+  the job even if failures later force multiple slots onto the same host.
 - Hosts beyond `N` in `hosts.txt` become **spares** — kept healthy and
   ready to replace any slot whose host fails.
 - Every worker call (`/load`, `/map`, `/reduce`, `/result`) is bound to a
@@ -615,9 +616,9 @@ The orchestrator uses a **slot-based coordinator** with a **spare pool**:
 | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Worker not reachable at startup                             | `waitHealthy` retries 30× / 2 s; survivors form slot+spare pool                                                                                          |
 | SCP / SSH failure (deploy)                                  | Failed hosts are skipped; deployment continues with the hosts that came up successfully                                                                  |
-| Worker returns 5xx during map/reduce                        | Calling host is replaced from spare pool, slot rewinds to `pending`, `/load` → `/map` (→ `/reduce`) replay                                               |
-| Worker dies → peer's `/reduce` 5xx with `fetch from peer X` | Coordinator parses the message, blames host `X` (not the caller), replaces `X`, then re-runs `/reduce` on all surviving slots with the updated peer list |
-| Transport error / timeout on a slot                         | Same as above; calling host replaced                                                                                                                     |
+| Worker returns 5xx during map/reduce                        | Calling host is replaced from a spare when available, otherwise the slot is rebound to a surviving healthy worker; `/load` → `/map` (→ `/reduce`) replay |
+| Worker dies → peer's `/reduce` 5xx with `fetch from slot X` | Coordinator blames slot `X` (not the caller), reassigns it, then re-runs `/reduce` on all surviving slots with the updated peer list                    |
+| Transport error / timeout on a slot                         | Same as above; the failed slot is moved to a spare or surviving worker                                                                                   |
 | Map/reduce phase times out                                  | 60 min HTTP client timeout per worker; failure triggers slot replacement                                                                                 |
 | Data upload times out                                       | 30 min HTTP client timeout for `/load`; failure triggers slot replacement                                                                                |
 | `/intermediate` fetch failure                               | 10 min worker-internal timeout; worker returns 500 to its `/reduce` caller; orchestrator identifies the dead peer                                        |
@@ -638,6 +639,6 @@ The orchestrator uses a **slot-based coordinator** with a **spare pool**:
 
 ### When the job will still fail
 
-- Spare pool exhausted (more slots fail than spares can replace).
+- A slot fails and there is neither a spare nor any surviving healthy worker left to absorb it.
 - All workers fail their initial `/health` check.
 - A single slot trips `-max-attempts` swaps.
