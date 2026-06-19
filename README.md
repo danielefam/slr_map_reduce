@@ -3,10 +3,10 @@
 This project provides two independent distributed workflows that operate over a
 pool of remote lab machines (`*.enst.fr`):
 
-| Script         | Purpose                                                                    |
-| -------------- | -------------------------------------------------------------------------- |
-| `mapreduce.sh` | Run a distributed **word-count MapReduce** job across N remote workers     |
-| `run.sh`       | Deploy an HTTP server to remote hosts, collect system stats, then clean up |
+| Script         | Purpose                                                                                   |
+| -------------- | ----------------------------------------------------------------------------------------- |
+| `mapreduce.sh` | Run a distributed MapReduce job across N remote workers; the built-in job is word count   |
+| `run.sh`       | Deploy an HTTP server to remote hosts, collect system stats, then clean up                |
 
 Both workflows are written in Go and share a common `hosts.txt` discovery mechanism.
 
@@ -20,7 +20,7 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 ├── hosts.txt           # Auto-generated list of available remote hosts
 ├── mapreduce.sh        # Entry point for the MapReduce pipeline
 ├── run.sh              # Entry point for the stats-collection pipeline
-└── scripts/
+├── scripts/
     ├── go.mod
     ├── make_hosts/     # Fetches available hosts from tp.telecom-paris.fr
     ├── deploy/         # Copies files to NFS and runs commands via SSH
@@ -28,6 +28,8 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
     ├── cleanup/        # Runs cleanup commands and removes NFS files
     ├── mapreduce/      # Client-side MapReduce orchestrator
     └── worker/         # HTTP worker server (map / reduce)
+└── docs/
+  └── JOBS.md         # Job model and examples beyond word count
 ```
 
 ---
@@ -63,6 +65,22 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 The output file contains one `word<TAB>count` line per word, sorted by
 descending count then alphabetically.
+
+### MapReduce Jobs Beyond Word Count
+
+The current command-line entry point runs the built-in word-count job. The worker
+is deliberately structured around `MapFunc` and `ReduceFunc`, so other jobs can
+use the same deployment, shuffle, reduce, result collection, retry, and cleanup
+pipeline by swapping those two functions.
+
+See [docs/JOBS.md](docs/JOBS.md) for the job contract and examples of non-word-count
+jobs such as domain popularity, language-signal counting, and document-density
+histograms.
+
+Important current constraint: final merge expects reducer outputs whose values
+are integers and sums values with the same key. Jobs that need averages or
+ratios should emit summable counters, then derive the final metric after the
+MapReduce output is written.
 
 ### Remote Stats Collection
 
@@ -170,9 +188,9 @@ Coordinates the full pipeline from the client machine:
 4. SSH each node to start the worker HTTP server (`nohup`)
 5. Wait for all workers to pass the health check
 6. Distribute input — either split a local file (`-input`) into 64 MB chunks and push them via `POST /data`, **or** resolve Common Crawl WET URLs from the official website and assign them **round-robin** across the N workers via `POST /load`. Workers download those WET files into their local `workDir`, map from local file streams, and delete the downloaded inputs after map succeeds. Bound Common Crawl runs with `-files-limit` and/or `-chunks-limit`.
-7. Broadcast `POST /map` with each worker's ID and the full peer list — each worker partitions its intermediate KVs into N bucket files (`map-bucket-{n}-{idx}.jsonl`) using `FNV-32a(key) % N`
-8. Broadcast `POST /reduce` — each worker fetches its pre-partitioned bucket file from every peer via `GET /intermediate?reducer=id&n=N` (O(1) file read per peer) and runs reduce locally
-9. `GET /result` from every worker, merge word counts, sort (descending count, then alphabetical), write output file
+7. Broadcast `POST /map` with each worker's ID and the full peer list — each worker applies the configured map function, then partitions its intermediate KVs into N bucket files (`map-bucket-{n}-{idx}.jsonl`) using `FNV-32a(key) % N`
+8. Broadcast `POST /reduce` — each worker fetches its pre-partitioned bucket file from every peer via `GET /intermediate?reducer=id&n=N` (O(1) file read per peer), then runs the configured reduce function locally
+9. `GET /result` from every worker, merge integer-valued outputs, sort (descending value, then alphabetical key), write output file
 10. SSH cleanup: kill worker processes and remove temporary files
 
 ---
@@ -325,7 +343,8 @@ Input file
 (or: .wet/.wet.gz files assigned round-robin ── POST /load ──▶ Workers)
 
 Workers: Map phase
-    Each worker applies wordCountMap line-by-line:
+  Each worker applies the configured MapFunc line-by-line.
+  For the built-in word-count job:
     "hello world hello" → [(hello,1),(world,1),(hello,1)]
     Output: N pre-partitioned bucket files on disk (map-bucket-{n}-{idx}.jsonl)
     Keys routed by FNV-32a(key) % N — partitioning done once, at map time
@@ -335,19 +354,19 @@ Workers: Reduce phase  (pull-based, no orchestrator involvement)
       GET /intermediate?reducer=i&n=N
     Peers serve map-bucket-{n}-{i}.jsonl directly — O(1), no scan
     After fetching: each worker owns all values for a disjoint key set
-    wordCountReduce(key, values) = len(values)
+    For the built-in word-count job: wordCountReduce(key, values) = len(values)
     Output: sorted []KeyValue
 
 Orchestrator: Collect phase
     GET /result from all workers
-    Merge totals (sum counts across workers for same key)
+    Merge totals (sum integer values across workers for same key)
     Sort: descending count, then alphabetical
     Write to output file
 ```
 
 ---
 
-## Word-Count Functions
+## Built-In Word-Count Job
 
 | Function          | Signature                    | Behaviour                                                                           |
 | ----------------- | ---------------------------- | ----------------------------------------------------------------------------------- |
@@ -355,7 +374,9 @@ Orchestrator: Collect phase
 | `wordCountReduce` | `(key, []string) → string`   | Returns `len(values)` as a string (counts occurrences)                              |
 
 The map and reduce functions are pluggable via the `MapFunc` / `ReduceFunc` type
-aliases, so the worker can be adapted to other jobs.
+aliases, so the worker can be adapted to other jobs. The active CLI does not yet
+expose a `-job` flag; changing jobs currently means building the worker with a
+different `newServer(mapFn, reduceFn, workDir)` binding. See [docs/JOBS.md](docs/JOBS.md).
 
 ---
 
