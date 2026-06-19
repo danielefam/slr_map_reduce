@@ -3,7 +3,6 @@ package remote
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -17,7 +16,7 @@ const (
 	DefaultSCPTimeout  = 2 * time.Minute
 )
 
-var controlPath = filepath.Join(os.TempDir(), "slr-ssh-%C")
+var controlPath = filepath.Join("/tmp", "slr-ssh-%C")
 
 func NormalizeParallelism(limit, total int) int {
 	if total <= 0 {
