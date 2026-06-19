@@ -21,3 +21,5 @@ vgcore.*
 *.swo
 data/
 *.txt
+
+kafka/dist
