@@ -49,12 +49,10 @@
 
 \section{Introduction}
 
-This project implements two distributed workflows for the Telecom Paris lab
-machines. The first one is the main deliverable: a custom MapReduce framework
-in Go. The second one is a generic deploy/collect/cleanup workflow used to
-start a program on many hosts and collect system information. The MapReduce
-system builds a worker binary locally, deploys it over SSH/SCP, assigns input,
-executes map and reduce through HTTP, then merges the final result locally.
+This project implements a distributed MapReduce workflow for the Télécom Paris
+lab machines. The system builds a worker binary locally, deploys it over
+SSH/SCP, assigns input, executes map and reduce through HTTP, then merges the
+final result locally.
 
 The project works under the practical constraints of the lab: no root access,
 no Docker, shared machines, and frequent host churn. For that reason the
@@ -67,7 +65,6 @@ What was achieved:
 \begin{itemize}[leftmargin=1.5em]
   \item a complete single-stage MapReduce pipeline with local-file and Common
   Crawl input modes;
-  \item a generic deployment script pipeline (\texttt{run.sh});
   \item a Kafka comparison path prepared for later benchmarking;
   \item a validated strong-scaling experiment on one fixed 64-file workload.
 \end{itemize}
@@ -117,30 +114,18 @@ Common Crawl mode:
   -crawl CC-MAIN-2026-21 -files-limit 4 -output result.txt -n 10
 \end{lstlisting}
 
-\subsection{Run the deploy/collect pipeline}
-
-\begin{lstlisting}[style=codeblock]
-./run.sh
-\end{lstlisting}
-
-This script fetches hosts, deploys a simple HTTP server, collects
-\texttt{hostname}, \texttt{uptime}, and memory statistics, then cleans up.
-
 \subsection{What must change for another student login}
 
 The MapReduce path is mostly login-agnostic because it deploys workers to
 \texttt{/tmp/mr-worker}. The main login-sensitive points are:
 
 \begin{enumerate}[leftmargin=1.5em]
-  \item \texttt{run.sh}: the variable \texttt{N} controls how many hosts are
-  targeted by the deploy/collect workflow.
-  \item \texttt{manifest.json}: field \texttt{n} must match \texttt{N} from
-  \texttt{run.sh}.
-  \item \texttt{manifest.json}: field \texttt{nfs} must be changed if a student
-  wants to use NFS-based file deployment.
-  \item \texttt{manifest.json}: the command, collect, and cleanup strings must
-  match the program the student wants to launch remotely.
+  \item \texttt{mapreduce.sh}: the \texttt{-n} flag controls how many active
+  workers the orchestrator targets, while the wrapper fetches a pool of
+  \(2 \times N\) hosts to keep cold spares available.
   \item The student must already have passwordless SSH configured for the lab.
+  \item The remote machines must still expose a compatible Linux/\texttt{amd64}
+  environment because the worker is cross-compiled for that target.
 \end{enumerate}
 
 Cross-login validation is still pending, so this report states the exact
@@ -159,23 +144,19 @@ variables to change, but not yet a verified second-student execution result.
   data/.style={draw, rounded corners, fill=green!6, align=center, minimum width=4.1cm, minimum height=1.0cm},
   ->, >=Latex
 ]
-  \node[box, fill=gray!10] (user) at (0,2) {User shell\\\texttt{mapreduce.sh} / \texttt{run.sh}};
+  \node[box, fill=gray!10] (user) at (0,2) {User shell\\\texttt{mapreduce.sh}};
   \node[service] (discover) at (-5,0) {Host discovery\\\codepath{scripts/make_hosts}};
   \node[service] (orchestrator) at (0,0) {MapReduce orchestrator\\\codepath{scripts/mapreduce}};
-  \node[service] (stats) at (5.0,0) {Deploy / collect / cleanup\\\codepath{scripts/deploy}, etc.};
-  \node[data] (machines) at (-3,-2) {Lab machines\\workers or remote commands};
-  \node[data] (io) at (3,-2) {Outputs\\\codepath{result.txt}, \codepath{stats.txt}, CSVs};
+  \node[data] (machines) at (-1.5,-2) {Lab machines\\workers};
+  \node[data] (io) at (3,-2) {Outputs\\\codepath{result.txt}, CSVs};
 
   \draw (user) -- (discover);
   \draw (user) -- (orchestrator);
-  \draw (user) -- (stats);
   \draw (discover) -- (machines);
   \draw (orchestrator) -- (machines);
-  \draw (stats) -- (machines);
   \draw (machines) -- (io);
 \end{tikzpicture}
-\caption{Repository-level architecture. The same discovered host list is reused
-by the deploy script path and by the MapReduce path.}
+\caption{Repository-level architecture for the MapReduce workflow.}
 \end{figure}
 
 \begin{center}
@@ -184,7 +165,7 @@ by the deploy script path and by the MapReduce path.}
 \toprule
 \textbf{Component} & \textbf{Location} & \textbf{Role} \\
 \midrule
-Wrapper scripts & \texttt{mapreduce.sh}, \texttt{run.sh} & User-facing entry points. \\
+Wrapper scripts & \texttt{mapreduce.sh} & User-facing entry point. \\
 Host discovery & \codepath{scripts/make_hosts} & Builds \codepath{hosts.txt}. \\
 Orchestrator & \codepath{scripts/mapreduce} & Builds workers, deploys them, coordinates phases, merges results. \\
 Worker & \codepath{scripts/worker} & HTTP server that performs load, map, reduce, and result serving. \\
@@ -194,23 +175,6 @@ Kafka path & \codepath{kafka/*} & Separate comparison setup. \\
 \bottomrule
 \end{tabularx}
 \end{center}
-
-\subsection{Deploy script}
-
-The deploy script path is the simpler of the two systems. \texttt{run.sh}
-performs four steps:
-
-\begin{enumerate}[leftmargin=1.5em]
-  \item fetch \(N\) available hosts with \codepath{scripts/make_hosts};
-  \item execute the commands from \texttt{manifest.json} on each host;
-  \item collect the configured remote outputs;
-  \item execute cleanup commands even if a previous step fails.
-\end{enumerate}
-
-In the current repository state, \texttt{manifest.json} starts a Python HTTP
-server on each machine, then collects \texttt{hostname}, \texttt{uptime}, and
-\texttt{free -m}. The implementation is intentionally generic: only the
-manifest changes, not the deploy tool itself.
 
 \subsection{Map Reduce implementation}
 
@@ -222,8 +186,9 @@ inside the cluster. Instead, the local machine:
 \begin{enumerate}[leftmargin=1.5em]
   \item reads \texttt{hosts.txt};
   \item builds a Linux worker binary with the selected job already linked in;
-  \item deploys that binary to every candidate host;
-  \item starts each worker as an HTTP server;
+  \item deploys that binary only to the initial active hosts;
+  \item starts each worker as an HTTP server, deploying additional spare hosts
+  only when recovery needs them;
   \item assigns input, broadcasts phases, and merges the final output locally.
 \end{enumerate}
 
@@ -233,13 +198,13 @@ job. This matters because the partition function is
 \mathrm{FNV32a}(key) \bmod N.
 \]
 If a machine dies, the coordinator preserves the logical slot number and
-reassigns that slot to a spare or to a surviving worker host.
+reassigns that slot to an on-demand spare or to a surviving worker host.
 
 \subsubsection{Worker API and phase sequence}
 
 \begin{center}
 \small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.0cm} >{\raggedright\arraybackslash}p{1.0cm} X}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.0cm} >{\raggedright\arraybackslash}p{2.0cm} X}
 \toprule
 \textbf{Endpoint} & \textbf{Method} & \textbf{Role} \\
 \midrule
@@ -353,10 +318,10 @@ shuffle decoding.
 \subsubsection{Crash behavior and remaining problems}
 
 The coordinator tracks logical slots rather than binding forever to one host. If
-a host fails, the slot can be rebound to a spare host or to a surviving active
-worker. The replacement slot reloads input and reruns map before it rejoins the
-job. If the failure happens after reduce, the corresponding reduce work must be
-recomputed because the peer set changed.
+a host fails, the slot can be rebound to a spare host that is deployed on demand
+or to a surviving active worker. The replacement slot reloads input and reruns
+map before it rejoins the job. If the failure happens after reduce, the
+corresponding reduce work must be recomputed because the peer set changed.
 
 The main remaining problems are:
 \begin{itemize}[leftmargin=1.5em]

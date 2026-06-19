@@ -1,14 +1,7 @@
-# SLR Project P4 — Distributed MapReduce & Remote Stats Collection
+# SLR Project P4 — Distributed MapReduce
 
-This project provides two independent distributed workflows that operate over a
-pool of remote lab machines (`*.enst.fr`):
-
-| Script         | Purpose                                                                                   |
-| -------------- | ----------------------------------------------------------------------------------------- |
-| `mapreduce.sh` | Run a distributed MapReduce job across N remote workers; the built-in job is word count   |
-| `run.sh`       | Deploy an HTTP server to remote hosts, collect system stats, then clean up                |
-
-Both workflows are written in Go and share a common `hosts.txt` discovery mechanism.
+This project provides a distributed MapReduce workflow that runs across a pool
+of remote lab machines (`*.enst.fr`).
 
 ---
 
@@ -16,16 +9,11 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 ```
 .
-├── manifest.json       # Configuration for deploy/collect/cleanup tools
 ├── hosts.txt           # Auto-generated list of available remote hosts
 ├── mapreduce.sh        # Entry point for the MapReduce pipeline
-├── run.sh              # Entry point for the stats-collection pipeline
 ├── scripts/
     ├── go.mod
     ├── make_hosts/     # Fetches available hosts from tp.telecom-paris.fr
-    ├── deploy/         # Copies files to NFS and runs commands via SSH
-    ├── collect/        # Collects stats from remote hosts via SSH
-    ├── cleanup/        # Runs cleanup commands and removes NFS files
     ├── mrjob/          # Shared Mapper / Reducer interfaces for custom jobs
     ├── jobs/           # Reference and user-provided MapReduce job packages
     ├── mapreduce/      # Client-side MapReduce orchestrator
@@ -70,6 +58,10 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 The output file contains one `word<TAB>count` line per word, sorted by
 descending count then alphabetically.
+
+`mapreduce.sh` fetches a host pool of `2 * -n` machines into `hosts.txt` so the
+orchestrator has cold spares available while still running with only `-n`
+active slots.
 
 ### MapReduce Jobs Beyond Word Count
 
@@ -121,62 +113,6 @@ By default, it writes:
 - Per-job logs under `run/commoncrawl_jobs/logs/<timestamp>/`
 - Timing CSV under `run/commoncrawl_jobs/timings_<timestamp>.csv`
 
-### Remote Stats Collection
-
-```bash
-./run.sh
-```
-
-Connects to 100 hosts, starts an HTTP server on each, collects `hostname`,
-`uptime`, and memory stats, writes them to `stats.txt`, and cleans everything
-up on exit.
-
-For a simple phase-by-phase benchmark of this deployment path, use:
-
-```bash
-experiments/run_deploy_benchmark.sh -n 100 -parallel-values "4 8 16 32" -reps 3
-```
-
-It reuses one fetched host pool, times `deploy`, `collect`, and `cleanup`
-separately, and writes `experiments/deploy-results.csv` with:
-
-```csv
-parallel,run,deploy_seconds,collect_seconds,cleanup_seconds,total_seconds,status
-```
-
----
-
-## Configuration — `manifest.json`
-
-```json
-{
-  "nfs": "",
-  "files": [],
-  "n": 100,
-  "commands": [
-    "nohup python3 -m http.server 8080 </dev/null >/tmp/httpserver.log 2>&1 & echo $! > /tmp/httpserver.pid"
-  ],
-  "collect_commands": ["hostname", "uptime", "free -m | head -2"],
-  "cleanup_commands": [
-    "kill $(cat /tmp/httpserver.pid) 2>/dev/null || true",
-    "rm -f /tmp/httpserver.pid /tmp/httpserver.log",
-    "kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true",
-    "rm -f /tmp/mr-worker.pid /tmp/mr-worker.log /tmp/mr-worker"
-  ]
-}
-```
-
-| Field              | Used by             | Description                                   |
-| ------------------ | ------------------- | --------------------------------------------- |
-| `nfs`              | `deploy`, `cleanup` | SCP destination for shared files              |
-| `files`            | `deploy`, `cleanup` | Local files to copy to the NFS share          |
-| `n`                | all                 | Max number of hosts (0 = all)                 |
-| `commands`         | `deploy`            | Shell commands run on each host after deploy  |
-| `collect_commands` | `collect`           | Commands whose output is saved to `stats.txt` |
-| `cleanup_commands` | `cleanup`           | Commands run on each host to clean up         |
-
----
-
 ## Components
 
 ### `make_hosts`
@@ -186,36 +122,6 @@ machines and writes the first `-n` entries to a local file.
 
 ```
 make_hosts -n 10 -f hosts.txt
-```
-
-### `deploy`
-
-Copies files to an NFS share (via `scp`) and then SSH-executes `commands`
-on each host in parallel. SSH/SCP fan-out is bounded by the `-parallel` flag
-(default: `16`), and SCP uses connection reuse plus a total timeout so one slow
-copy cannot stall the full deployment indefinitely.
-
-```
-deploy -m manifest.json -h hosts.txt [-parallel 16]
-```
-
-### `collect`
-
-SSH-runs `collect_commands` on each host in parallel and writes a
-per-host report to an output file. Remote collection also uses the bounded
-`-parallel` fan-out to avoid overwhelming the client machine or SSH gateway.
-
-```
-collect -m manifest.json -h hosts.txt -o stats.txt [-parallel 16]
-```
-
-### `cleanup`
-
-SSH-runs `cleanup_commands` on each host in parallel and removes deployed
-files from the NFS share. Cleanup uses the same bounded `-parallel` SSH fan-out.
-
-```
-cleanup -m manifest.json -h hosts.txt [-parallel 16]
 ```
 
 ### `worker`
@@ -252,50 +158,7 @@ Coordinates the full pipeline from the client machine:
 
 ## Sequence Diagrams
 
-### 1. Stats-Collection Pipeline (`run.sh`)
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant run.sh
-    participant make_hosts
-    participant deploy
-    participant collect
-    participant cleanup
-    participant Hosts as Remote Hosts (×N)
-
-    User->>run.sh: ./run.sh
-    run.sh->>make_hosts: -n 100 -f hosts.txt
-    make_hosts->>tp.telecom-paris.fr: GET /ajax.php
-    tp.telecom-paris.fr-->>make_hosts: available hosts JSON
-    make_hosts-->>run.sh: hosts.txt written
-
-    run.sh->>deploy: -m manifest.json -h hosts.txt
-    par for each host (parallel)
-        deploy->>Hosts: SSH: run commands (start HTTP server)
-        Hosts-->>deploy: OK
-    end
-    deploy-->>run.sh: done
-
-    run.sh->>collect: -m manifest.json -h hosts.txt -o stats.txt
-    par for each host (parallel)
-        collect->>Hosts: SSH: hostname && uptime && free -m
-        Hosts-->>collect: output
-    end
-    collect-->>run.sh: stats.txt written
-
-    run.sh->>cleanup: -m manifest.json -h hosts.txt
-    par for each host (parallel)
-        cleanup->>Hosts: SSH: kill HTTP server & remove files
-        Hosts-->>cleanup: OK
-    end
-    cleanup-->>run.sh: done
-    run.sh-->>User: All done. Stats are in stats.txt
-```
-
----
-
-### 2. MapReduce Pipeline
+### 1. MapReduce Pipeline
 
 ```mermaid
 sequenceDiagram
@@ -351,7 +214,7 @@ sequenceDiagram
 
 ---
 
-### 3. Intermediate Data Pull Detail
+### 2. Intermediate Data Pull Detail
 
 This diagram zooms in on how intermediate data flows during the reduce phase for a 3-worker example.
 
@@ -429,9 +292,8 @@ Orchestrator: Collect phase
 | `Reducer.Reduce`  | Returns `len(values)` as a string (counts occurrences)                              |
 
 The map and reduce functions are pluggable via the `MapFunc` / `ReduceFunc` type
-aliases, so the worker can be adapted to other jobs. The active CLI does not yet
-expose a `-job` flag; changing jobs currently means building the worker with a
-different `newServer(mapFn, reduceFn, workDir)` binding. See [docs/JOBS.md](docs/JOBS.md).
+aliases, so the worker can be adapted to other jobs. The active CLI exposes `-job`, so the orchestrator builds the worker with the
+selected job package on each run. See [docs/JOBS.md](docs/JOBS.md).
 
 ---
 
@@ -445,13 +307,10 @@ cd scripts && go build -o /tmp/mr-worker ./worker/
 
 # Build any other tool
 cd scripts && go build -o /tmp/mapreduce ./mapreduce/
-cd scripts && go build -o /tmp/deploy    ./deploy/
-cd scripts && go build -o /tmp/collect   ./collect/
-cd scripts && go build -o /tmp/cleanup   ./cleanup/
 cd scripts && go build -o /tmp/make_hosts ./make_hosts/
 
 # Vet everything
-cd scripts && go vet ./worker/ ./mapreduce/ ./deploy/ ./collect/ ./cleanup/ ./make_hosts/
+cd scripts && go vet ./worker/ ./mapreduce/ ./make_hosts/
 ```
 
 The `mapreduce` orchestrator cross-compiles the worker automatically
@@ -604,31 +463,30 @@ The orchestrator uses a **slot-based coordinator** with a **spare pool**:
 - `N` (target `-n`) logical slots initially map 1:1 to physical hosts.
   Partitioning uses `FNV-32a(key) % N`, so `N` is fixed for the duration of
   the job even if failures later force multiple slots onto the same host.
-- Hosts beyond `N` in `hosts.txt` become **spares** — kept healthy and
-  ready to replace any slot whose host fails.
+- Hosts beyond `N` in `hosts.txt` become **cold spares** — they are not
+  deployed at startup, and are deployed only if a slot host must be replaced.
 - Every worker call (`/load`, `/map`, `/reduce`, `/result`) is bound to a
   `context.Context` so it can be cancelled promptly.
-- A background **health watcher** polls `GET /health` on every active and
-  spare host every `-health-interval` (default 5 s). Two consecutive failures
-  mark a host dead so it will not be reused.
+- A background **health watcher** polls `GET /health` on every active slot host
+  every `-health-interval` (default 5 s). Two consecutive failures mark a host
+  dead so it will not be reused.
 
 | Scenario                                                    | Behaviour                                                                                                                                                |
 | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Worker not reachable at startup                             | `waitHealthy` retries 30× / 2 s; survivors form slot+spare pool                                                                                          |
+| Worker not reachable at startup                             | Startup deploys only enough workers to fill `-n`; each candidate gets `waitHealthy` 6× / 2 s with a 5 s per-probe timeout, and later hosts remain cold spares |
 | SCP / SSH failure (deploy)                                  | Failed hosts are skipped; deployment continues with the hosts that came up successfully                                                                  |
-| Worker returns 5xx during map/reduce                        | Calling host is replaced from a spare when available, otherwise the slot is rebound to a surviving healthy worker; `/load` → `/map` (→ `/reduce`) replay |
+| Worker returns 5xx during map/reduce                        | Calling host is replaced from a cold spare when available (deploy + health-check on demand), otherwise the slot is rebound to a surviving healthy worker; `/load` → `/map` (→ `/reduce`) replay |
 | Worker dies → peer's `/reduce` 5xx with `fetch from slot X` | Coordinator blames slot `X` (not the caller), reassigns it, then re-runs `/reduce` on all surviving slots with the updated peer list                    |
-| Transport error / timeout on a slot                         | Same as above; the failed slot is moved to a spare or surviving worker                                                                                   |
+| Transport error / timeout on a slot                         | Same as above; the failed slot is moved to a cold spare or surviving worker                                                                              |
 | Map/reduce phase times out                                  | 60 min HTTP client timeout per worker; failure triggers slot replacement                                                                                 |
 | Data upload times out                                       | 30 min HTTP client timeout for `/load`; failure triggers slot replacement                                                                                |
 | `/intermediate` fetch failure                               | 10 min worker-internal timeout; worker returns 500 to its `/reduce` caller; orchestrator identifies the dead peer                                        |
-| `run.sh` receives SIGINT/SIGTERM                            | `trap cleanup EXIT` kills remote processes                                                                                                               |
 
 ### Tunable flags (orchestrator)
 
 | Flag               | Default | Purpose                                                         |
 | ------------------ | ------- | --------------------------------------------------------------- |
-| `-n`               | 0       | Target number of active slots; extras in `hosts.txt` are spares |
+| `-n`               | 0       | Target number of active slots; extras in `hosts.txt` are cold spares |
 | `-commoncrawl`     | false   | Use the official Common Crawl website instead of a local file   |
 | `-crawl`           | latest  | Override the Common Crawl ID for deterministic runs             |
 | `-files-limit`     | 0       | Cap the number of Common Crawl WET files selected               |

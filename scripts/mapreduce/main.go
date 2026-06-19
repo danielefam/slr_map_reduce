@@ -4,16 +4,16 @@
 //
 //  1. Read N hosts from hosts.txt (or -hosts flag)
 //  2. Build the worker binary
-//  3. SCP the binary to each node
-//  4. SSH each node to start the worker HTTP server (nohup)
-//  5. Wait for all workers to pass the health check
+//  3. SCP the binary to the initial active nodes
+//  4. SSH those nodes to start the worker HTTP server (nohup)
+//  5. Wait for the active workers to pass the health check
 //  6. Split a local input file into 64 MB chunks or resolve Common Crawl WET URLs
 //     and assign them to workers
 //  7. Broadcast POST /map  (with peer list) — wait for all to finish
 //  8. Broadcast POST /reduce               — wait for all to finish
 //  9. GET /result from every worker, merge-sort, write to output file
 //
-// 10. SSH cleanup: kill worker processes
+// 10. SSH cleanup: kill worker processes on every touched host
 //
 // Usage:
 //
@@ -47,13 +47,13 @@ import (
 const (
 	chunkSize    = 64 * 1024 * 1024 // 64 MB
 	workerBinary = "/tmp/mr-worker"
-	healthRetry  = 30
+	healthRetry  = 6
 	healthDelay  = 2 * time.Second
 )
 
 // HTTP clients with appropriate timeouts for each operation class.
 var (
-	shortClient         = &http.Client{Timeout: 30 * time.Second} // health checks
+	shortClient         = &http.Client{Timeout: 5 * time.Second}  // health checks
 	dataClient          = &http.Client{Timeout: 30 * time.Minute} // data upload/load
 	longClient          = &http.Client{Timeout: 60 * time.Minute} // map, reduce, collect
 	commonCrawlIndexURL = "https://index.commoncrawl.org/collinfo.json"
@@ -110,10 +110,6 @@ func run() error {
 		return fmt.Errorf("read hosts: %w", err)
 	}
 	nWorkers := len(hosts)
-	peers := make([]string, nWorkers)
-	for i, h := range hosts {
-		peers[i] = h + ":" + *port
-	}
 
 	var coord *coordinator
 	var deployedHosts []string
@@ -133,6 +129,11 @@ func run() error {
 
 	log.Printf("candidate workers: %d (target -n=%d)", nWorkers, *n)
 
+	target := *n
+	if target <= 0 || target > nWorkers {
+		target = nWorkers
+	}
+
 	// ── Step 1: build worker binary ────────────────────────────────────────
 	log.Println("building worker binary…")
 	workerBuildPath, err := buildWorker(*jobPath)
@@ -141,39 +142,27 @@ func run() error {
 	}
 	defer os.Remove(workerBuildPath)
 
-	// ── Step 2: SCP binary to every node ───────────────────────────────────
-	log.Println("deploying worker binary…")
-	hosts, peers, err = deployWorker(hosts, peers, workerBuildPath, *port, *parallel, *workerPprof)
+	// ── Step 2: deploy only the initial active workers ─────────────────────
+	log.Printf("deploying up to %d initial worker(s)…", target)
+	activeHosts, activePeers, sparePeers, err := deployInitialWorkers(hosts, *port, workerBuildPath, target, *workerPprof)
 	if err != nil {
 		return fmt.Errorf("deploy failed: %w", err)
 	}
-	deployedHosts = append([]string(nil), hosts...)
-	log.Printf("deployed to %d workers", len(hosts))
+	deployedHosts = append([]string(nil), activeHosts...)
+	log.Printf("%d workers ready", len(activePeers))
+	log.Printf("using %d active slots + %d cold spares (target -n=%d)",
+		len(activePeers), len(sparePeers), *n)
 
-	// ── Step 3: health-check all workers ───────────────────────────────────
-	log.Println("waiting for workers to become ready…")
-	hosts, peers, err = waitHealthy(hosts, peers, *parallel)
-	if err != nil {
-		return fmt.Errorf("health check: %w", err)
+	activateSpare := func(peer string) error {
+		host, _, found := strings.Cut(peer, ":")
+		if !found {
+			host = peer
+		}
+		return activateWorker(host, peer, workerBuildPath, *workerPprof)
 	}
-	deployedHosts = append(deployedHosts[:0], hosts...)
-	log.Printf("%d workers ready", len(hosts))
-
-	// Decide how many slots (N) and which hosts are spares.
-	target := *n
-	if target <= 0 || target > len(hosts) {
-		target = len(hosts)
-	}
-	if target > len(hosts) {
-		return fmt.Errorf("need at least %d healthy workers but only %d are ready", target, len(hosts))
-	}
-	slotPeers := peers[:target]
-	sparePeers := append([]string(nil), peers[target:]...)
-	log.Printf("using %d active slots + %d spares (target -n=%d)",
-		len(slotPeers), len(sparePeers), *n)
 
 	// Assemble the coordinator.
-	coord = newCoordinator(slotPeers, sparePeers, *maxAttempts, *backoffInitial, *healthInterval)
+	coord = newCoordinator(activePeers, sparePeers, *maxAttempts, *backoffInitial, *healthInterval, activateSpare)
 
 	// ── Step 4: assign input to slots ───────────────────────────────────────
 	log.Println("preparing slot inputs…")
@@ -325,54 +314,64 @@ func buildWorker(jobPath string) (string, error) {
 	return out, nil
 }
 
-// deployWorker SCPs the worker binary to each host and starts the HTTP server.
-// It returns the subset of hosts and peers that were successfully deployed.
-// An error is returned only if every host fails.
-func deployWorker(hosts, peers []string, workerBuildPath, port string, parallel int, withPprof bool) ([]string, []string, error) {
-	type result struct {
-		host string
-		peer string
-		err  error
-	}
-	results := make([]result, len(hosts))
-	indexes := make([]int, len(hosts))
-	for i := range hosts {
-		indexes[i] = i
-	}
-	remote.RunBounded(indexes, parallel, func(idx int) {
-		host := hosts[idx]
-		peer := peers[idx]
-		results[idx] = result{host: host, peer: peer}
-		remoteBinary := fmt.Sprintf("%s.deploy-%d", workerBinary, time.Now().UnixNano()+int64(idx))
-		if err := scpTo(workerBuildPath, host, remoteBinary); err != nil {
-			results[idx].err = fmt.Errorf("scp to %s: %w", host, err)
-			return
-		}
-		startCmd := fmt.Sprintf(
-			"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "+
-				"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log %s && "+
-				"mv %s %s && chmod +x %s && nohup %s -port %s%s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
-			workerBinary, remoteBinary, workerBinary, workerBinary, workerBinary, port, pprofArg(withPprof))
-		_, err := sshRun(host, []string{startCmd})
-		if err != nil {
-			_, _ = sshRun(host, []string{"rm -f " + remoteBinary})
-			results[idx].err = fmt.Errorf("ssh start on %s: %w", host, err)
-		}
-	})
+func deployInitialWorkers(hosts []string, port, workerBuildPath string, target int, withPprof bool) ([]string, []string, []string, error) {
+	activeHosts := make([]string, 0, target)
+	activePeers := make([]string, 0, target)
 
-	var goodHosts, goodPeers []string
-	for _, r := range results {
-		if r.err != nil {
-			log.Printf("[deploy] skipping %s: %v", r.host, r.err)
-		} else {
-			goodHosts = append(goodHosts, r.host)
-			goodPeers = append(goodPeers, r.peer)
+	for i, host := range hosts {
+		if len(activePeers) == target {
+			return activeHosts, activePeers, peersForHosts(hosts[i:], port), nil
 		}
+		peer := host + ":" + port
+		if err := activateWorker(host, peer, workerBuildPath, withPprof); err != nil {
+			log.Printf("[startup] skipping %s: %v", peer, err)
+			continue
+		}
+		activeHosts = append(activeHosts, host)
+		activePeers = append(activePeers, peer)
 	}
-	if len(goodHosts) == 0 {
-		return nil, nil, fmt.Errorf("all %d hosts failed to deploy", len(hosts))
+	if len(activePeers) < target {
+		return nil, nil, nil, fmt.Errorf("need at least %d healthy workers but only %d are ready", target, len(activePeers))
 	}
-	return goodHosts, goodPeers, nil
+	return activeHosts, activePeers, nil, nil
+}
+
+func activateWorker(host, peer, workerBuildPath string, withPprof bool) error {
+	if err := deployWorker(host, peer, workerBuildPath, withPprof); err != nil {
+		return err
+	}
+	readyHosts, _, err := waitHealthy([]string{host}, []string{peer}, 1)
+	if err == nil && len(readyHosts) == 1 {
+		return nil
+	}
+	cleanupWorkers([]string{host}, 1)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%s did not become ready", peer)
+}
+
+// deployWorker SCPs the worker binary to one host and starts the HTTP server.
+func deployWorker(host, peer, workerBuildPath string, withPprof bool) error {
+	remoteBinary := fmt.Sprintf("%s.deploy-%d", workerBinary, time.Now().UnixNano())
+	if err := scpTo(workerBuildPath, host, remoteBinary); err != nil {
+		return fmt.Errorf("scp to %s: %w", host, err)
+	}
+	_, port, found := strings.Cut(peer, ":")
+	if !found {
+		return fmt.Errorf("peer %q is missing port", peer)
+	}
+	startCmd := fmt.Sprintf(
+		"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "+
+			"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log %s && "+
+			"mv %s %s && chmod +x %s && nohup %s -port %s%s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
+		workerBinary, remoteBinary, workerBinary, workerBinary, workerBinary, port, pprofArg(withPprof))
+	_, err := sshRun(host, []string{startCmd})
+	if err != nil {
+		_, _ = sshRun(host, []string{"rm -f " + remoteBinary})
+		return fmt.Errorf("ssh start on %s: %w", host, err)
+	}
+	return nil
 }
 
 func scpTo(src, host, dst string) error {
@@ -965,6 +964,14 @@ func peerHosts(peers []string) []string {
 		hosts = append(hosts, host)
 	}
 	return hosts
+}
+
+func peersForHosts(hosts []string, port string) []string {
+	peers := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		peers = append(peers, host+":"+port)
+	}
+	return peers
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────────────

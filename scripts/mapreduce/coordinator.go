@@ -7,8 +7,8 @@
 //     can be served by different physical hosts over time as we replace
 //     failed ones.
 //
-//   - Spare: a host that successfully deployed but is not assigned a slot.
-//     Used to replace failed slot hosts.
+//   - Spare: a host candidate that is not assigned a slot initially. It is
+//     deployed on demand only if a slot host needs replacement.
 //
 //   - Phase: load -> map -> reduce -> result. Replacement requires replaying
 //     the prerequisite phases on the new host.
@@ -98,10 +98,13 @@ type reduceRequest struct {
 // coordinator owns the slot table, the spare pool, and the configuration
 // knobs for fault tolerance.
 type coordinator struct {
-	mu     sync.Mutex
-	slots  []*slot
-	spares []string // peer strings ("host:port") of unused healthy hosts
-	dead   map[string]struct{}
+	mu      sync.Mutex
+	slots   []*slot
+	spares  []string // peer strings ("host:port") of unused cold spare candidates
+	dead    map[string]struct{}
+	touched map[string]struct{} // peers where a worker was actually started
+
+	activateSpare func(string) error
 
 	maxAttempts    int
 	backoffInitial time.Duration
@@ -119,11 +122,13 @@ type coordinator struct {
 	healthMu       sync.Mutex
 }
 
-func newCoordinator(slotHosts, spareHosts []string, maxAttempts int, backoffInitial, healthInterval time.Duration) *coordinator {
+func newCoordinator(slotHosts, spareHosts []string, maxAttempts int, backoffInitial, healthInterval time.Duration, activateSpare func(string) error) *coordinator {
 	c := &coordinator{
 		slots:          make([]*slot, len(slotHosts)),
 		spares:         append([]string(nil), spareHosts...),
 		dead:           make(map[string]struct{}),
+		touched:        make(map[string]struct{}, len(slotHosts)),
+		activateSpare:  activateSpare,
 		maxAttempts:    maxAttempts,
 		backoffInitial: backoffInitial,
 		backoffMax:     5 * time.Second,
@@ -132,6 +137,7 @@ func newCoordinator(slotHosts, spareHosts []string, maxAttempts int, backoffInit
 	}
 	for i, h := range slotHosts {
 		c.slots[i] = &slot{id: i, host: h, state: sPending}
+		c.touched[h] = struct{}{}
 	}
 	return c
 }
@@ -167,12 +173,12 @@ func (c *coordinator) mapPeers() []string {
 	return out
 }
 
-// allHosts returns slot hosts + spare hosts, used by the health watcher.
+// allHosts returns the active slot hosts used by the health watcher.
 func (c *coordinator) allHosts() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	hosts := make([]string, 0, len(c.slots)+len(c.spares))
-	seen := make(map[string]struct{}, len(c.slots)+len(c.spares))
+	hosts := make([]string, 0, len(c.slots))
+	seen := make(map[string]struct{}, len(c.slots))
 	for _, s := range c.slots {
 		s.mu.Lock()
 		if s.host != "" {
@@ -183,55 +189,63 @@ func (c *coordinator) allHosts() []string {
 		}
 		s.mu.Unlock()
 	}
-	for _, host := range c.spares {
-		if _, ok := seen[host]; ok {
-			continue
-		}
-		seen[host] = struct{}{}
-		hosts = append(hosts, host)
-	}
 	return hosts
 }
 
-// hostsForCleanup returns every host the coordinator has touched, including
-// dead ones, so the orchestrator can attempt cleanup everywhere.
+// hostsForCleanup returns every host where a worker was started so the
+// orchestrator can attempt cleanup everywhere it actually deployed.
 func (c *coordinator) hostsForCleanup() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	seen := make(map[string]struct{})
-	for _, s := range c.slots {
-		s.mu.Lock()
-		if s.host != "" {
-			seen[s.host] = struct{}{}
-		}
-		s.mu.Unlock()
-	}
-	for _, p := range c.spares {
-		seen[p] = struct{}{}
-	}
-	for h := range c.dead {
-		seen[h] = struct{}{}
-	}
-	out := make([]string, 0, len(seen))
-	for h := range seen {
+	out := make([]string, 0, len(c.touched))
+	for h := range c.touched {
 		out = append(out, h)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// claimSpare pops a spare host, skipping any that we already marked dead.
-func (c *coordinator) claimSpare() (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i, h := range c.spares {
-		if _, dead := c.dead[h]; dead {
-			continue
-		}
-		c.spares = append(c.spares[:i], c.spares[i+1:]...)
-		return h, true
+func (c *coordinator) markTouched(host string) {
+	if host == "" {
+		return
 	}
-	return "", false
+	c.mu.Lock()
+	c.touched[host] = struct{}{}
+	c.mu.Unlock()
+}
+
+// claimSpare activates a cold spare host, skipping any that we already marked dead.
+func (c *coordinator) claimSpare() (string, bool) {
+	for {
+		c.mu.Lock()
+		claimIdx := -1
+		candidate := ""
+		for i, h := range c.spares {
+			if _, dead := c.dead[h]; dead {
+				continue
+			}
+			claimIdx = i
+			candidate = h
+			break
+		}
+		if claimIdx >= 0 {
+			c.spares = append(c.spares[:claimIdx], c.spares[claimIdx+1:]...)
+		}
+		c.mu.Unlock()
+
+		if claimIdx < 0 {
+			return "", false
+		}
+		if c.activateSpare != nil {
+			if err := c.activateSpare(candidate); err != nil {
+				log.Printf("[spare %s] activation failed: %v", candidate, err)
+				c.markDead(candidate)
+				continue
+			}
+		}
+		c.markTouched(candidate)
+		return candidate, true
+	}
 }
 
 // claimActiveHost picks a currently healthy slot host to temporarily own another
@@ -678,8 +692,8 @@ func allAtLeast(slots []*slot, target slotState) bool {
 
 // ── health watcher ──────────────────────────────────────────────────────────
 
-// watchHealth runs until ctx is cancelled, polling /health on every slot host
-// and spare. A host that fails two consecutive polls is marked dead; the
+// watchHealth runs until ctx is cancelled, polling /health on every active slot
+// host. A host that fails two consecutive polls is marked dead; the
 // matching slot (if any) is forced into replacement on its next phase attempt.
 //
 // The watcher does NOT cancel in-flight phase requests directly — that adds

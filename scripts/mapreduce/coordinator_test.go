@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -173,7 +174,7 @@ func startFake(t *testing.T, n, spareCount int) (workers []*fakeWorker, slotPeer
 
 func TestCoordinator_HappyPath(t *testing.T) {
 	workers, slots, spares := startFake(t, 3, 0)
-	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
+	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second, nil)
 	for i, s := range c.slots {
 		s.urls = []string{fmt.Sprintf("https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x%d.wet.gz", i)}
 	}
@@ -201,7 +202,7 @@ func TestCoordinator_HappyPath(t *testing.T) {
 func TestCoordinator_ReplaceOnMapTransportError(t *testing.T) {
 	// Slot 1's host will close mid-test; coordinator should pick up the spare.
 	workers, slots, spares := startFake(t, 3, 2)
-	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
+	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second, nil)
 	for _, s := range c.slots {
 		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
 	}
@@ -227,7 +228,7 @@ func TestCoordinator_ReplacePeerOnReduceFailure(t *testing.T) {
 	// All map fine. Then worker[1] dies; worker[0]'s reduce returns 500 with
 	// "fetch from peer <worker1>". Coordinator must blame worker[1], not 0.
 	workers, slots, spares := startFake(t, 3, 2)
-	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
+	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second, nil)
 	for _, s := range c.slots {
 		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
 	}
@@ -274,7 +275,7 @@ func TestCoordinator_ReplacePeerOnReduceFailure(t *testing.T) {
 
 func TestCoordinator_ReassignsToActiveWorkerWhenNoSpareRemains(t *testing.T) {
 	workers, slots, spares := startFake(t, 2, 0) // zero spares
-	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second)
+	c := newCoordinator(slots, spares, 4, 10*time.Millisecond, time.Second, nil)
 	for _, s := range c.slots {
 		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
 	}
@@ -332,7 +333,7 @@ func TestExtractFailedPeer(t *testing.T) {
 }
 
 func TestCoordinator_MergeResults(t *testing.T) {
-	c := newCoordinator([]string{"x"}, nil, 1, time.Millisecond, time.Second)
+	c := newCoordinator([]string{"x"}, nil, 1, time.Millisecond, time.Second, nil)
 	c.slots[0].result = []KeyValue{{"a", "3"}, {"b", "1"}}
 	// Add a second virtual slot to test merge across slots.
 	c.slots = append(c.slots, &slot{id: 1, result: []KeyValue{{"a", "2"}, {"c", "5"}}})
@@ -351,6 +352,53 @@ func TestCoordinator_MergeResults(t *testing.T) {
 	want := "a\t5\nc\t5\nb\t1"
 	if got != want {
 		t.Errorf("merge output:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestCoordinator_ActivatesColdSpareOnReplacement(t *testing.T) {
+	workers, slots, _ := startFake(t, 2, 0)
+	cold := newFakeWorker()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	coldHost := ln.Addr().String()
+	activated := make(chan struct{}, 1)
+	activate := func(peer string) error {
+		if peer != coldHost {
+			return fmt.Errorf("activate peer %s, want %s", peer, coldHost)
+		}
+		cold.srv = &httptest.Server{Listener: ln, Config: &http.Server{Handler: cold.handler()}}
+		cold.srv.Start()
+		activated <- struct{}{}
+		return nil
+	}
+	c := newCoordinator(slots, []string{coldHost}, 4, 10*time.Millisecond, time.Second, activate)
+	for _, s := range c.slots {
+		s.urls = []string{"https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-01/x.wet.gz"}
+	}
+	t.Cleanup(func() {
+		if cold.srv != nil {
+			cold.srv.Close()
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	mustDrive(t, c, ctx, sMapped, "map")
+
+	workers[1].srv.Close()
+	workers[1].srv = nil
+
+	mustDrive(t, c, ctx, sReduced, "reduce")
+
+	select {
+	case <-activated:
+	default:
+		t.Fatal("expected cold spare activation during replacement")
+	}
+	if got := c.slots[1].host; got != coldHost {
+		t.Fatalf("slot 1 host = %s, want cold spare %s", got, coldHost)
 	}
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the full MapReduce pipeline:
-#   1. Fetch available hosts
+#   1. Fetch a host pool (2× the requested worker count)
 #   2. Run the mapreduce client (builds worker, deploys, map→shuffle→reduce→collect)
 #   3. Cleanup is handled by the mapreduce client itself
 #
@@ -28,16 +28,46 @@ PORT=9090
 # Parse flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -job)          JOB="$2";            shift 2 ;;
-    -input)        INPUT="$2";          shift 2 ;;
-    -commoncrawl)  USE_COMMONCRAWL=1;   shift   ;;
-    -crawl)        CRAWL="$2";          shift 2 ;;
-    -files-limit)  FILES_LIMIT="$2";    shift 2 ;;
-    -chunks-limit) CHUNKS_LIMIT="$2";   shift 2 ;;
-    -output)       OUTPUT="$2";         shift 2 ;;
-    -n)            N="$2";              shift 2 ;;
-    -port)         PORT="$2";           shift 2 ;;
-    *) echo "Unknown flag: $1" >&2; exit 1 ;;
+  -job)
+    JOB="$2"
+    shift 2
+    ;;
+  -input)
+    INPUT="$2"
+    shift 2
+    ;;
+  -commoncrawl)
+    USE_COMMONCRAWL=1
+    shift
+    ;;
+  -crawl)
+    CRAWL="$2"
+    shift 2
+    ;;
+  -files-limit)
+    FILES_LIMIT="$2"
+    shift 2
+    ;;
+  -chunks-limit)
+    CHUNKS_LIMIT="$2"
+    shift 2
+    ;;
+  -output)
+    OUTPUT="$2"
+    shift 2
+    ;;
+  -n)
+    N="$2"
+    shift 2
+    ;;
+  -port)
+    PORT="$2"
+    shift 2
+    ;;
+  *)
+    echo "Unknown flag: $1" >&2
+    exit 1
+    ;;
   esac
 done
 
@@ -75,8 +105,10 @@ if [[ -z "$INPUT" && "$USE_COMMONCRAWL" -eq 0 ]]; then
   exit 1
 fi
 
-echo "=== Step 1: Fetching hosts ==="
-(cd "$SCRIPTS" && go run ./make_hosts -n "$N" -f "$HOSTS")
+HOST_POOL_SIZE=$((N * 2))
+
+echo "=== Step 1: Fetching $HOST_POOL_SIZE hosts for $N active workers ==="
+(cd "$SCRIPTS" && go run ./make_hosts -n "$HOST_POOL_SIZE" -f "$HOSTS")
 
 echo ""
 echo "=== Step 2: Running MapReduce ==="
@@ -85,8 +117,8 @@ EXTRA_FLAGS=()
 if [[ "$USE_COMMONCRAWL" -eq 1 ]]; then
   EXTRA_FLAGS+=(-commoncrawl)
   [[ -n "$CRAWL" ]] && EXTRA_FLAGS+=(-crawl "$CRAWL")
-  (( FILES_LIMIT > 0 )) && EXTRA_FLAGS+=(-files-limit "$FILES_LIMIT")
-  (( CHUNKS_LIMIT > 0 )) && EXTRA_FLAGS+=(-chunks-limit "$CHUNKS_LIMIT")
+  ((FILES_LIMIT > 0)) && EXTRA_FLAGS+=(-files-limit "$FILES_LIMIT")
+  ((CHUNKS_LIMIT > 0)) && EXTRA_FLAGS+=(-chunks-limit "$CHUNKS_LIMIT")
 fi
 
 (cd "$SCRIPTS" && go run ./mapreduce \

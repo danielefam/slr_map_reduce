@@ -2,7 +2,7 @@
 
 **Project:** Custom distributed MapReduce in Go over remote lab machines (`*.enst.fr`)  
 **Repository:** `slr_map_reduce`  
-**Last updated:** 2026-06-14
+**Last updated:** 2026-06-19
 
 ---
 
@@ -42,13 +42,14 @@ All reducers emit integer strings to remain compatible with the orchestrator's i
 
 1. Parse flags (`-hosts`, `-job`, `-input` or `-commoncrawl`, `-n`, etc.).
 2. Build worker binary with generated job binding (`job_binding_generated.go`).
-3. Deploy binary over SSH/SCP and start remote `mr_worker` with PID tracking.
-4. Health-check workers (`/health`) and keep healthy subset.
+3. Deploy the worker binary only to the initial active hosts and start remote `mr_worker` with PID tracking.
+4. Health-check those active workers (`/health`) until `N` slots are filled; keep the remaining discovered hosts as cold spares.
 5. Load inputs (`POST /data` for local chunks, `POST /load` for WET URLs).
 6. Run map (`POST /map`) where each worker writes bucket files partitioned by reducer.
 7. Run reduce (`POST /reduce`) where each reducer pulls exactly one bucket from each peer.
 8. Collect (`GET /result`) and merge counts in orchestrator.
-9. Cleanup remote workers.
+9. If a slot host fails, deploy and health-check a cold spare on demand before replaying the needed phases for that slot.
+10. Cleanup remote workers on every host that was actually started.
 
 ### 2.3 Why integer outputs are mandatory
 
@@ -105,17 +106,18 @@ This gives O(1) bucket selection per request and O(N²) total peer requests for 
 ### 4.1 Slot model
 
 - A **slot** is a logical worker index `0..N-1`.
-- A **spare** is a deployed healthy host not currently owning a slot.
+- A **spare** is a discovered host that is not assigned a slot initially; it is deployed on demand only if a slot host must be replaced.
 - When spares run out, a healthy worker may temporarily own more than one slot so `N` stays fixed.
 - Slot state machine: `pending -> loaded -> mapped -> reduced -> done`.
 - Replacing a failed slot host resets that slot to replay required prerequisites.
 
 ### 4.2 Failure handling
 
-1. Background health watcher probes `/health` and marks hosts dead after repeated failures.
+1. Background health watcher probes `/health` on active slot hosts and marks hosts dead after repeated failures.
 2. Phase calls retry with exponential backoff and bounded attempts.
 3. Reduce failures that indicate `fetch from slot X peer ...` are attributed to slot `X`, even if multiple slots currently share the same physical host.
-4. On slot-host replacement, coordinator epoch increments and previously reduced slots are demoted to mapped (reduce replay).
+4. When a slot host fails, the coordinator first tries to deploy a cold spare on demand; if none can be activated, it falls back to rebinding the slot onto a surviving healthy worker.
+5. On slot-host replacement, coordinator epoch increments and previously reduced slots are demoted to mapped (reduce replay).
 
 This prevents stale peer topology from leaking into final reduce outputs.
 
@@ -326,7 +328,7 @@ In both paths, input staging/production happens before timer start.
    - Current mitigation: timestamped deploy temp path + move on remote.
 
 - **No remote workers become healthy**
-   - Validate SSH, port reachability, and remote `/tmp/mr-worker.log`.
+   - Validate SSH, port reachability, and remote `/tmp/mr-worker.log`. The wrapper fetches a pool of `2 * N` hosts, but only the first `N` successful startups become active workers.
 
 - **Unexpected zero output**
    - Confirm job-specific input expectations:
@@ -365,6 +367,8 @@ END{
    printf "alnum_density=%.6f\n", a/t
 }' result_docdensity.txt
 ```
+
+`mapreduce.sh` fetches `2 * N` hosts into `hosts.txt` so the orchestrator can keep cold spares available while still running with only `N` active workers.
 
 ### 10.2 Local single-worker protocol validation (used in this report)
 
