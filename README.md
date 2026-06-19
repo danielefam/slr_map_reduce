@@ -89,6 +89,37 @@ are integers and sums values with the same key. Jobs that need averages or
 ratios should emit summable counters, then derive the final metric after the
 MapReduce output is written.
 
+### Run All 4 Jobs On Common Crawl
+
+The commands below run all built-in jobs against Common Crawl and store outputs
+separately.
+
+```bash
+mkdir -p run/commoncrawl_jobs
+
+./mapreduce.sh -job scripts/jobs/wordcount  -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 1 -chunks-limit 1 -n 4 -output run/commoncrawl_jobs/wordcount_result.txt
+./mapreduce.sh -job scripts/jobs/langdetect -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 1 -chunks-limit 1 -n 4 -output run/commoncrawl_jobs/langdetect_result.txt
+./mapreduce.sh -job scripts/jobs/domainpop  -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 1 -chunks-limit 1 -n 4 -output run/commoncrawl_jobs/domainpop_result.txt
+./mapreduce.sh -job scripts/jobs/docdensity -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 1 -chunks-limit 1 -n 4 -output run/commoncrawl_jobs/docdensity_result.txt
+```
+
+If `-files-limit` (or `-chunks-limit`) is lower than `-n`, the orchestrator may
+print a warning that some workers receive no URLs. The run is still valid, but
+for more balanced work distribution you should increase the Common Crawl limits
+or reduce `-n`.
+
+For a one-command run of all four jobs plus automatic timing/log collection, use:
+
+```bash
+./run_all_commoncrawl_jobs.sh -crawl CC-MAIN-2026-21 -files-limit 1 -chunks-limit 1 -n 4
+```
+
+By default, it writes:
+
+- Outputs under `run/commoncrawl_jobs/*_result.txt`
+- Per-job logs under `run/commoncrawl_jobs/logs/<timestamp>/`
+- Timing CSV under `run/commoncrawl_jobs/timings_<timestamp>.csv`
+
 ### Remote Stats Collection
 
 ```bash
