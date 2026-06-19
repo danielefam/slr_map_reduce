@@ -21,4 +21,6 @@ vgcore.*
 *.swo
 data/
 *.txt
+*.aux
 docs/report/build/
+experiments/
