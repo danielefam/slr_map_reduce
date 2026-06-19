@@ -25,11 +25,11 @@ echo "=== Step 1: Fetching $N hosts ==="
 
 echo ""
 echo "=== Step 2: Starting HTTP servers ==="
-(cd "$SCRIPTS" && go run ./deploy -m "$MANIFEST" -h "../$HOSTS") || true
+(cd "$SCRIPTS" && go run ./deploy -m "$MANIFEST" -h "../$HOSTS")
 
 echo ""
 echo "=== Step 3: Collecting stats (1/5/15-min load + memory) ==="
-(cd "$SCRIPTS" && go run ./collect -m "$MANIFEST" -h "../$HOSTS" -o "../$STATS") || true
+(cd "$SCRIPTS" && go run ./collect -m "$MANIFEST" -h "../$HOSTS" -o "../$STATS")
 echo "Stats written to $STATS"
 
 echo ""

@@ -15,15 +15,13 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"sync"
-	"time"
+
+	"scripts/internal/remote"
 )
 
 // Manifest mirrors the deploy manifest; only the fields needed for collection are used.
@@ -42,6 +40,7 @@ func main() {
 	m := flag.String("m", "manifest.json", "path to the manifest file")
 	h := flag.String("h", "hosts.txt", "path to the file containing hosts")
 	o := flag.String("o", "stats.txt", "path to the output file")
+	parallel := flag.Int("parallel", remote.DefaultParallelism, "maximum number of concurrent SSH operations")
 	flag.Parse()
 
 	manifest, err := parseManifest(*m)
@@ -68,16 +67,15 @@ func main() {
 	fmt.Printf("Collecting stats from %d host(s)...\n", len(hosts))
 
 	results := make([]hostResult, len(hosts))
-	var wg sync.WaitGroup
-	for i, host := range hosts {
-		wg.Add(1)
-		go func(idx int, h string) {
-			defer wg.Done()
-			out, err := sshCapture(h, manifest.CollectCommands)
-			results[idx] = hostResult{host: h, output: out, err: err}
-		}(i, host)
+	indexes := make([]int, len(hosts))
+	for i := range hosts {
+		indexes[i] = i
 	}
-	wg.Wait()
+	remote.RunBounded(indexes, *parallel, func(i int) {
+		host := hosts[i]
+		out, err := sshCapture(host, manifest.CollectCommands)
+		results[i] = hostResult{host: host, output: out, err: err}
+	})
 
 	var buf bytes.Buffer
 	var failed int
@@ -107,19 +105,7 @@ func main() {
 
 // sshCapture connects to host and runs all commands, returning combined output.
 func sshCapture(host string, commands []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=5",
-		"-o", "ServerAliveCountMax=3",
-		host,
-		strings.Join(commands, " && "),
-	)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return remote.RunSSH(host, commands, remote.DefaultSSHTimeout)
 }
 
 func parseManifest(path string) (*Manifest, error) {

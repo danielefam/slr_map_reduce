@@ -26,6 +26,8 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
     ├── deploy/         # Copies files to NFS and runs commands via SSH
     ├── collect/        # Collects stats from remote hosts via SSH
     ├── cleanup/        # Runs cleanup commands and removes NFS files
+    ├── mrjob/          # Shared Mapper / Reducer interfaces for custom jobs
+    ├── jobs/           # Reference and user-provided MapReduce job packages
     ├── mapreduce/      # Client-side MapReduce orchestrator
     └── worker/         # HTTP worker server (map / reduce)
 └── docs/
@@ -44,24 +46,26 @@ Both workflows are written in Go and share a common `hosts.txt` discovery mechan
 
 ## Quick Start
 
-### Word-Count MapReduce
+### Custom MapReduce Job
 
 ```bash
-./mapreduce.sh -input /path/to/data.txt -output result.txt -n 10 -port 9090
+./mapreduce.sh -job scripts/jobs/wordcount -input /path/to/data.txt -output result.txt -n 10 -port 9090
 # or, from the official Common Crawl website:
-./mapreduce.sh -commoncrawl -crawl CC-MAIN-2026-05 -files-limit 4 -output result.txt -n 10 -port 9090
+./mapreduce.sh -job scripts/jobs/wordcount -commoncrawl -crawl CC-MAIN-2026-21 -files-limit 4 -output result.txt -n 10 -port 9090
 ```
 
-| Flag            | Default      | Description                                                                           |
-| --------------- | ------------ | ------------------------------------------------------------------------------------- |
-| `-input`        | _(optional)_ | Path to the input text file                                                           |
-| `-commoncrawl`  | _(optional)_ | Use the official Common Crawl website instead of a local file                         |
-| `-crawl`        | latest crawl | Common Crawl ID override for reproducible website-backed runs                         |
-| `-files-limit`  | `0`          | Cap the number of Common Crawl WET files selected (`0` = all)                        |
-| `-chunks-limit` | `0`          | Second Common Crawl workload cap kept for benchmark compatibility (`0` = disabled)   |
-| `-output`       | `result.txt` | Path for the merged output file                                                       |
-| `-n`            | `10`         | Number of worker nodes to use                                                         |
-| `-port`         | `9090`       | HTTP port for worker servers                                                          |
+| Flag            | Default      | Description                                                                        |
+| --------------- | ------------ | ---------------------------------------------------------------------------------- |
+| `-job`          | _(required)_ | Path to a Go package directory that exports `NewMapper()` and `NewReducer()`       |
+| `-input`        | _(optional)_ | Path to the input text file                                                        |
+| `-commoncrawl`  | _(optional)_ | Use the official Common Crawl website instead of a local file                      |
+| `-crawl`        | latest crawl | Common Crawl ID override for reproducible website-backed runs                      |
+| `-files-limit`  | `0`          | Cap the number of Common Crawl WET files selected (`0` = all)                      |
+| `-chunks-limit` | `0`          | Second Common Crawl workload cap kept for benchmark compatibility (`0` = disabled) |
+| `-output`       | `result.txt` | Path for the merged output file                                                    |
+| `-n`            | `10`         | Number of worker nodes to use                                                      |
+| `-port`         | `9090`       | HTTP port for worker servers                                                       |
+| `-parallel`     | `16`         | Max concurrent deploy/startup/health-check SSH or SCP operations                   |
 
 The output file contains one `word<TAB>count` line per word, sorted by
 descending count then alphabetically.
@@ -91,6 +95,19 @@ MapReduce output is written.
 Connects to 100 hosts, starts an HTTP server on each, collects `hostname`,
 `uptime`, and memory stats, writes them to `stats.txt`, and cleans everything
 up on exit.
+
+For a simple phase-by-phase benchmark of this deployment path, use:
+
+```bash
+experiments/run_deploy_benchmark.sh -n 100 -parallel-values "4 8 16 32" -reps 3
+```
+
+It reuses one fetched host pool, times `deploy`, `collect`, and `cleanup`
+separately, and writes `experiments/deploy-results.csv` with:
+
+```csv
+parallel,run,deploy_seconds,collect_seconds,cleanup_seconds,total_seconds,status
+```
 
 ---
 
@@ -139,28 +156,31 @@ make_hosts -n 10 -f hosts.txt
 ### `deploy`
 
 Copies files to an NFS share (via `scp`) and then SSH-executes `commands`
-on each host in parallel.
+on each host in parallel. SSH/SCP fan-out is bounded by the `-parallel` flag
+(default: `16`), and SCP uses connection reuse plus a total timeout so one slow
+copy cannot stall the full deployment indefinitely.
 
 ```
-deploy -m manifest.json -h hosts.txt
+deploy -m manifest.json -h hosts.txt [-parallel 16]
 ```
 
 ### `collect`
 
 SSH-runs `collect_commands` on each host in parallel and writes a
-per-host report to an output file.
+per-host report to an output file. Remote collection also uses the bounded
+`-parallel` fan-out to avoid overwhelming the client machine or SSH gateway.
 
 ```
-collect -m manifest.json -h hosts.txt -o stats.txt
+collect -m manifest.json -h hosts.txt -o stats.txt [-parallel 16]
 ```
 
 ### `cleanup`
 
 SSH-runs `cleanup_commands` on each host in parallel and removes deployed
-files from the NFS share.
+files from the NFS share. Cleanup uses the same bounded `-parallel` SSH fan-out.
 
 ```
-cleanup -m manifest.json -h hosts.txt
+cleanup -m manifest.json -h hosts.txt [-parallel 16]
 ```
 
 ### `worker`
@@ -168,25 +188,25 @@ cleanup -m manifest.json -h hosts.txt
 An HTTP server that holds the state for one MapReduce job. Started on each
 remote node by the `mapreduce` orchestrator.
 
-| Endpoint        | Method | Description                                                                                    |
-| --------------- | ------ | ---------------------------------------------------------------------------------------------- |
-| `/health`       | GET    | Readiness probe — returns `200 ok` when ready                                                  |
-| `/data`         | POST   | Receive a raw text chunk (the worker's input partition)                                        |
-| `/load`         | POST   | Accept a JSON payload of Common Crawl WET URLs; downloads them into the worker `workDir`       |
-| `/map`          | POST   | Run the map function on the local input; body is `{"id": N, "peers": [...]}`                  |
+| Endpoint        | Method | Description                                                                                                                         |
+| --------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `/health`       | GET    | Readiness probe — returns `200 ok` when ready                                                                                       |
+| `/data`         | POST   | Receive a raw text chunk (the worker's input partition)                                                                             |
+| `/load`         | POST   | Accept a JSON payload of Common Crawl WET URLs; downloads them into the worker `workDir`                                            |
+| `/map`          | POST   | Run the map function on the local input; body is `{"id": N, "peers": [...]}`                                                        |
 | `/intermediate` | GET    | Serve the pre-partitioned map output bucket for a reducer (`?reducer=N&n=N`) — written at map time, served in O(1) without scanning |
-| `/reduce`       | POST   | Pull intermediate KVs from all peers via `/intermediate`, then run the reduce function locally |
-| `/result`       | GET    | Download the reduce output as `key\tvalue` lines                                               |
+| `/reduce`       | POST   | Pull intermediate KVs from all peers via `/intermediate`, then run the reduce function locally                                      |
+| `/result`       | GET    | Download the reduce output as `key\tvalue` lines                                                                                    |
 
 ### `mapreduce` (orchestrator)
 
 Coordinates the full pipeline from the client machine:
 
 1. Read N hosts from `hosts.txt`
-2. Build the worker binary (`GOOS=linux GOARCH=amd64`)
-3. SCP the binary to each node
-4. SSH each node to start the worker HTTP server (`nohup`)
-5. Wait for all workers to pass the health check
+2. Build the worker binary (`GOOS=linux GOARCH=amd64`) against the required `-job` package
+3. SCP the staged binary to each node, then swap it into place remotely
+4. SSH each node to start the worker HTTP server (`nohup`) using SSH connection reuse
+5. Wait for all workers to pass the health check with bounded parallel probes
 6. Distribute input — either split a local file (`-input`) into 64 MB chunks and push them via `POST /data`, **or** resolve Common Crawl WET URLs from the official website and assign them **round-robin** across the N workers via `POST /load`. Workers download those WET files into their local `workDir`, map from local file streams, and delete the downloaded inputs after map succeeds. Bound Common Crawl runs with `-files-limit` and/or `-chunks-limit`.
 7. Broadcast `POST /map` with each worker's ID and the full peer list — each worker applies the configured map function, then partitions its intermediate KVs into N bucket files (`map-bucket-{n}-{idx}.jsonl`) using `FNV-32a(key) % N`
 8. Broadcast `POST /reduce` — each worker fetches its pre-partitioned bucket file from every peer via `GET /intermediate?reducer=id&n=N` (O(1) file read per peer), then runs the configured reduce function locally
@@ -291,7 +311,7 @@ sequenceDiagram
         Wn-->>Orchestrator: key-values
     end
 
-    Note over Orchestrator: Merge counts, sort, write output file
+    Note over Orchestrator: Merge integer reducer outputs by key, sort, write output file
 ```
 
 ---
@@ -368,10 +388,10 @@ Orchestrator: Collect phase
 
 ## Built-In Word-Count Job
 
-| Function          | Signature                    | Behaviour                                                                           |
-| ----------------- | ---------------------------- | ----------------------------------------------------------------------------------- |
-| `wordCountMap`    | `(docID, text) → []KeyValue` | Splits text on non-alphanumeric runes; emits `(lowercase_word, "1")` for each token |
-| `wordCountReduce` | `(key, []string) → string`   | Returns `len(values)` as a string (counts occurrences)                              |
+| Function          | Behaviour                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------- |
+| `Mapper.Map`      | Splits text on non-alphanumeric runes; emits `(lowercase_word, "1")` for each token |
+| `Reducer.Reduce`  | Returns `len(values)` as a string (counts occurrences)                              |
 
 The map and reduce functions are pluggable via the `MapFunc` / `ReduceFunc` type
 aliases, so the worker can be adapted to other jobs. The active CLI does not yet
@@ -400,7 +420,8 @@ cd scripts && go vet ./worker/ ./mapreduce/ ./deploy/ ./collect/ ./cleanup/ ./ma
 ```
 
 The `mapreduce` orchestrator cross-compiles the worker automatically
-(`GOOS=linux GOARCH=amd64`) before deploying it.
+(`GOOS=linux GOARCH=amd64`) before deploying it, injecting the required `-job`
+package into the worker binary at build time.
 
 ---
 
@@ -445,6 +466,7 @@ Bound it with `-files-limit` and/or `-chunks-limit`.
 ```bash
 # Recommended: sweep 1→128, 3 reps/N, and plot at the end.
 experiments/run_benchmark.sh \
+    -job scripts/jobs/wordcount \
     -crawl CC-MAIN-2026-05 \
     -chunks-limit 256 \
     -nodes "1 2 4 8 16 32 64 128" \
@@ -456,7 +478,8 @@ What happens for each node count `N` in the sequence:
 
 1. The runner fetches a master host pool once (`make_hosts -n <maxN>`), then
    slices the first `N` hosts for the run.
-2. It invokes the MapReduce orchestrator `-reps` times. Each run loads the data
+2. It invokes the MapReduce orchestrator `-reps` times with the required `-job`
+   package. Each run loads the data
    **before** starting the timer, then times only map → reduce → collect and
    prints `TIMING nodes=N … compute_seconds=…`.
 3. The runner parses `compute_seconds`, validates that the orchestrator actually
@@ -473,12 +496,12 @@ nodes,median_seconds,speedup,runs
 …
 ```
 
-| Column           | Meaning                                                        |
-| ---------------- | ------------------------------------------------------------- |
-| `nodes`          | Number of active worker nodes (N)                             |
-| `median_seconds` | Median compute time over the `-reps` runs                     |
-| `speedup`        | `median_seconds[N=1] / median_seconds[N]`                     |
-| `runs`           | All successful per-run compute times (`;`-separated)          |
+| Column           | Meaning                                              |
+| ---------------- | ---------------------------------------------------- |
+| `nodes`          | Number of active worker nodes (N)                    |
+| `median_seconds` | Median compute time over the `-reps` runs            |
+| `speedup`        | `median_seconds[N=1] / median_seconds[N]`            |
+| `runs`           | All successful per-run compute times (`;`-separated) |
 
 **4. Generate / regenerate the plot.** `-plot` renders `experiments/amdahl.png`
 automatically. To (re)build it from an existing CSV:
@@ -499,30 +522,32 @@ existing `experiments/bench-hosts.txt`:
 
 ```bash
 experiments/run_benchmark.sh -crawl CC-MAIN-2026-05 -chunks-limit 256 \
+    -job scripts/jobs/wordcount \
     -no-fetch -plot
 ```
 
 ### Outputs
 
-| Path                          | Description                                  |
-| ----------------------------- | -------------------------------------------- |
-| `experiments/results.csv`     | Per-N median compute time and speedup        |
-| `experiments/amdahl.png`      | Amdahl's-law plot (with `-plot`)             |
+| Path                          | Description                                       |
+| ----------------------------- | ------------------------------------------------- |
+| `experiments/results.csv`     | Per-N median compute time and speedup             |
+| `experiments/amdahl.png`      | Amdahl's-law plot (with `-plot`)                  |
 | `experiments/bench-hosts.txt` | Master host pool (regenerated unless `-no-fetch`) |
 
 ### Flags
 
-| Flag            | Default               | Purpose                                            |
-| --------------- | --------------------- | -------------------------------------------------- |
-| `-crawl`        | latest crawl          | Common Crawl ID override                            |
-| `-files-limit`  | 0                     | Cap number of WET files (fixed workload)           |
-| `-chunks-limit` | 0                     | Second workload cap kept for compatibility         |
-| `-nodes`        | `1 2 4 8 16 32 64 128`| Space-separated node counts to sweep               |
-| `-reps`         | 3                     | Timed runs per node count (median reported)        |
-| `-port`         | 9090                  | Worker HTTP port                                    |
-| `-out`          | `experiments/results.csv` | Output CSV path                                |
-| `-plot`         | _(off)_               | Render `experiments/amdahl.png` after the sweep    |
-| `-no-fetch`     | _(off)_               | Reuse `experiments/bench-hosts.txt` (skip `make_hosts`) |
+| Flag            | Default                   | Purpose                                                 |
+| --------------- | ------------------------- | ------------------------------------------------------- |
+| `-job`          | _(required)_              | Go job package directory to build into the worker       |
+| `-crawl`        | latest crawl              | Common Crawl ID override                                |
+| `-files-limit`  | 0                         | Cap number of WET files (fixed workload)                |
+| `-chunks-limit` | 0                         | Second workload cap kept for compatibility              |
+| `-nodes`        | `1 2 4 8 16 32 64 128`    | Space-separated node counts to sweep                    |
+| `-reps`         | 3                         | Timed runs per node count (median reported)             |
+| `-port`         | 9090                      | Worker HTTP port                                        |
+| `-out`          | `experiments/results.csv` | Output CSV path                                         |
+| `-plot`         | _(off)_                   | Render `experiments/amdahl.png` after the sweep         |
+| `-no-fetch`     | _(off)_                   | Reuse `experiments/bench-hosts.txt` (skip `make_hosts`) |
 
 > **Download note:** Common Crawl files are downloaded by workers during `/load`,
 > before the timer starts, so the benchmark still measures map → reduce → collect
@@ -532,7 +557,7 @@ experiments/run_benchmark.sh -crawl CC-MAIN-2026-05 -chunks-limit 256 \
 > so the measurements reflect pure compute scaling. A run is discarded (not
 > recorded) if it fails or if the orchestrator reports a different active node
 > count than requested (e.g. fewer healthy workers); the median is taken over the
-> surviving runs. The data-load/upload step runs *before* the timer, so only the
+> surviving runs. The data-load/upload step runs _before_ the timer, so only the
 > map → reduce → collect compute time contributes to the speedup.
 
 ---
@@ -551,30 +576,30 @@ The orchestrator uses a **slot-based coordinator** with a **spare pool**:
   spare host every `-health-interval` (default 5 s). Two consecutive failures
   mark a host dead so it will not be reused.
 
-| Scenario                            | Behaviour                                                                                                          |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Worker not reachable at startup     | `waitHealthy` retries 30× / 2 s; survivors form slot+spare pool                                                    |
-| SCP / SSH failure (deploy)          | Failed hosts are skipped; deployment continues with the hosts that came up successfully                             |
-| Worker returns 5xx during map/reduce | Calling host is replaced from spare pool, slot rewinds to `pending`, `/load` → `/map` (→ `/reduce`) replay        |
+| Scenario                                                    | Behaviour                                                                                                                                                |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Worker not reachable at startup                             | `waitHealthy` retries 30× / 2 s; survivors form slot+spare pool                                                                                          |
+| SCP / SSH failure (deploy)                                  | Failed hosts are skipped; deployment continues with the hosts that came up successfully                                                                  |
+| Worker returns 5xx during map/reduce                        | Calling host is replaced from spare pool, slot rewinds to `pending`, `/load` → `/map` (→ `/reduce`) replay                                               |
 | Worker dies → peer's `/reduce` 5xx with `fetch from peer X` | Coordinator parses the message, blames host `X` (not the caller), replaces `X`, then re-runs `/reduce` on all surviving slots with the updated peer list |
-| Transport error / timeout on a slot | Same as above; calling host replaced                                                                               |
-| Map/reduce phase times out          | 60 min HTTP client timeout per worker; failure triggers slot replacement                                            |
-| Data upload times out               | 30 min HTTP client timeout for `/load`; failure triggers slot replacement                                          |
-| `/intermediate` fetch failure       | 10 min worker-internal timeout; worker returns 500 to its `/reduce` caller; orchestrator identifies the dead peer  |
-| `run.sh` receives SIGINT/SIGTERM    | `trap cleanup EXIT` kills remote processes                                                                          |
+| Transport error / timeout on a slot                         | Same as above; calling host replaced                                                                                                                     |
+| Map/reduce phase times out                                  | 60 min HTTP client timeout per worker; failure triggers slot replacement                                                                                 |
+| Data upload times out                                       | 30 min HTTP client timeout for `/load`; failure triggers slot replacement                                                                                |
+| `/intermediate` fetch failure                               | 10 min worker-internal timeout; worker returns 500 to its `/reduce` caller; orchestrator identifies the dead peer                                        |
+| `run.sh` receives SIGINT/SIGTERM                            | `trap cleanup EXIT` kills remote processes                                                                                                               |
 
 ### Tunable flags (orchestrator)
 
-| Flag                  | Default | Purpose                                                       |
-| --------------------- | ------- | ------------------------------------------------------------- |
-| `-n`                  | 0       | Target number of active slots; extras in `hosts.txt` are spares |
-| `-commoncrawl`        | false   | Use the official Common Crawl website instead of a local file |
-| `-crawl`              | latest  | Override the Common Crawl ID for deterministic runs           |
-| `-files-limit`        | 0       | Cap the number of Common Crawl WET files selected             |
-| `-chunks-limit`       | 0       | Second Common Crawl workload cap kept for compatibility       |
-| `-max-attempts`       | 4       | Per-slot host swaps before failing the job                    |
-| `-health-interval`    | 5s      | `/health` poll cadence during long phases                     |
-| `-backoff-initial`    | 250ms   | First retry backoff (doubles, capped at 5 s)                  |
+| Flag               | Default | Purpose                                                         |
+| ------------------ | ------- | --------------------------------------------------------------- |
+| `-n`               | 0       | Target number of active slots; extras in `hosts.txt` are spares |
+| `-commoncrawl`     | false   | Use the official Common Crawl website instead of a local file   |
+| `-crawl`           | latest  | Override the Common Crawl ID for deterministic runs             |
+| `-files-limit`     | 0       | Cap the number of Common Crawl WET files selected               |
+| `-chunks-limit`    | 0       | Second Common Crawl workload cap kept for compatibility         |
+| `-max-attempts`    | 4       | Per-slot host swaps before failing the job                      |
+| `-health-interval` | 5s      | `/health` poll cadence during long phases                       |
+| `-backoff-initial` | 250ms   | First retry backoff (doubles, capped at 5 s)                    |
 
 ### When the job will still fail
 

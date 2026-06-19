@@ -7,19 +7,26 @@ import (
 	"io"
 	"sort"
 	"strconv"
+
+	"scripts/mrjob"
 )
 
 // KeyValue is a single intermediate or output key-value pair.
-type KeyValue struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
+type KeyValue = mrjob.KeyValue
 
 // MapFunc maps a document (identified by docID) to a list of intermediate KeyValue pairs.
 type MapFunc func(docID, text string) []KeyValue
 
 // ReduceFunc reduces all values for a key into a single output string.
 type ReduceFunc func(key string, values []string) string
+
+func mapFuncFrom(mapper mrjob.Mapper) MapFunc {
+	return mapper.Map
+}
+
+func reduceFuncFrom(reducer mrjob.Reducer) ReduceFunc {
+	return reducer.Reduce
+}
 
 // runMap applies fn to every line in r, using the line number as docID.
 // Returns intermediate KV pairs grouped by key.

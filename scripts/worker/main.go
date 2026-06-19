@@ -18,12 +18,15 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"path"
@@ -34,6 +37,11 @@ import (
 	"sync"
 	"time"
 )
+
+// pprofEnabled controls whether Go profiling endpoints are registered under
+// /debug/pprof/. Set by the -pprof flag in main(); off by default so that
+// production benchmark runs are not perturbed.
+var pprofEnabled bool
 
 // state holds all runtime data for one MapReduce job.
 type state struct {
@@ -132,19 +140,33 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /intermediate", s.handleIntermediate)
 	mux.HandleFunc("POST /reduce", s.handleReduce)
 	mux.HandleFunc("GET /result", s.handleResult)
+	if pprofEnabled {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 	return mux
 }
 
 func main() {
 	port := flag.String("port", "9090", "port to listen on")
+	enablePprof := flag.Bool("pprof", false, "expose Go profiling endpoints under /debug/pprof/")
 	flag.Parse()
+	pprofEnabled = *enablePprof
 
 	workDir, err := os.MkdirTemp("", "mr-worker-*")
 	if err != nil {
 		log.Fatalf("create work dir: %v", err)
 	}
 
-	srv := newServer(wordCountMap, wordCountReduce, workDir)
+	mapper, reducer, err := loadInjectedJob()
+	if err != nil {
+		log.Fatalf("load injected job: %v", err)
+	}
+
+	srv := newServer(mapFuncFrom(mapper), reduceFuncFrom(reducer), workDir)
 	addr := ":" + *port
 	log.Printf("worker listening on %s (workDir: %s)", addr, workDir)
 	if err := http.ListenAndServe(addr, srv.handler()); err != nil {
@@ -300,8 +322,20 @@ func (s *server) handleIntermediate(w http.ResponseWriter, r *http.Request) {
 }
 
 // intermediateClient is used for fetching pre-partitioned map buckets from peers.
-// A 10-minute timeout is generous enough for large buckets over a LAN.
-var intermediateClient = &http.Client{Timeout: 10 * time.Minute}
+// The lab hostnames publish IPv6 addresses that are not routable between all
+// machines, so shuffle traffic is forced onto IPv4.
+var intermediateClient = &http.Client{
+	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
+	},
+}
 
 // fetchIntermediate GETs /intermediate from peer, requesting the KV pairs destined
 // for reducerID out of n total workers.
@@ -369,6 +403,9 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(idx int, addr string) {
 			defer wg.Done()
+			if addr == "" {
+				return
+			}
 			kvs, err := fetchIntermediate(addr, id, n)
 			if err != nil {
 				errs[idx] = err
