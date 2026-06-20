@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"os"
 	"strings"
 	"testing"
 )
@@ -28,58 +30,65 @@ func TestTargetNodeDeterministic(t *testing.T) {
 
 func TestRunMapBasic(t *testing.T) {
 	data := "hello world\nhello go\n"
-	result, err := runMap(strings.NewReader(data), wordCountMap)
+	var buf strings.Builder
+	writers := []*bufio.Writer{bufio.NewWriter(&buf)}
+	_, err := runMap(strings.NewReader(data), wordCountMap, 1, writers)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if len(result["hello"]) != 2 {
-		t.Errorf("hello: want 2 values, got %d", len(result["hello"]))
+	writers[0].Flush()
+	out := buf.String()
+	if strings.Count(out, "hello\t1\n") != 2 {
+		t.Errorf("hello: want 2 values, got output:\n%s", out)
 	}
-	if len(result["world"]) != 1 {
-		t.Errorf("world: want 1 value, got %d", len(result["world"]))
+	if !strings.Contains(out, "world\t1\n") {
+		t.Errorf("world: want 1 value, got output:\n%s", out)
 	}
-	if len(result["go"]) != 1 {
-		t.Errorf("go: want 1 value, got %d", len(result["go"]))
+	if !strings.Contains(out, "go\t1\n") {
+		t.Errorf("go: want 1 value, got output:\n%s", out)
 	}
 }
 
 func TestRunMapEmpty(t *testing.T) {
-	result, err := runMap(strings.NewReader(""), wordCountMap)
+	var buf strings.Builder
+	writers := []*bufio.Writer{bufio.NewWriter(&buf)}
+	pairs, err := runMap(strings.NewReader(""), wordCountMap, 1, writers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result) != 0 {
-		t.Errorf("empty input: want 0 keys, got %d", len(result))
+	if pairs != 0 {
+		t.Errorf("empty input: want 0 keys, got %d", pairs)
 	}
 }
 
 func TestRunMapEmitsValues(t *testing.T) {
-	result, err := runMap(strings.NewReader("a b c\n"), wordCountMap)
+	var buf strings.Builder
+	writers := []*bufio.Writer{bufio.NewWriter(&buf)}
+	_, err := runMap(strings.NewReader("a b c\n"), wordCountMap, 1, writers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for key, vals := range result {
-		for _, v := range vals {
-			if v != "1" {
-				t.Errorf("key %q: want value '1', got %q", key, v)
-			}
+	writers[0].Flush()
+	out := buf.String()
+	for _, expected := range []string{"a\t1\n", "b\t1\n", "c\t1\n"} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("want %q, got output:\n%s", expected, out)
 		}
 	}
 }
 
 func TestRunReduceSorted(t *testing.T) {
-	intermediate := map[string][]string{
-		"zebra": {"1"},
-		"apple": {"1", "1", "1"},
-		"mango": {"1", "1"},
+	path := writeTempSortedMap(t, "apple\t1\napple\t1\napple\t1\nmango\t1\nmango\t1\nzebra\t1\n")
+	defer os.Remove(path)
+
+	result, err := runReduce(path, wordCountReduce)
+	if err != nil {
+		t.Fatal(err)
 	}
-	result := runReduce(intermediate, wordCountReduce)
 
 	if len(result) != 3 {
 		t.Fatalf("want 3 entries, got %d", len(result))
 	}
-	// runReduce sorts by key
 	if result[0].Key != "apple" {
 		t.Errorf("result[0].Key = %q, want 'apple'", result[0].Key)
 	}
@@ -92,11 +101,13 @@ func TestRunReduceSorted(t *testing.T) {
 }
 
 func TestRunReduceValues(t *testing.T) {
-	intermediate := map[string][]string{
-		"hello": {"1", "1"},
-		"world": {"1"},
+	path := writeTempSortedMap(t, "hello\t1\nhello\t1\nworld\t1\n")
+	defer os.Remove(path)
+
+	result, err := runReduce(path, wordCountReduce)
+	if err != nil {
+		t.Fatal(err)
 	}
-	result := runReduce(intermediate, wordCountReduce)
 
 	counts := make(map[string]string)
 	for _, kv := range result {

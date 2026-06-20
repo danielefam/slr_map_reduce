@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.Serdes;
@@ -46,24 +47,28 @@ public class WordCountJob {
 
     static final String INPUT_TOPIC = "bench-input";
     static final String OUTPUT_TOPIC = "bench-output";
-    static final String APP_ID = "bench-wordcount";
+    static final String DEFAULT_APP_ID = "bench-wordcount";
+    static final int MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) {
-            System.err.println("usage: WordCountJob <bootstrap-server>");
+        if (args.length < 1 || args.length > 2) {
+            System.err.println("usage: WordCountJob <bootstrap-server> [app-id]");
             System.exit(2);
         }
         final String bootstrap = args[0];
+        final String appId = args.length == 2 ? args[1] : DEFAULT_APP_ID;
 
         Properties props = new Properties();
-        props.put(StreamsConfig.APPLICATION_ID_CONFIG, APP_ID);
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, appId);
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
-        props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-bench/streams-state");
+        props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-bench-guilherme/streams-state");
         // Larger batches: fairer comparison with the batch-oriented Go system.
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);
         props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 64 * 1024 * 1024L);
+        props.put(StreamsConfig.consumerPrefix(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG), MAX_MESSAGE_BYTES);
+        props.put(StreamsConfig.consumerPrefix(ConsumerConfig.FETCH_MAX_BYTES_CONFIG), MAX_MESSAGE_BYTES);
 
         StreamsBuilder builder = new StreamsBuilder();
         KStream<String, String> lines =
@@ -92,7 +97,7 @@ public class WordCountJob {
                 int zeroStreak = 0;
                 while (zeroStreak < 2) {
                     Thread.sleep(2000);
-                    long lag = totalLag(admin);
+                    long lag = totalLag(admin, appId);
                     if (lag == 0) {
                         zeroStreak++;
                     } else {
@@ -100,7 +105,7 @@ public class WordCountJob {
                     }
                 }
                 double seconds = (System.nanoTime() - t0) / 1e9;
-                System.out.printf("TIMING compute_seconds=%.3f%n", seconds);
+                System.out.printf(Locale.ROOT, "TIMING compute_seconds=%.3f%n", seconds);
                 done.countDown();
             } catch (Exception e) {
                 e.printStackTrace();
@@ -115,9 +120,9 @@ public class WordCountJob {
     }
 
     /** Total lag of the streams app's consumer group on the input topic. */
-    static long totalLag(Admin admin) throws Exception {
+    static long totalLag(Admin admin, String appId) throws Exception {
         Map<TopicPartition, OffsetAndMetadata> committed =
-                admin.listConsumerGroupOffsets(APP_ID)
+                admin.listConsumerGroupOffsets(appId)
                         .partitionsToOffsetAndMetadata().get();
         Set<TopicPartition> inputParts = committed.keySet().stream()
                 .filter(tp -> tp.topic().equals(INPUT_TOPIC))

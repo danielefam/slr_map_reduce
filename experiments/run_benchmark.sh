@@ -48,6 +48,7 @@ DO_FETCH=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -job)          JOB="$2";          shift 2 ;;
+    -input)        INPUT="$2";        shift 2 ;;
     -crawl)        CRAWL="$2";        shift 2 ;;
     -files-limit)  FILES_LIMIT="$2";  shift 2 ;;
     -chunks-limit) CHUNKS_LIMIT="$2"; shift 2 ;;
@@ -91,8 +92,9 @@ fi
 
 # ── Fetch a master pool of hosts once ────────────────────────────────────────
 if [[ "$DO_FETCH" -eq 1 ]]; then
-  echo "=== Fetching up to $MAX_N hosts ==="
-  ( cd "$SCRIPTS" && go run ./make_hosts -n "$MAX_N" -f "$MASTER_HOSTS" )
+  FETCH_COUNT=$(( MAX_N * 2 ))
+  echo "=== Fetching up to $FETCH_COUNT hosts ==="
+  ( cd "$SCRIPTS" && go run ./make_hosts -n "$FETCH_COUNT" -f "$MASTER_HOSTS" )
 fi
 if [[ ! -s "$MASTER_HOSTS" ]]; then
   echo "Error: no master hosts file at $MASTER_HOSTS (run without -no-fetch)" >&2
@@ -112,8 +114,13 @@ run_one() {
   # than requested (e.g. fewer healthy workers than -n), so the CSV is never
   # mislabeled.
   local hosts_file="$1" n="$2" out_file="$WORK_DIR/result-n$2.txt" log got_nodes secs
-  local extra=(-commoncrawl)
-  [[ -n "$CRAWL" ]] && extra+=(-crawl "$CRAWL")
+  local extra=()
+  if [[ -n "${INPUT:-}" ]]; then
+    extra+=(-input "$INPUT")
+  else
+    extra+=(-commoncrawl)
+    [[ -n "$CRAWL" ]] && extra+=(-crawl "$CRAWL")
+  fi
   (( FILES_LIMIT  > 0 )) && extra+=(-files-limit  "$FILES_LIMIT")
   (( CHUNKS_LIMIT > 0 )) && extra+=(-chunks-limit "$CHUNKS_LIMIT")
   log="$( cd "$SCRIPTS" && go run ./mapreduce \
@@ -122,6 +129,7 @@ run_one() {
             -output "$out_file" \
             -n "$n" \
             -port "$PORT" \
+            -max-attempts 64 \
             "${extra[@]}" 2>&1 )" || { echo "$log" >&2; return 1; }
   got_nodes="$(echo "$log" | sed -n 's/.*TIMING nodes=\([0-9][0-9]*\).*/\1/p' | tail -1)"
   secs="$(echo "$log" | sed -n 's/.*compute_seconds=\([0-9.][0-9.]*\).*/\1/p' | tail -1)"
@@ -159,7 +167,7 @@ for N in $NODES; do
   times=()
   for ((r = 1; r <= REPS; r++)); do
     echo "  run $r/$REPS …"
-    if t="$(run_one "$WORK_DIR/hosts-n$N.txt" "$N")" && [[ -n "$t" ]]; then
+    if t="$(run_one "$MASTER_HOSTS" "$N")" && [[ -n "$t" ]]; then
       echo "    compute_seconds=$t"
       times+=("$t")
     else

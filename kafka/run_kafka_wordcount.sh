@@ -4,7 +4,8 @@
 #
 # Pipeline:
 #   1. (Re)create bench-input / bench-output topics
-#   2. Compile WordCountJob.java on the controller node (bundled Kafka jars,
+#   2. Compile WordCountJob.java + ChunkedTextProducer.java on the controller
+#      node (bundled Kafka jars,
 #      no Maven required)
 #   3. Produce the input file into bench-input        (NOT timed — mirrors
 #      the Go orchestrator, which excludes /data uploads from compute time)
@@ -13,7 +14,7 @@
 #   5. Consume bench-output into a local result file (latest count per word)
 #
 # Usage:
-#   ./run_kafka_wordcount.sh -input ../test_input.txt [-output kafka_result.txt]
+#   ./run_kafka_wordcount.sh -input ../test_input.txt [-output kafka_result.txt] [-port 9092]
 #
 # Comparison with the custom framework:
 #   ../mapreduce.sh -job scripts/jobs/wordcount -input <same file> ... prints
@@ -23,10 +24,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
-REMOTE_ROOT="/tmp/kafka-bench"
+REMOTE_ROOT="/tmp/kafka-bench-guilherme"
 KAFKA_VERSION="4.3.0"
 SCALA_VERSION="2.13"
 BROKER_PORT=9092
+MAX_MESSAGE_BYTES=$((10 * 1024 * 1024))
+CHUNK_MESSAGE_BYTES=$((8 * 1024 * 1024))
 INPUT=""
 OUTPUT="kafka_result.txt"
 
@@ -35,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     -input)   INPUT="$2";         shift 2 ;;
     -output)  OUTPUT="$2";        shift 2 ;;
     -version) KAFKA_VERSION="$2"; shift 2 ;;
+    -port)    BROKER_PORT="$2";   shift 2 ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -63,15 +67,16 @@ kssh "
 "
 
 # ── Step 2: compile the Streams app remotely ───────────────────────────────
-echo "--- Compiling WordCountJob on $CONTROLLER_HOST ---"
-scp -q "$SCRIPT_DIR/WordCountJob.java" "$CONTROLLER_HOST:$REMOTE_ROOT/"
-kssh "cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java"
+echo "--- Compiling Kafka benchmark helpers on $CONTROLLER_HOST ---"
+scp -q "$SCRIPT_DIR/WordCountJob.java" "$SCRIPT_DIR/ChunkedTextProducer.java" "$CONTROLLER_HOST:$REMOTE_ROOT/"
+kssh "cd $REMOTE_ROOT && javac -cp '$KAFKA_HOME/libs/*' WordCountJob.java ChunkedTextProducer.java"
 
 # ── Step 3: produce input (untimed, like the Go /data phase) ───────────────
 echo "--- Producing input ($(wc -l < "$INPUT") lines) ---"
-# Stream the local file through ssh into the console producer on the node.
+# Stream the local file through a bounded chunk producer on the controller so
+# large Common Crawl lines do not exceed Kafka's per-record limits.
 ssh -o BatchMode=yes "$CONTROLLER_HOST" \
-  "$KAFKA_HOME/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic bench-input" \
+  "cd $REMOTE_ROOT && java -cp '$KAFKA_HOME/libs/*:.' ChunkedTextProducer $BOOTSTRAP bench-input $CHUNK_MESSAGE_BYTES" \
   < "$INPUT"
 
 # ── Step 4: run the Streams job; it exits once lag == 0 and prints TIMING ──

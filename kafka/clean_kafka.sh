@@ -8,7 +8,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
-REMOTE_ROOT="/tmp/kafka-bench"
+REMOTE_ROOT="/tmp/kafka-bench-guilherme"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

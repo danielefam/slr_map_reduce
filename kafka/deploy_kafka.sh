@@ -11,7 +11,8 @@
 # (static KRaft quorum with a single controller — sufficient for benchmarks).
 #
 # Usage:
-#   ./deploy_kafka.sh [-n 3] [-hosts ../hosts.txt] [-version 4.3.0]
+#   ./deploy_kafka.sh [-n 3] [-hosts ../hosts.txt] [-version 4.3.0] \
+#       [-port 9092] [-controller-port 9093]
 #
 # Requires: Java 17+ on the remote machines (checked), ssh/scp key access.
 
@@ -25,7 +26,9 @@ KAFKA_VERSION="4.3.0"
 SCALA_VERSION="2.13"
 BROKER_PORT=9092
 CONTROLLER_PORT=9093
-REMOTE_ROOT="/tmp/kafka-bench"
+REMOTE_ROOT="/tmp/kafka-bench-guilherme"
+MAX_MESSAGE_BYTES=$((10 * 1024 * 1024))
+SOCKET_REQUEST_MAX_BYTES=$((20 * 1024 * 1024))
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     -hosts)    HOSTS_FILE="$2";      shift 2 ;;
     -version)  KAFKA_VERSION="$2";   shift 2 ;;
     -port)     BROKER_PORT="$2";     shift 2 ;;
+    -controller-port) CONTROLLER_PORT="$2"; shift 2 ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -43,6 +47,23 @@ DIST_CACHE="$SCRIPT_DIR/dist"
 PRIMARY_URL="https://dlcdn.apache.org/kafka/${KAFKA_VERSION}/${TARBALL}"
 ARCHIVE_URL="https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/${TARBALL}"
 KAFKA_HOSTS_FILE="$SCRIPT_DIR/kafka_hosts.txt"
+
+wait_for_port() {
+  local host="$1" port="$2" label="$3" ok=0
+  for _ in $(seq 1 30); do
+    if ssh -o BatchMode=yes "$host" "bash -c 'echo > /dev/tcp/127.0.0.1/${port}'" 2>/dev/null; then
+      ok=1
+      break
+    fi
+    sleep 2
+  done
+  if (( ok )); then
+    echo "  ✓ $label on $host:${port} is accepting connections"
+  else
+    echo "  ✗ $label on $host:${port} did not come up; see $REMOTE_ROOT/kafka.log on that host" >&2
+    exit 1
+  fi
+}
 
 # ── Step 1: pick the first N hosts ──────────────────────────────────────────
 mapfile -t ALL_HOSTS < <(grep -v '^[[:space:]]*$' "$HOSTS_FILE")
@@ -96,6 +117,8 @@ echo "--- Cluster ID: $CLUSTER_ID ---"
 
 # ── Step 6: write per-node config, format storage, start broker ────────────
 QUORUM="1@${CONTROLLER_HOST}:${CONTROLLER_PORT}"
+# Start the combined controller+broker first and wait for it to accept both
+# controller and broker traffic before booting the follower brokers.
 node_id=1
 for h in "${HOSTS[@]}"; do
   echo "--- Configuring node $node_id ($h) ---"
@@ -118,6 +141,49 @@ listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
 inter.broker.listener.name=PLAINTEXT
 log.dirs=${REMOTE_ROOT}/logs
 num.partitions=${N}
+message.max.bytes=${MAX_MESSAGE_BYTES}
+replica.fetch.max.bytes=${MAX_MESSAGE_BYTES}
+socket.request.max.bytes=${SOCKET_REQUEST_MAX_BYTES}
+offsets.topic.replication.factor=1
+transaction.state.log.replication.factor=1
+transaction.state.log.min.isr=1
+group.initial.rebalance.delay.ms=0
+EOF
+
+  ssh -o BatchMode=yes "$h" "
+    set -e
+    cd $REMOTE_ROOT/$KAFKA_DIST
+    rm -rf $REMOTE_ROOT/logs
+    bin/kafka-storage.sh format -t $CLUSTER_ID -c $REMOTE_ROOT/server.properties >/dev/null
+    nohup bin/kafka-server-start.sh $REMOTE_ROOT/server.properties \
+      > $REMOTE_ROOT/kafka.log 2>&1 &
+    echo \$! > $REMOTE_ROOT/kafka.pid
+  "
+  if (( node_id == 1 )); then
+    echo "--- Waiting for controller node to be ready before starting followers ---"
+    wait_for_port "$h" "$BROKER_PORT" "broker listener"
+    wait_for_port "$h" "$CONTROLLER_PORT" "controller listener"
+    node_id=$((node_id + 1))
+    break
+  fi
+done
+
+for h in "${HOSTS[@]:1}"; do
+  echo "--- Configuring node $node_id ($h) ---"
+  ssh -o BatchMode=yes "$h" "cat > $REMOTE_ROOT/server.properties" <<EOF
+process.roles=broker
+node.id=${node_id}
+controller.quorum.voters=${QUORUM}
+listeners=PLAINTEXT://0.0.0.0:${BROKER_PORT}
+advertised.listeners=PLAINTEXT://${h}:${BROKER_PORT}
+controller.listener.names=CONTROLLER
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+inter.broker.listener.name=PLAINTEXT
+log.dirs=${REMOTE_ROOT}/logs
+num.partitions=${N}
+message.max.bytes=${MAX_MESSAGE_BYTES}
+replica.fetch.max.bytes=${MAX_MESSAGE_BYTES}
+socket.request.max.bytes=${SOCKET_REQUEST_MAX_BYTES}
 offsets.topic.replication.factor=1
 transaction.state.log.replication.factor=1
 transaction.state.log.min.isr=1
@@ -139,19 +205,7 @@ done
 # ── Step 7: health check ────────────────────────────────────────────────────
 echo "--- Waiting for brokers to come up ---"
 for h in "${HOSTS[@]}"; do
-  ok=0
-  for _ in $(seq 1 30); do
-    if ssh -o BatchMode=yes "$h" "bash -c 'echo > /dev/tcp/127.0.0.1/${BROKER_PORT}'" 2>/dev/null; then
-      ok=1; break
-    fi
-    sleep 2
-  done
-  if (( ok )); then
-    echo "  ✓ $h:${BROKER_PORT} is accepting connections"
-  else
-    echo "  ✗ $h:${BROKER_PORT} did not come up; see $REMOTE_ROOT/kafka.log on that host" >&2
-    exit 1
-  fi
+  wait_for_port "$h" "$BROKER_PORT" "broker listener"
 done
 
 echo ""

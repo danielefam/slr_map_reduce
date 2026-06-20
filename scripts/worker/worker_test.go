@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -252,8 +253,16 @@ func TestIntermediateEndpoint(t *testing.T) {
 			t.Fatalf("reducer %d: want 200, got %d", r, resp.StatusCode)
 		}
 		var kvs []KeyValue
-		if err := json.NewDecoder(resp.Body).Decode(&kvs); err != nil {
-			t.Fatalf("decode reducer %d: %v", r, err)
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.SplitN(line, "\t", 2)
+			if len(parts) == 2 {
+				kvs = append(kvs, KeyValue{Key: parts[0], Value: parts[1]})
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			t.Fatalf("scan reducer %d: %v", r, err)
 		}
 		for _, kv := range kvs {
 			if got := targetNode(kv.Key, n); got != r {

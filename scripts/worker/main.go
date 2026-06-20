@@ -29,6 +29,7 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -275,32 +276,42 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 
 	n := len(req.Peers)
 	var err error
-	var intermediate map[string][]string
-	if len(files) > 0 {
-		intermediate, err = s.runMapFiles(files)
-	} else {
-		intermediate, err = runMap(strings.NewReader(data), s.mapFn)
+
+	filesOut := make([]*os.File, n)
+	writers := make([]*bufio.Writer, n)
+	for i := 0; i < n; i++ {
+		f, err := os.OpenFile(s.bucketFile(req.ID, n, i), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				filesOut[j].Close()
+			}
+			http.Error(w, "create map bucket: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		filesOut[i] = f
+		writers[i] = bufio.NewWriter(f)
 	}
+
+	var keysCount int
+	if len(files) > 0 {
+		keysCount, err = s.runMapFiles(files, n, writers)
+	} else {
+		keysCount, err = runMap(strings.NewReader(data), s.mapFn, n, writers)
+	}
+
+	for _, w := range writers {
+		w.Flush()
+	}
+
+	for _, f := range filesOut {
+		f.Close()
+	}
+
 	if err != nil {
 		http.Error(w, "run map: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Partition intermediate KVs into n bucket files (one per reducer) so that
-	// /intermediate?reducer=X can serve its file directly without scanning all output.
-	buckets := make([][]KeyValue, n)
-	for key, values := range intermediate {
-		idx := targetNode(key, n)
-		for _, v := range values {
-			buckets[idx] = append(buckets[idx], KeyValue{Key: key, Value: v})
-		}
-	}
-	for i, kvs := range buckets {
-		if err := writeKVLines(s.bucketFile(req.ID, n, i), kvs); err != nil {
-			http.Error(w, "write map bucket: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
 	if len(files) > 0 {
 		if err := s.clearMappedInputs(req.ID, files); err != nil {
 			http.Error(w, "cleanup mapped inputs: "+err.Error(), http.StatusInternalServerError)
@@ -309,7 +320,7 @@ func (s *server) handleMap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"keys":%d}`, len(intermediate))
+	fmt.Fprintf(w, `{"keys":%d}`, keysCount)
 }
 
 // handleIntermediate serves the pre-partitioned bucket file for the requested
@@ -327,19 +338,15 @@ func (s *server) handleIntermediate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kvs, err := readKVFlat(s.bucketFile(slotID, n, reducer))
-	if err != nil {
-		http.Error(w, "read map bucket: "+err.Error(), http.StatusInternalServerError)
+	path := s.bucketFile(slotID, n, reducer)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK) // empty bucket
 		return
 	}
-	if kvs == nil {
-		kvs = []KeyValue{}
-	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(kvs); err != nil {
-		log.Printf("encode intermediate: %v", err)
-	}
+	w.Header().Set("Content-Type", "text/tab-separated-values")
+	http.ServeFile(w, r, path)
 }
 
 // intermediateClient is used for fetching pre-partitioned map buckets from peers.
@@ -358,32 +365,32 @@ var intermediateClient = &http.Client{
 	},
 }
 
-// fetchIntermediate GETs /intermediate from peer, requesting the KV pairs destined
-// for reducerID out of n total workers.
-func fetchIntermediate(peer string, sourceSlotID, reducerID, n int) ([]KeyValue, error) {
+// fetchIntermediate GETs /intermediate from peer, downloading the raw TSV bucket
+// for reducerID out of n total workers into outPath.
+func fetchIntermediate(peer string, sourceSlotID, reducerID, n int, outPath string) error {
 	url := fmt.Sprintf("http://%s/intermediate?slot=%d&reducer=%d&n=%d", peer, sourceSlotID, reducerID, n)
 	resp, err := intermediateClient.Get(url) //nolint:gosec
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("peer %s returned %d: %s", peer, resp.StatusCode, b)
+		return fmt.Errorf("peer %s returned %d: %s", peer, resp.StatusCode, b)
 	}
-	var kvs []KeyValue
-	if err := json.NewDecoder(resp.Body).Decode(&kvs); err != nil {
-		return nil, fmt.Errorf("decode intermediate from %s: %w", peer, err)
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
 	}
-	return kvs, nil
+	defer f.Close()
+
+	_, err = io.Copy(f, resp.Body)
+	return err
 }
 
 // handleReduce pulls intermediate data from all peers via /intermediate, then runs
 // the reduce function over the merged KV pairs.
-//
-// Peer list selection (in order of preference):
-//  1. peers from the request body (if provided and non-empty)
-//  2. peers stored from the prior /map call
 func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 	var req reduceRequest
 	if r.Body != nil {
@@ -417,10 +424,10 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n := len(peers)
-	var mu sync.Mutex
-	intermediate := make(map[string][]string)
 	errs := make([]error, n)
 	var wg sync.WaitGroup
+
+	peerFiles := make([]string, n)
 	for i, peer := range peers {
 		wg.Add(1)
 		go func(idx int, addr string) {
@@ -428,16 +435,11 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 			if addr == "" {
 				return
 			}
-			kvs, err := fetchIntermediate(addr, idx, req.ID, n)
-			if err != nil {
+			outPath := filepath.Join(s.workDir, fmt.Sprintf("slot-%d-peer-%d.tsv", req.ID, idx))
+			peerFiles[idx] = outPath
+			if err := fetchIntermediate(addr, idx, req.ID, n, outPath); err != nil {
 				errs[idx] = err
-				return
 			}
-			mu.Lock()
-			for _, kv := range kvs {
-				intermediate[kv.Key] = append(intermediate[kv.Key], kv.Value)
-			}
-			mu.Unlock()
 		}(i, peer)
 	}
 	wg.Wait()
@@ -449,7 +451,26 @@ func (s *server) handleReduce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	output := runReduce(intermediate, s.reduceFn)
+	sortedFile := filepath.Join(s.workDir, fmt.Sprintf("slot-%d-sorted.tsv", req.ID))
+	sortArgs := []string{"-k1,1", "-t\t", "-o", sortedFile}
+	for _, pf := range peerFiles {
+		if pf != "" {
+			sortArgs = append(sortArgs, pf)
+		}
+	}
+
+	cmd := exec.Command("sort", sortArgs...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		http.Error(w, fmt.Sprintf("sort failed: %v, out: %s", err, string(out)), http.StatusInternalServerError)
+		return
+	}
+
+	output, err := runReduce(sortedFile, s.reduceFn)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runReduce failed: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	s.state.mu.Lock()
 	slot = s.slotStateLocked(req.ID)
@@ -499,24 +520,22 @@ func (s *server) resetInputs(slotID int) error {
 	return removeFiles(stale)
 }
 
-func (s *server) runMapFiles(files []string) (map[string][]string, error) {
-	out := make(map[string][]string)
+func (s *server) runMapFiles(files []string, n int, writers []*bufio.Writer) (int, error) {
+	totalKeys := 0
 	for _, file := range files {
-		fileMap, err := s.runMapFile(file)
+		keysCount, err := s.runMapFile(file, n, writers)
 		if err != nil {
-			return nil, err
+			return totalKeys, err
 		}
-		for key, values := range fileMap {
-			out[key] = append(out[key], values...)
-		}
+		totalKeys += keysCount
 	}
-	return out, nil
+	return totalKeys, nil
 }
 
-func (s *server) runMapFile(file string) (map[string][]string, error) {
+func (s *server) runMapFile(file string, n int, writers []*bufio.Writer) (int, error) {
 	f, err := os.Open(file)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", file, err)
+		return 0, fmt.Errorf("open %s: %w", file, err)
 	}
 	defer f.Close()
 
@@ -524,16 +543,16 @@ func (s *server) runMapFile(file string) (map[string][]string, error) {
 	if strings.HasSuffix(file, ".gz") {
 		gr, err := gzip.NewReader(f)
 		if err != nil {
-			return nil, fmt.Errorf("gzip open %s: %w", file, err)
+			return 0, fmt.Errorf("gzip open %s: %w", file, err)
 		}
 		defer gr.Close()
 		reader = gr
 	}
-	intermediate, err := runMap(reader, s.mapFn)
+	keysCount, err := runMap(reader, s.mapFn, n, writers)
 	if err != nil {
-		return nil, fmt.Errorf("map %s: %w", file, err)
+		return keysCount, fmt.Errorf("map %s: %w", file, err)
 	}
-	return intermediate, nil
+	return keysCount, nil
 }
 
 func (s *server) clearMappedInputs(slotID int, files []string) error {

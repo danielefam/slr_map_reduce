@@ -38,7 +38,13 @@ func NewReducer() mrjob.Reducer {
 	return Reducer{}
 }
 
-// Reduce counts the number of values emitted for a word.
+// Reduce sums the numeric values emitted for a word.
 func (Reducer) Reduce(_ string, values []string) string {
-	return strconv.Itoa(len(values))
+	sum := 0
+	for _, v := range values {
+		if c, err := strconv.Atoi(v); err == nil {
+			sum += c
+		}
+	}
+	return strconv.Itoa(sum)
 }

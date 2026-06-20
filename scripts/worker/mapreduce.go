@@ -5,8 +5,9 @@ import (
 	"bufio"
 	"hash/fnv"
 	"io"
-	"sort"
+	"os"
 	"strconv"
+	"strings"
 
 	"scripts/mrjob"
 )
@@ -29,35 +30,66 @@ func reduceFuncFrom(reducer mrjob.Reducer) ReduceFunc {
 }
 
 // runMap applies fn to every line in r, using the line number as docID.
-// Returns intermediate KV pairs grouped by key.
-func runMap(r io.Reader, fn MapFunc) (map[string][]string, error) {
-	out := make(map[string][]string)
+// It streams the emitted KV pairs directly to the appropriate partition writer.
+func runMap(r io.Reader, fn MapFunc, n int, writers []*bufio.Writer) (int, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
 	lineNo := 0
+	pairsCount := 0
 	for scanner.Scan() {
 		pairs := fn(strconv.Itoa(lineNo), scanner.Text())
 		for _, kv := range pairs {
-			out[kv.Key] = append(out[kv.Key], kv.Value)
+			idx := targetNode(kv.Key, n)
+			if _, err := writers[idx].WriteString(kv.Key + "\t" + kv.Value + "\n"); err != nil {
+				return pairsCount, err
+			}
+			pairsCount++
 		}
 		lineNo++
 	}
-	return out, scanner.Err()
+	return pairsCount, scanner.Err()
 }
 
-// runReduce applies fn to every key in intermediate, returning the final sorted KV list.
-func runReduce(intermediate map[string][]string, fn ReduceFunc) []KeyValue {
-	keys := make([]string, 0, len(intermediate))
-	for k := range intermediate {
-		keys = append(keys, k)
+// runReduce applies fn streamingly over a sorted TSV file, returning the final sorted KV list.
+func runReduce(sortedFile string, fn ReduceFunc) ([]KeyValue, error) {
+	f, err := os.Open(sortedFile)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(keys)
+	defer f.Close()
 
-	result := make([]KeyValue, 0, len(keys))
-	for _, k := range keys {
-		result = append(result, KeyValue{Key: k, Value: fn(k, intermediate[k])})
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
+
+	var result []KeyValue
+	var currentKey string
+	var currentValues []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k, v := parts[0], parts[1]
+
+		if currentKey == "" {
+			currentKey = k
+		} else if k != currentKey {
+			result = append(result, KeyValue{Key: currentKey, Value: fn(currentKey, currentValues)})
+			currentKey = k
+			currentValues = currentValues[:0] // reuse slice
+		}
+		currentValues = append(currentValues, v)
 	}
-	return result
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	if currentKey != "" {
+		result = append(result, KeyValue{Key: currentKey, Value: fn(currentKey, currentValues)})
+	}
+	return result, nil
 }
 
 // targetNode returns the index of the reducer node responsible for key,

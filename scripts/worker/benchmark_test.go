@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -44,24 +47,38 @@ func BenchmarkWordCountReduce(b *testing.B) {
 func BenchmarkRunMap(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
-		if _, err := runMap(strings.NewReader(mapBenchInput), wordCountMap); err != nil {
+		writers := []*bufio.Writer{bufio.NewWriter(io.Discard)}
+		if _, err := runMap(strings.NewReader(mapBenchInput), wordCountMap, 1, writers); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkRunReduce(b *testing.B) {
-	intermediate := make(map[string][]string)
-	for _, w := range strings.Fields("the quick brown fox jumps over lazy dog") {
-		vals := make([]string, 10_000)
-		for i := range vals {
-			vals[i] = "1"
-		}
-		intermediate[w] = vals
+func writeTempSortedMap(t testing.TB, content string) string {
+	f, err := os.CreateTemp("", "test-sorted-*.tsv")
+	if err != nil {
+		t.Fatal(err)
 	}
+	f.WriteString(content)
+	f.Close()
+	return f.Name()
+}
+
+func BenchmarkRunReduce(b *testing.B) {
+	var buf strings.Builder
+	for _, w := range strings.Fields("the quick brown fox jumps over lazy dog") {
+		for i := 0; i < 10_000; i++ {
+			buf.WriteString(w + "\t1\n")
+		}
+	}
+	path := writeTempSortedMap(b, buf.String())
+	defer os.Remove(path)
+
 	b.ResetTimer()
 	for range b.N {
-		runReduce(intermediate, wordCountReduce)
+		if _, err := runReduce(path, wordCountReduce); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
