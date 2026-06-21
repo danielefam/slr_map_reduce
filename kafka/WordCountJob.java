@@ -19,6 +19,7 @@
 //   java -cp "$KAFKA_HOME/libs/*:." WordCountJob <bootstrap-server> <application-id>
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
@@ -88,16 +89,33 @@ public class WordCountJob {
 
         // Watchdog: exit once the consumer group has fully caught up with the
         // input topic (lag == 0 across all partitions, seen twice in a row).
+        // Retries on transient broker disconnects rather than crashing.
         Thread watchdog = new Thread(() -> {
-            try (Admin admin = Admin.create(Map.of("bootstrap.servers", bootstrap))) {
+            Map<String, Object> adminConf = new HashMap<>();
+            adminConf.put("bootstrap.servers", bootstrap);
+            adminConf.put("request.timeout.ms", "30000");
+            adminConf.put("default.api.timeout.ms", "30000");
+            try (Admin admin = Admin.create(adminConf)) {
                 int zeroStreak = 0;
+                int errorStreak = 0;
                 while (zeroStreak < 2) {
                     Thread.sleep(2000);
-                    long lag = totalLag(admin, appId);
-                    if (lag == 0) {
-                        zeroStreak++;
-                    } else {
-                        zeroStreak = 0;
+                    try {
+                        long lag = totalLag(admin, appId);
+                        if (lag == 0) {
+                            zeroStreak++;
+                        } else {
+                            zeroStreak = 0;
+                        }
+                        errorStreak = 0;
+                    } catch (Exception e) {
+                        errorStreak++;
+                        System.err.println("Watchdog: transient error (" + errorStreak + "): " + e.getMessage());
+                        if (errorStreak > 30) {
+                            // ~60 s of sustained errors — broker is truly gone
+                            e.printStackTrace();
+                            System.exit(1);
+                        }
                     }
                 }
                 double seconds = (System.nanoTime() - t0) / 1e9;

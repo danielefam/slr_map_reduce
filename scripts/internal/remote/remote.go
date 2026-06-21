@@ -13,7 +13,7 @@ import (
 const (
 	DefaultParallelism = 16
 	DefaultSSHTimeout  = 30 * time.Second
-	DefaultSCPTimeout  = 2 * time.Minute
+	DefaultSCPTimeout  = 5 * time.Minute
 )
 
 var controlPath = filepath.Join("/tmp", "slr-ssh-%C")

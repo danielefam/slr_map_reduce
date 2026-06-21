@@ -76,7 +76,9 @@ if [[ -z "$INPUT" && "$USE_COMMONCRAWL" -eq 0 ]]; then
 fi
 
 echo "=== Step 1: Fetching hosts ==="
-(cd "$SCRIPTS" && go run ./make_hosts -n "$N" -f "$HOSTS")
+# Fetch 2× the requested workers so the extras act as spares when lab machines die mid-run.
+FETCH_N=$(( N * 2 ))
+(cd "$SCRIPTS" && go run ./make_hosts -n "$FETCH_N" -f "$HOSTS")
 
 echo ""
 echo "=== Step 2: Running MapReduce ==="

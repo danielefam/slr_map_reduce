@@ -145,12 +145,13 @@ EOF
   node_id=$((node_id + 1))
 done
 
-# ── Step 6: health check ────────────────────────────────────────────────────
-echo "--- Waiting for brokers to come up ---"
+# ── Step 6: health check (up to 120 s per broker) ──────────────────────────
+echo "--- Waiting for brokers to come up (up to 120s each) ---"
 for h in "${HOSTS[@]}"; do
   ok=0
-  for _ in $(seq 1 30); do
-    if ssh -o BatchMode=yes "$h" "bash -c 'echo > /dev/tcp/127.0.0.1/${BROKER_PORT}'" 2>/dev/null; then
+  for _ in $(seq 1 60); do
+    if ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" \
+        "bash -c 'echo > /dev/tcp/127.0.0.1/${BROKER_PORT}'" 2>/dev/null; then
       ok=1; break
     fi
     sleep 2
@@ -158,7 +159,10 @@ for h in "${HOSTS[@]}"; do
   if (( ok )); then
     echo "  ✓ $h:${BROKER_PORT} is accepting connections"
   else
-    echo "  ✗ $h:${BROKER_PORT} did not come up; see $REMOTE_ROOT/kafka.log on that host" >&2
+    echo "  ✗ $h:${BROKER_PORT} did not come up in 120s" >&2
+    echo "  --- Last 20 lines of kafka.log on $h ---" >&2
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" \
+      "tail -20 $REMOTE_ROOT/kafka.log 2>/dev/null || echo '(log not found)'" >&2
     exit 1
   fi
 done
