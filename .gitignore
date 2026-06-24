@@ -20,6 +20,7 @@ vgcore.*
 *.swo
 *.swo
 *.txt
+!data/*.txt
 
 kafka/dist
 *.aux
