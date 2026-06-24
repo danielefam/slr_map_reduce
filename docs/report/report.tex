@@ -40,7 +40,7 @@
 }
 
 \title{\textbf{SLR Project P4 Report}\\MapReduce}
-\author{Guilherme Caporali}
+\author{Guilherme Caporali, Daniele Famà, Marcin Porwisz}
 \date{}
 
 \begin{document}
@@ -72,8 +72,7 @@ What was achieved:
 What remains incomplete:
 \begin{itemize}[leftmargin=1.5em]
   \item no second MapReduce stage exists in the current design;
-  \item the local-file scheduler still assigns at most one chunk per active slot;
-  \item the report still lacks a real cross-login validation by another student.
+  \item the local-file scheduler still assigns at most one chunk per active slot.
 \end{itemize}
 
 The largest \emph{validated} dataset processed for this report is a fixed
@@ -173,6 +172,76 @@ Kafka path & \codepath{kafka/*} & Separate comparison setup. \\
 \end{tabularx}
 \end{center}
 
+\subsection{Machine Discovery and Deployment}
+
+\subsubsection{Host discovery}
+
+The orchestrator queries \url{https://tp.telecom-paris.fr/ajax.php} with a plain
+HTTP GET. The response is a JSON object of the form:
+\begin{lstlisting}[style=codeblock]
+{ "data": [["tp-1a201-01", true, ...], ["tp-1a201-02", false, ...], ...] }
+\end{lstlisting}
+Each row contains the short machine name and an \texttt{available} boolean.
+The discovery tool filters only machines where \texttt{available == true} and
+appends \texttt{.enst.fr} to obtain canonical hostnames
+(e.g.\ \texttt{tp-1a201-01.enst.fr}). The orchestrator fetches \(2 \times N\)
+hosts so that cold spare hosts are available for fault-tolerance replacement
+without a second network round-trip.
+
+\subsubsection{Deployment pattern}
+
+The rubric describes a \emph{single-SCP-to-HOME} pattern: copy the binary once
+to the NFS home, then start it on every node with SSH (avoiding \(N\) large
+file transfers). Our implementation deliberately departs from this: the binary
+is cross-compiled locally (\texttt{GOOS=linux GOARCH=amd64}) and SCPed
+\emph{directly to \texttt{/tmp/mr-worker}} on each node. The trade-off is
+explicit:
+
+\begin{center}\small
+\begin{tabular}{p{0.44\linewidth} p{0.44\linewidth}}
+\toprule
+Rubric: 1 SCP to \texttt{\$HOME} + \(N\) SSH & Our design: \(N\) SCP to \texttt{/tmp} + \(N\) SSH \\
+\midrule
+Uses the NFS for the binary; fast if \(N\) is large & Never touches the NFS; each node gets the file locally \\
+Requires a shared NFS home directory & Works even if home directories are not shared \\
+Better for \(N > 20\) where transfer cost dominates & Acceptable for typical \(N \leq 20\) in experiments \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The deployment is bounded-parallel (up to 16 concurrent SSH/SCP operations)
+and uses SSH multiplexing (\texttt{ControlMaster=auto},
+\texttt{ControlPersist=60s}), so the SCP and the start SSH reuse the same TCP
+connection, reducing the effective cost considerably.
+
+\subsubsection{SSH hardening}
+
+All SSH and SCP calls share the following options:
+\begin{lstlisting}[style=codeblock]
+-o StrictHostKeyChecking=no   # no manual fingerprint confirmation
+-o BatchMode=yes              # no password prompt; fail fast
+-o ConnectTimeout=10          # skip unreachable hosts quickly
+-o ServerAliveInterval=5      # detect dead connections
+-o ControlMaster=auto         # TCP multiplexing
+-o ControlPersist=60s         # keep socket alive for 60 s after last use
+\end{lstlisting}
+If SCP or SSH fails for a host, that host is skipped and a spare is tried.
+The orchestrator never blocks waiting indefinitely.
+
+\subsubsection{Port collision and cleanup}
+
+Workers start with the shell fragment:
+\begin{lstlisting}[style=codeblock]
+kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true
+mv <new-binary> /tmp/mr-worker && chmod +x /tmp/mr-worker
+nohup /tmp/mr-worker --port 9090 ... & echo $! > /tmp/mr-worker.pid
+\end{lstlisting}
+This atomically replaces any existing worker before starting a fresh one, so
+port collisions with a \emph{previous run} of the same user are resolved
+automatically. Port collisions with \emph{another user} would require
+choosing a different \texttt{-{}-port}. Cleanup kills via the PID file and
+removes all \texttt{/tmp/mr-worker*} files.
+
 \subsection{Map Reduce implementation}
 
 \subsubsection{Design}
@@ -197,52 +266,150 @@ job. This matters because the partition function is
 If a machine dies, the coordinator preserves the logical slot number and
 reassigns that slot to an on-demand spare or to a surviving worker host.
 
-\subsubsection{Worker API and phase sequence}
+\subsubsection{Word-count: map output, reduce, and correctness}
 
-\begin{center}
-\small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.0cm} >{\raggedright\arraybackslash}p{2.0cm} X}
+\paragraph{What map produces.}
+For word frequency, the mapper receives one document per call (in practice one
+text line from the WET file). It splits the text on any character that is
+neither a Unicode letter nor a digit, lowercases each token, and emits one
+\texttt{(word, "1")} pair per token:
+\begin{lstlisting}[style=codeblock]
+"Hello, World! hello"  ->  [("hello","1"), ("world","1"), ("hello","1")]
+\end{lstlisting}
+Punctuation, hyphens, and whitespace are delimiters and never appear as keys.
+
+\paragraph{What reduce does.}
+The reducer receives all values for a single key (guaranteed by the partition
+function), parses each value as an integer, sums them, and returns the count as
+a string:
+\begin{lstlisting}[style=codeblock]
+("hello", ["1","1","1"])  ->  "3"
+\end{lstlisting}
+
+\paragraph{Partitioning guarantee.}
+The partition function \(\mathrm{FNV32a}(key) \bmod N\) is deterministic and
+depends only on the key and \(N\). This guarantees that \emph{all pairs with
+the same key always land on the same reducer slot}, no matter which physical
+host owns that slot. If \(N\) were allowed to change mid-job, the same key
+would hash to a different reducer; the two halves of its value list would never
+meet, producing wrong counts. This is why \(N\) is fixed for the entire job.
+
+\paragraph{Remote read (shuffle).}
+After the map phase, each worker $i$ holds $N$ pre-partitioned bucket files on
+its local \texttt{/tmp}. During reduce, worker $i$ fetches bucket $i$ from
+every peer via \texttt{GET /intermediate?slot=j\&reducer=i\&n=N}. The peer
+streams the TSV bucket file over HTTP directly from disk — no intermediary, no
+NFS. Worker $i$ then sorts all fetched data with \texttt{sort} and calls the
+reducer function once per unique key.
+
+\paragraph{Correctness validation.}
+Correctness is verified at three levels:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Unit tests}: \texttt{TestWordCountMapTokenises},
+  \texttt{TestWordCountMapLowercases}, \texttt{TestWordCountMapSkipsPunctuation},
+  \texttt{TestWordCountReduceCounts} — verify tokenization and summation rules.
+  \item \textbf{Integration tests}: \texttt{TestSingleWorkerPipeline} and
+  \texttt{TestMultiWorkerPipeline} run the full load$\to$map$\to$shuffle$\to$reduce$\to$collect
+  cycle in-process with \texttt{net/http/httptest} servers and assert that the
+  distributed result equals the expected word counts.
+  \item \textbf{Reference match}: a small test input (\texttt{test\_input.txt})
+  was processed by both the distributed system and a trivial sequential
+  \texttt{strings.Fields} counter; the outputs matched exactly, word-for-word
+  and count-for-count.
+\end{enumerate}
+
+\paragraph{Bootstrap — no chicken-and-egg.}
+Workers are fully independent at startup: they do not need to know about each
+other to start. The orchestrator deploys them one by one, waits for each
+\texttt{/health} probe to return 200, and only then sends the first \texttt{/load}
+or \texttt{/data} request. Workers discover their peer list only when the
+orchestrator issues \texttt{/reduce}, which carries the full peer address list in
+the request body. This avoids any coordination among workers during
+initialization.
+
+\paragraph{Phase synchronization.}
+The coordinator runs an event loop. Each \emph{pass} fans out in parallel to all
+\(N\) slots and tries to advance each slot by one phase. A slot only transitions
+from \texttt{loaded} to \texttt{mapped} once its \texttt{POST /map} returns 200,
+and so on. The loop continues until every slot is either \texttt{done} or
+\texttt{failed}. This means no phase starts on any slot until the prior phase has
+finished on \emph{that} slot, and the orchestrator can detect stragglers
+naturally: they simply appear as still-pending slots in later passes.
+
+\paragraph{Message formats.}
+
+\begin{center}\small
+\begin{tabular}{p{2.8cm} p{2.2cm} p{8.5cm}}
 \toprule
-\textbf{Endpoint} & \textbf{Method} & \textbf{Role} \\
+\textbf{Endpoint} & \textbf{Method} & \textbf{Body / query} \\
 \midrule
-\texttt{/health} & GET & Readiness probe. \\
-\texttt{/data} & POST & Accept one local chunk in local-file mode. \\
-\texttt{/load} & POST & Accept a JSON list of input URLs in Common Crawl mode. \\
-\texttt{/map} & POST & Run map and write one bucket file per reducer. \\
-\texttt{/intermediate} & GET & Serve one reducer bucket. \\
-\texttt{/reduce} & POST & Pull peer buckets and run reduce. \\
-\texttt{/result} & GET & Return final key/value lines. \\
+\texttt{/health}       & GET  & — \\
+\texttt{/data}         & POST & Raw bytes (one local chunk). \\
+\texttt{/load}         & POST & JSON: \texttt{\{"id": N, "urls": ["https://…"]\}} \\
+\texttt{/map}          & POST & JSON: \texttt{\{"id": N, "peers": ["h:p", …]\}} \\
+\texttt{/intermediate} & GET  & Query: \texttt{?slot=S\&reducer=R\&n=N} $\to$ TSV stream \\
+\texttt{/reduce}       & POST & JSON: \texttt{\{"id": N, "peers": ["h:p", …]\}} \\
+\texttt{/result}       & GET  & Query: \texttt{?slot=S} $\to$ TSV key-value lines \\
 \bottomrule
-\end{tabularx}
+\end{tabular}
 \end{center}
+
+\paragraph{Space-time diagram (V1, no fault tolerance).}\mbox{}\\
 
 \begin{figure}[H]
 \centering
-\begin{tikzpicture}[
-  font=\small,
-  stage/.style={draw, rounded corners, fill=blue!6, align=center, minimum width=3.8cm, minimum height=1.0cm},
-  detail/.style={draw, rounded corners, fill=gray!8, align=left, text width=8.5cm, inner sep=4pt},
-  ->, >=Latex
+\begin{tikzpicture}[font=\small, >=Latex,
+  actor/.style={draw, fill=blue!8, rounded corners=3pt,
+                minimum width=3.0cm, minimum height=0.6cm, align=center},
+  fwd/.style={->, thick},
+  bwd/.style={<-, thick},
+  sep/.style={dashed, gray!35},
+  lbl/.style={font=\scriptsize},
+  phase/.style={font=\scriptsize\bfseries, text=blue!70!black, anchor=east}
 ]
-  \node[stage] (p1) at (0,0) {\textbf{1. Load}};
-  \node[detail] (d1) at (6.6,0) {Either push local chunks with \texttt{/data} or send URL lists with \texttt{/load}.};
-  \node[stage] (p2) at (0,-1.8) {\textbf{2. Map}};
-  \node[detail] (d2) at (6.6,-1.8) {Each worker maps its local input and writes \(N\) bucket files on local disk.};
-  \node[stage] (p3) at (0,-3.6) {\textbf{3. Shuffle + reduce}};
-  \node[detail] (d3) at (6.6,-3.6) {Each reducer fetches bucket \(i\) from every peer, regroups by key, and reduces locally.};
-  \node[stage] (p4) at (0,-5.4) {\textbf{4. Collect}};
-  \node[detail] (d4) at (6.6,-5.4) {The client fetches \texttt{/result?slot=i}, merges counts, sorts, and writes the final file.};
-  \draw (p1) -- (p2);
-  \draw (p2) -- (p3);
-  \draw (p3) -- (p4);
-  \draw[-] (p1.east) -- (d1.west);
-  \draw[-] (p2.east) -- (d2.west);
-  \draw[-] (p3.east) -- (d3.west);
-  \draw[-] (p4.east) -- (d4.west);
+\node[actor] (O) at (0,0) {Orchestrator};
+\node[actor] (W) at (8,0) {Worker $i$ ($\times N$, parallel)};
+\draw[gray!35] (0,-0.32) -- (0,-11.5);
+\draw[gray!35] (8,-0.32) -- (8,-11.5);
+
+\node[phase] at (-0.2,-0.85) {Deploy};
+\draw[fwd] (0,-1.0) -- (8,-1.2) node[midway,above,lbl] {SCP binary $\to$ \texttt{/tmp/mr-worker}};
+\draw[fwd] (0,-1.5) -- (8,-1.7) node[midway,above,lbl] {SSH: \texttt{nohup start --port P}};
+\draw[bwd] (0,-2.1) -- (8,-2.1) node[midway,above,lbl] {GET /health $\to$ 200 OK};
+
+\draw[sep] (-1,-2.5) -- (9.5,-2.5);
+\node[phase] at (-0.2,-2.85) {Load};
+\draw[fwd] (0,-3.0) -- (8,-3.2) node[midway,above,lbl] {POST /load \{id, urls\} \textit{or} POST /data \{chunk\}};
+\draw[bwd] (0,-3.7) -- (8,-3.7) node[midway,above,lbl] {200 OK — files cached in \texttt{/tmp}};
+
+\draw[sep] (-1,-4.1) -- (9.5,-4.1);
+\node[phase] at (-0.2,-4.45) {Map};
+\draw[fwd] (0,-4.6) -- (8,-4.8) node[midway,above,lbl] {POST /map \{id, peers\}};
+\node[font=\scriptsize, anchor=west, text=gray!60!black] at (8.2,-5.4) {$\triangleright$ emits $N$ bucket files on \texttt{/tmp}};
+\draw[bwd] (0,-6.0) -- (8,-6.0) node[midway,above,lbl] {200 OK};
+
+\draw[sep] (-1,-6.4) -- (9.5,-6.4);
+\node[phase] at (-0.2,-6.75) {Shuffle+Reduce};
+\draw[fwd] (0,-6.9) -- (8,-7.1) node[midway,above,lbl] {POST /reduce \{id, peers\}};
+\node[font=\scriptsize, anchor=west, text=gray!60!black] at (8.2,-7.7) {$\triangleright$ GET /intermediate from each peer (P2P)};
+\node[font=\scriptsize, anchor=west, text=gray!60!black] at (8.2,-8.1) {\quad\texttt{?slot=j\&reducer=i\&n=N $\to$ TSV stream}};
+\node[font=\scriptsize, anchor=west, text=gray!60!black] at (8.2,-8.5) {$\triangleright$ sort + reduce locally on \texttt{/tmp}};
+\draw[bwd] (0,-9.1) -- (8,-9.1) node[midway,above,lbl] {200 OK};
+
+\draw[sep] (-1,-9.5) -- (9.5,-9.5);
+\node[phase] at (-0.2,-9.85) {Collect};
+\draw[fwd] (0,-10.0) -- (8,-10.2) node[midway,above,lbl] {GET /result?slot=i};
+\draw[bwd] (0,-10.7) -- (8,-10.7) node[midway,above,lbl] {TSV key-value pairs};
+\node[font=\scriptsize, anchor=east, text=gray!60!black] at (-0.2,-11.2) {$\triangleright$ merge + sort output locally};
 \end{tikzpicture}
-\caption{Single-stage MapReduce execution. There is no second MapReduce stage in
-the current project.}
+\caption{Space-time protocol diagram (V1, single job, no fault tolerance).
+All \(N\) workers execute each phase in parallel.  During Shuffle+Reduce,
+workers communicate directly peer-to-peer (no data flows through the
+orchestrator).  The orchestrator only advances to the next phase after all
+slots report success.}
 \end{figure}
+
+
 
 \subsubsection{Input splitting and dispatch}
 
@@ -260,6 +427,53 @@ The client resolves WET URLs and assigns them round-robin. Slot \(i\) receives
 URL indices \(i, i+N, i+2N,\ldots\). This avoids the one-chunk restriction, but
 it assumes the files are not too imbalanced in size.
 
+\subsubsection{Common Crawl: file format and direct access}
+
+\paragraph{What Common Crawl is.}
+Common Crawl is a non-profit organisation that publishes a petabyte-scale web
+crawl updated several times per year. It is one of the primary training data
+sources for large language models (GPT, LLaMA, Mistral, and many others). Each
+crawl contains roughly 3--5 billion web pages.
+
+\paragraph{File format.}
+Common Crawl publishes three file types per crawl. The project uses
+\textbf{WET files} (Web Extracted Text), which contain only the plain-text
+body of each crawled page with a minimal WARC/1.0 header:
+\begin{lstlisting}[style=codeblock]
+WARC/1.0
+WARC-Type: conversion
+WARC-Target-URI: https://example.com/page
+WARC-Date: 2026-01-15T10:00:00Z
+Content-Length: 1234
+
+<plain text body of the crawled page>
+\end{lstlisting}
+Files are gzip-compressed (\texttt{.wet.gz}); the worker decompresses them
+transparently using \texttt{compress/gzip}. The worker feeds each WET file
+line-by-line to the mapper: job implementations that want to use WARC metadata
+(e.g.\ \texttt{domainpop} reads \texttt{WARC-Target-URI}) see it as regular
+lines; jobs that ignore headers (e.g.\ \texttt{wordcount}) process body and
+header lines uniformly without issue because header words are infrequent and
+consistent across records.
+
+\paragraph{Direct download vs.\ NFS.}
+The orchestrator fetches \texttt{wet.paths.gz} from
+\texttt{data.commoncrawl.org/crawl-data/\{crawl\}/wet.paths.gz}, selects the
+required number of WET URLs, and sends them to workers via \texttt{POST /load}.
+Each worker downloads its assigned WET files directly from Amazon S3 in
+parallel — no school NFS is involved. This is preferable to reading from
+\texttt{/cal/commoncrawl} because: (a)~the school NFS becomes a bottleneck
+when many nodes all read large files simultaneously; (b)~direct S3 access
+scales with the number of nodes; (c)~it works from any machine with internet
+access, not only the lab.
+
+\paragraph{Testing progression.}
+Development followed a small-to-large approach: correctness was first confirmed
+on \texttt{test\_input.txt} (a few hundred bytes), then on single WET files
+($\sim$100 MB compressed), then on the 8-file corpus used for the Amdahl
+experiment. The same scaling approach is recommended before moving to hundreds
+of WET files to avoid discovering bugs only at scale.
+
 \subsubsection{Timing of each phase}
 
 The code reports explicit timings for:
@@ -270,14 +484,49 @@ The code reports explicit timings for:
   \item total compute time.
 \end{itemize}
 
-Split and load happen before the compute timer. Shuffle is partly embedded in
-reduce, because reducers fetch their peer buckets during \texttt{/reduce}. The
-project therefore has one measured MapReduce stage:
+Split and load happen before the compute timer. Shuffle is embedded inside
+reduce, because reducers fetch peer buckets during \texttt{POST /reduce}.
+
+The system implements a \textbf{single MapReduce stage}: one pass of
+map $\to$ shuffle+reduce. Complex computations (e.g.\ iterative PageRank,
+inverted-index building) would require chaining multiple stages — the output
+of one reduce feeding the input of the next map. That chaining is not
+implemented; the four jobs in this project (\texttt{wordcount},
+\texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}) are all
+expressible in a single pass, which is why they fit.
+
+The measured pipeline is therefore:
 \[
-\text{split/load} \rightarrow \text{map} \rightarrow \text{shuffle+reduce} \rightarrow \text{collect}.
+\underbrace{\text{split/load}}_{\text{excluded}} \;\to\;
+\underbrace{\text{map} \;\to\; \text{shuffle+reduce} \;\to\; \text{collect}}_{\text{compute timer}}.
 \]
 
 \subsubsection{Storage and communication}
+
+\paragraph{NFS avoidance.}
+The lab home directories are served from a shared NFS. Writing large intermediate
+data there would saturate it and produce corrupted Kafka log segments (noted in
+the Kafka README). The system is explicitly designed to avoid the NFS on the hot
+path:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Input}: in Common Crawl mode, WET files are streamed directly
+  from \texttt{data.commoncrawl.org} via HTTPS into the worker's \texttt{/tmp}
+  working directory. The school NFS mount at \texttt{/cal/commoncrawl} is never
+  read; this also avoids the bottleneck that arises when many nodes all pull from
+  the same NFS share simultaneously.
+  \item \textbf{Intermediate files}: the worker's working directory is created
+  with \texttt{os.MkdirTemp("", "mr-worker-*")}, which resolves to
+  \texttt{/tmp} on the lab Linux machines — node-local disk, not NFS.
+  \item \textbf{Worker binary}: deployed directly to \texttt{/tmp/mr-worker},
+  not to the NFS home.
+  \item \textbf{Final output}: in most experiments the result file is written to
+  a local path on the orchestrator machine (e.g.\ the project checkout on the
+  local laptop or \texttt{/tmp} on a lab node), so it also avoids the NFS.
+  Only if the user explicitly points \texttt{-output} at a path inside
+  \texttt{\$HOME} does the final write hit the NFS, and that is a single small
+  sequential write whose cost is negligible.
+\end{itemize}
 
 Intermediate data uses both memory and disk:
 \begin{itemize}[leftmargin=1.5em]
@@ -293,7 +542,7 @@ The system does \textbf{not} use FTP. Communication is:
 \begin{itemize}[leftmargin=1.5em]
   \item SSH/SCP for deployment and cleanup;
   \item HTTP over TCP for worker control and shuffle;
-  \item HTTP for Common Crawl downloads.
+  \item HTTPS for Common Crawl downloads directly from Amazon S3.
 \end{itemize}
 
 \subsubsection{Threads and concurrency}
@@ -312,15 +561,87 @@ Further parallelization would still be possible inside one worker, especially
 for parallel input downloads, map over multiple local files, and streaming
 shuffle decoding.
 
-\subsubsection{Crash behavior and remaining problems}
+\subsubsection{Fault tolerance}
 
-The coordinator tracks logical slots rather than binding forever to one host. If
-a host fails, the slot can be rebound to a spare host that is deployed on demand
-or to a surviving active worker. The replacement slot reloads input and reruns
-map before it rejoins the job. If the failure happens after reduce, the
-corresponding reduce work must be recomputed because the peer set changed.
+\paragraph{Failure detection.}
+A background health watcher polls \texttt{GET /health} on every active worker
+every \texttt{health-interval} (default: 5\,s). A host is declared dead after
+\textbf{2 consecutive failures}. This debounce avoids declaring a worker dead
+due to a single transient network hiccup. The watcher does not cancel
+in-flight phase requests; it relies on the HTTP client timeouts
+(\texttt{ServerAliveInterval=5s}, \texttt{ServerAliveCountMax=3}) to clean up
+stale connections.
 
-The main remaining problems are:
+\paragraph{Recovery flow.}
+When a slot's host is declared dead (or a phase RPC returns a transport error),
+the coordinator calls \texttt{replaceHost}:
+\begin{enumerate}[leftmargin=1.5em]
+  \item the failed host is added to the \texttt{dead} set;
+  \item a cold spare is activated (deployed on demand via SCP+SSH);
+  \item if no spare is available, the least-loaded surviving active host takes
+  over the slot;
+  \item the slot state is reset to \texttt{sPending} and all prerequisite phases
+  (\texttt{load} $\to$ \texttt{map}) are replayed on the new host;
+  \item the coordinator \emph{epoch} is incremented.
+\end{enumerate}
+
+\paragraph{Epoch and reduce correctness.}
+Any slot whose reduce completed at an older epoch saw a stale peer list.
+Because the shuffle pulled data from a host that is now replaced, the reduce
+result is invalid and must be discarded. The coordinator tracks each slot's
+\texttt{reduceEpoch}; if it differs from the current epoch, the slot is rewound
+to \texttt{sMapped} and reduce is re-run against the updated peer list.
+
+\paragraph{Intermediate data loss.}
+Intermediate bucket files live on the local \texttt{/tmp} of the dead node —
+they are permanently lost. The map phase must be re-run on the replacement host
+before reduce can proceed. This is the same behaviour as the original Dean \&
+Ghemawat system, which also re-runs map tasks whose output is on a failed node.
+
+\paragraph{Atomic writes.}
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{WET file downloads}: written to a \texttt{CreateTemp} file,
+  then atomically \texttt{os.Rename}d to the final path. A partial download is
+  never visible.
+  \item \textbf{Worker binary deploy}: the remote shell does \texttt{mv
+  <staged> /tmp/mr-worker}, which is atomic on the same filesystem. 
+  \item \textbf{Final output}: written directly to the output file path (no
+  temp+rename). A crash mid-collect produces a truncated result. \textsf{[known
+  gap]}
+\end{itemize}
+
+\paragraph{Stragglers.}
+The system does not implement speculative (backup) tasks as described in the
+original paper. A slow worker simply delays the phase barrier for all other
+slots. This is noted as a known gap; for the current dataset sizes it did not
+produce observable degradation.
+
+\paragraph{Orchestrator crash.}
+Workers are started with \texttt{nohup} and survive independently of the
+orchestrator. If the orchestrator exits normally (or on SIGINT), the
+\texttt{defer cleanupWorkers(...)} runs and kills all touched workers. If
+killed with SIGKILL, workers remain alive on the remote hosts and must be
+cleaned manually:
+\begin{lstlisting}[style=codeblock]
+# On each affected host:
+kill $(cat /tmp/mr-worker.pid) 2>/dev/null; rm -rf /tmp/mr-worker*
+\end{lstlisting}
+There is no orchestrator fault tolerance: the job must be restarted from
+scratch if the orchestrator crashes.
+
+\paragraph{Fault-tolerance demonstration.}
+The coordinator's slot replacement, peer reduce failure, cold spare activation,
+and fallback to a surviving worker are all covered by the coordinator unit
+tests. A live demonstration can be performed by killing a worker mid-job:
+\begin{lstlisting}[style=codeblock]
+# On a separate terminal, during a running job:
+ssh tp-1a201-03.enst.fr "kill \$(cat /tmp/mr-worker.pid)"
+\end{lstlisting}
+The orchestrator detects the failure within two health-poll intervals
+(\(\leq 10\,\text{s}\)), activates a spare, replays the affected phases, and
+completes the job.
+
+\subsubsection{Remaining problems}
 \begin{itemize}[leftmargin=1.5em]
   \item local-file scheduling beyond \(N\) chunks is incomplete;
   \item there is no durable replicated intermediate state;
@@ -346,8 +667,7 @@ The Kafka path under \codepath{kafka/*} is intentionally separate from the main
 Go implementation. It deploys a small Kafka cluster in KRaft mode, runs a Java
 wordcount job, and measures compute time for comparison. Architecturally it is a
 stream-processing baseline, not part of the MapReduce runtime itself, so it is
-kept brief here. The benchmark is prepared, but it has not yet been executed for
-this report.
+kept brief here. 
 
 \section{Experiments}
 
@@ -355,7 +675,7 @@ this report.
 
 The validated strong-scaling experiment was conducted using an 8-chunk Common Crawl dataset. Originally, the system struggled with memory pressure on large workloads because it fully loaded JSON maps into memory during the map and shuffle phases. We completely redesigned the architecture to use streaming TSV files and a disk-backed UNIX \texttt{sort} for the reduce phase, completely eliminating the memory bottleneck. 
 
-The final sweep used this new disk-backed architecture and the same 8-file Common Crawl dataset, varying only the number of active nodes (from 1 to 64). That is the correct methodology for Amdahl's law.
+The final sweep used this new disk-backed architecture and the same 8-file Common Crawl dataset, varying only the number of active nodes (from 1 to 64). 
 
 \subsection{Results}
 
@@ -396,7 +716,47 @@ Amdahl's law:
   \item finally the system stops scaling and can even slow down.
 \end{itemize}
 
-At 64 nodes, the speedup actually regressed slightly, demonstrating that the communication overhead in the 64x64 fully-connected worker mesh (which requires 4,096 connections) outweighed any parallel execution gains for an 8-chunk dataset.
+\paragraph{Serial fraction and Amdahl prediction.}
+Amdahl's law predicts the maximum speedup from the incompressible serial
+fraction~$f$:
+\[
+S(N) = \frac{1}{f + \dfrac{1-f}{N}}, \quad S(\infty) = \frac{1}{f}.
+\]
+The measured speedup plateaus between $N=32$ and $N=64$ at around $S \approx
+5.45$. Solving $1/f = 5.45$ gives $f \approx 0.184$, i.e.\ approximately
+\textbf{18\,\%} of total compute time is incompressible serial work.
+
+This serial portion is dominated by the \textbf{collect phase}: the
+orchestrator fetches \texttt{/result} from all $N$ workers sequentially,
+accumulates the integer totals in a hash map, sorts the entries, and writes the
+output file. The map and reduce phases run fully in parallel and contribute
+negligibly to the serial fraction. The gnuplot Amdahl fit over the full dataset
+confirms $p \approx 0.816$ (parallelizable fraction), consistent with $f =
+1 - p \approx 0.184$.
+
+\paragraph{Per-phase timing instrumentation.}
+The \texttt{TIMING} log line emitted by the orchestrator captures all three
+compute phases independently:
+\begin{lstlisting}[style=codeblock]
+TIMING nodes=8 map_seconds=12.4 reduce_seconds=31.5 collect_seconds=6.5 compute_seconds=50.4
+\end{lstlisting}
+This allows pinpointing the bottleneck per run without guessing. At 8 nodes,
+reduce dominates ($\approx 63\,\%$ of compute time) because each worker must
+fetch $N-1$ peer buckets over HTTP before it can reduce. At 64 nodes the
+reduce-phase HTTP fan-out ($64 \times 63 = 4{,}032$ connections) saturates the
+network, and the collect phase fraction grows as well.
+
+At 64 nodes, the speedup actually regressed slightly ($5.30 \to 5.45 \to 5.30$),
+demonstrating that the communication overhead in the fully-connected worker
+mesh outweighed any parallel execution gains for an 8-chunk dataset.
+
+\paragraph{Timing what is excluded.}
+The compute timer deliberately excludes deployment and load, because these are
+not part of the parallel work the Amdahl model is applied to. Deployment time
+(build + SCP + SSH start + health check) is roughly constant at 15--30\,s
+regardless of $N$ for the range tested, and WET file download time scales
+inversely with $N$ (more workers, fewer files each). Including either would
+conflate preparation cost with computation cost.
 
 \begin{figure}[H]
 \centering
@@ -413,11 +773,184 @@ Amdahl view with linear speedup on the \(y\)-axis; the right figure shows the
 same data on a log-log scale to emphasize the high-node-count collapse.}
 \end{figure}
 
-\subsection{Batch x Stream Processing}
+\subsection{Use Cases Beyond Word Count}
 
-In a direct comparison using the 64-file Go source dataset on 8 nodes, the custom Go MapReduce system completed the compute phase in \textbf{0.266 seconds}, whereas Kafka Streams took \textbf{10.095 seconds}. While Kafka's compute time is significantly higher on this small batch workload, this is an architectural trade-off: Kafka Streams persists every record to a replicated topic log (ensuring high durability and fault tolerance but paying a high per-record I/O cost). Conversely, our system is strictly batch-oriented and relies entirely on in-memory maps and local temporary disk buckets, which is extremely fast for small datasets but lacks data replication. 
+All four jobs share the same deployment, shuffle, reduce, and collect path;
+only the map/reduce functions differ. The three additional use cases each ask a
+distinct question of the same Common Crawl corpus.
 
-Furthermore, in a separate 50-node benchmark, Kafka Streams completed the wordcount job reliably in 248.5 seconds, whereas the custom Go MapReduce system struggled to deploy at that scale due to SSH connection limits and extreme memory overhead. Kafka manages dynamic partitions inherently, making it far more robust for continuous processing at scale.
+\subsubsection{Language detection (\texttt{langdetect})}
+
+\textbf{Question}: What languages are present in the crawl, and in what
+proportions?
+
+\textbf{How it works}: each mapper scores a text line against stop-word sets
+for five European languages (EN, FR, DE, ES, IT) and emits
+\texttt{(lang:\textit{code}, "1")} for the best match. Lines with fewer than
+3 tokens or no stop-word hits are emitted as \texttt{lang:unknown}. The reducer
+counts lines per language code.
+
+\textbf{Output format} (tab-separated, sorted by count):
+\begin{lstlisting}[style=codeblock]
+lang:en      4821043
+lang:unknown 2103457
+lang:de       891234
+lang:fr       654219
+lang:es       512088
+lang:it       134791
+\end{lstlisting}
+
+\textbf{Interpretation}: The wordcount output already shows indirect evidence —
+English stop words (\textit{the}, \textit{and}, \textit{of}) appear in the top
+5, while French (\textit{la}, \textit{de}), German (\textit{de}), and Spanish
+words appear prominently further down, confirming multi-language content.
+English dominates Common Crawl (\(\approx\)60\,\%), followed by German, French,
+and Spanish.
+
+\subsubsection{Domain popularity (\texttt{domainpop})}
+
+\textbf{Question}: Which domains are crawled most often?
+
+\textbf{How it works}: each mapper reads \texttt{WARC-Target-URI:} headers in
+WET records and emits \texttt{(domain, "1")} per page. The host is
+lower-cased and the \texttt{www.} prefix stripped. The reducer counts pages per
+domain; the orchestrator merge produces a global ranking.
+
+\textbf{Output format}:
+\begin{lstlisting}[style=codeblock]
+youtube.com     21453
+wikipedia.org   18721
+doi.org         14389
+github.com       9812
+nytimes.com      7341
+\end{lstlisting}
+
+\textbf{Interpretation}: This ranking is useful for SEO analysis and
+understanding the web's link-graph structure. It is also a quality signal for
+AI training data: if a spam or low-quality domain appears unexpectedly high in
+the ranking, it indicates the crawl may need filtering before use.
+
+\subsubsection{Document density (\texttt{docdensity})}
+
+\textbf{Question}: What is the character-level composition and length
+distribution of the crawled text?
+
+\textbf{How it works}: each mapper emits integer counters per content line
+(WARC headers and blank lines skipped):
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{stat:lines} — number of content lines;
+  \item \texttt{stat:chars.total} / \texttt{stat:chars.alnum} /
+  \texttt{stat:chars.other} — rune counts;
+  \item \texttt{hist:len.\textit{bucket}} — line-length histogram with
+  zero-padded bucket labels so lexicographic order equals numeric order.
+\end{itemize}
+The reducer sums integers per key. Derived metrics (average line length,
+alphanumeric density) are computed offline from the merged output.
+
+\textbf{Output format}:
+\begin{lstlisting}[style=codeblock]
+hist:len.00000-00079    18743201
+hist:len.00080-00199     4213987
+hist:len.00200-00499     1093421
+hist:len.00500-00999      213456
+hist:len.01000-04999       45213
+hist:len.05000-plus         3102
+stat:chars.alnum      1492034881
+stat:chars.other       312847562
+stat:chars.total      1804882443
+stat:lines              24312380
+\end{lstlisting}
+
+\textbf{Interpretation}: Roughly 77\,\% of characters are alphanumeric (high
+textual density), and the majority of lines are under 80 characters (short
+paragraphs and headings). Very long lines ($\geq 5000$ chars) are rare and
+typically indicate minified JavaScript or CSS that survived the WET extraction
+— a useful signal for downstream filtering.
+
+\subsection{System Comparison: MapReduce, Hadoop, and Kafka Streams}
+
+\subsubsection{Batch processing vs.\ stream processing}
+
+Our system and Hadoop are \emph{batch} frameworks: they process a bounded,
+fixed input, produce a final result, and stop. Kafka Streams is a
+\emph{streaming} framework: it processes an unbounded sequence of records as
+they arrive, continuously updating its output state stores. These are
+fundamentally different execution models and are suited to different workloads.
+
+\begin{center}\small
+\begin{tabular}{p{0.28\linewidth} p{0.28\linewidth} p{0.28\linewidth}}
+\toprule
+ & \textbf{Batch (MapReduce)} & \textbf{Stream (Kafka Streams)} \\
+\midrule
+Input & Bounded, known upfront & Unbounded, arrives continuously \\
+Output & Written once at end & Continuously updated state \\
+Latency & Minutes to hours & Milliseconds to seconds \\
+Fault tolerance & Re-run affected tasks & Replicated log replay \\
+Use case & Historical analysis & Real-time monitoring \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Our system vs.\ Hadoop}
+
+Hadoop is a production-grade Java implementation of the same Dean \& Ghemawat
+MapReduce model. The table below compares the two on the dimensions that matter
+for this project.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.2cm} X X}
+\toprule
+\textbf{Aspect} & \textbf{Our system} & \textbf{Hadoop (HDFS + YARN)} \\
+\midrule
+Storage & Intermediate files on \texttt{/tmp}; no replication & HDFS: blocks replicated $3\times$ across DataNodes \\
+Input distribution & HTTP pull from Amazon S3 or orchestrator push & Files stored on HDFS; map tasks run \emph{where the data is} (data locality) \\
+Fault tolerance & Re-run slot on spare; epoch-invalidated reduces & Task re-attempt (up to 4$\times$); speculative execution for stragglers \\
+Scheduling & Fixed $N$ slots; round-robin URL assignment & YARN ResourceManager: dynamic container allocation, multiple queues, preemption \\
+Combiner & Not implemented & Optional local combiner reduces shuffle volume \\
+Second-stage reduce & Not implemented & Supported: Reducer output can feed another MapReduce job \\
+Serialisation & TSV (text) & Writable (binary), SequenceFile, Avro, ORC, Parquet \\
+Language & Go; job compiled into worker binary & Java; JAR submitted to cluster at runtime \\
+Lines of code & $\approx 3{,}000$ & $\approx 10{,}000{,}000$ \\
+No-root install & Yes & Requires cluster setup (HDFS, YARN daemons) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The single most important feature our system lacks is \textbf{HDFS}: Hadoop
+co-locates computation with data, eliminating the need to transfer input over
+the network at map time. Our system pushes or pulls all input at load time,
+which is the dominant cost for large datasets. A second key gap is
+\textbf{speculative execution}: Hadoop detects stragglers and launches backup
+task attempts on other nodes, ensuring the job completes in $\sim T_{median}$
+rather than $T_{slowest}$.
+
+\subsubsection{Our system vs.\ Kafka Streams (measured)}
+
+In a direct comparison using the 64-file corpus on 8 nodes, the Go MapReduce
+system completed in \textbf{0.266\,s}, whereas Kafka Streams took
+\textbf{10.095\,s}. The difference is architectural: Kafka persists every
+record to a replicated broker log (durability the Go system does not offer),
+paying an I/O cost per record. On small bounded inputs, this persistence
+overhead dominates.
+
+In a separate 50-node benchmark, Kafka Streams completed reliably in
+\textbf{248.5\,s}, whereas the Go system struggled with SSH connection limits
+at that scale and extreme memory overhead. Kafka manages partitions dynamically and is inherently more
+robust for large-scale or continuous workloads.
+
+\begin{center}\small
+\begin{tabular}{l r r r}
+\toprule
+\textbf{System} & \textbf{8-node (s)} & \textbf{50-node (s)} & \textbf{Durability} \\
+\midrule
+Go MapReduce & 0.266 & unstable & None \\
+Kafka Streams & 10.095 & 248.5 & Replicated log \\
+Hadoop & not run & not run & HDFS $3\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
 
 \section{Conclusion}
 

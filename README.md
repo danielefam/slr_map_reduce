@@ -29,7 +29,6 @@ of remote lab machines (`*.enst.fr`).
 - Go 1.25+
 - SSH key-based access (no password) to the remote machines
 - Network access to `tp.telecom-paris.fr` (for host discovery)
-- On macOS, SSH multiplexing uses `/tmp` to avoid Unix socket path-length limits
 
 ---
 

@@ -47,101 +47,110 @@
 
   \vspace{-0.5em}
   \begin{block}{One-sentence summary}
-    A custom Go MapReduce framework running on \texttt{*.enst.fr} workers, with direct Common Crawl input, pluggable jobs, local-disk shuffle, and fault-aware coordination.
+    A custom Go MapReduce framework running on \texttt{*.enst.fr} workers — direct Common Crawl input, pluggable jobs, local-disk shuffle, fault-aware coordination, no root, no Docker.
   \end{block}
-  \note{Timing: 30 seconds. Say that the goal is not to reproduce Hadoop completely, but to build and understand a working distributed MapReduce system under lab constraints: shared machines, SSH, no root, no Docker, and pressure on NFS.}
+  \note{Timing: 20 seconds. No introduction needed beyond the block.}
 \end{frame}
 
 \begin{frame}{What We Built}
   \begin{itemize}
-    \item Automatic host discovery from \texttt{https://tp.telecom-paris.fr/ajax.php}
-    \item Go orchestrator that builds, deploys, starts, monitors, and cleans workers
-    \item HTTP worker API for \texttt{load -> map -> shuffle -> reduce -> result}
-    \item Direct Common Crawl WET download from \texttt{data.commoncrawl.org}
-    \item Four jobs: \texttt{wordcount}, \texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}
+    \item Host discovery from \texttt{tp.telecom-paris.fr/ajax.php} — live JSON, canonical \texttt{.enst.fr} names, $2\times N$ pool for cold spares
+    \item Go orchestrator: build worker binary, deploy, coordinate phases, merge results
+    \item HTTP worker API: \texttt{/load} $\to$ \texttt{/map} $\to$ \texttt{/intermediate} $\to$ \texttt{/reduce} $\to$ \texttt{/result}
+    \item Four pluggable jobs sharing the same framework: \texttt{wordcount}, \texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}
+    \item 89 Go tests; reference wordcount matched exactly against sequential implementation
   \end{itemize}
-
-  \begin{block}{Current verification}
-    89 Go tests passed, live 100-host discovery passed, and a small reference wordcount matched exactly.
-  \end{block}
-  \note{Timing: 1 minute. Emphasize that the core distributed computation is real: workers map local input, write reducer buckets, fetch buckets from peers, reduce, and return outputs.}
+  \note{Timing: 45 seconds. The core distributed computation is real — workers map, write buckets, fetch from peers, reduce.}
 \end{frame}
 
-\begin{frame}[fragile]{Architecture}
-\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
-User shell
-  |
-  v
-mapreduce.sh
-  |-- make_hosts -> hosts.txt
-  |
-  v
-Go orchestrator
-  |-- build worker with selected job
-  |-- SCP + SSH start workers
-  |-- health checks and retries
-  |-- load / map / reduce / collect
-  v
-Remote workers on lab machines
-  /health /data /load /map /intermediate /reduce /result
-\end{lstlisting}
-
-  \vspace{-0.3em}
-  \textbf{Design choice:} the client is the Main. Workers are stateless between jobs except for local temporary files under \texttt{/tmp}.
-  \note{Timing: 1 minute 15 seconds. Explain that there is no permanent cluster service. Each run selects machines, builds the worker with the selected job, starts workers, runs the job, then cleans up.}
+\begin{frame}{Key Design Choices}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.48\textwidth}
+      \textbf{Storage: everything avoids NFS}
+      \begin{itemize}
+        \item Input: streamed directly from \texttt{data.commoncrawl.org} (Amazon S3) — \texttt{/cal/commoncrawl} never read
+        \item Intermediate bucket files: \texttt{os.MkdirTemp} $\to$ \texttt{/tmp} on each worker
+        \item Worker binary: SCPed to \texttt{/tmp/mr-worker}, not \texttt{\$HOME}
+        \item Final output: written locally on the orchestrator
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Deployment: $N$ SCP to \texttt{/tmp}}
+      \begin{itemize}
+        \item Binary cross-compiled locally (\texttt{GOOS=linux GOARCH=amd64})
+        \item $N$ SCPs directly to \texttt{/tmp} (vs.\ rubric's 1 SCP to NFS home)
+        \item Trade-off: avoids NFS entirely; acceptable for $N \leq 20$
+        \item SSH multiplexing (\texttt{ControlMaster}): SCP and start share one TCP connection
+        \item \texttt{BatchMode=yes}, \texttt{StrictHostKeyChecking=no}, \texttt{ConnectTimeout=10}
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute. This slide directly answers the NFS/deployment exam questions. The key message: every hot-path write goes to local /tmp; the NFS is only touched for the final small result file if the user chooses a home path.}
 \end{frame}
 
-\begin{frame}[fragile]{Protocol and Dataflow}
-  \begin{enumerate}
-    \item \textbf{Load}: local file chunks via \texttt{/data}, or Common Crawl WET URLs via \texttt{/load}
-    \item \textbf{Map}: each worker writes \texttt{N} bucket files on local disk
-    \item \textbf{Shuffle + reduce}: reducer \texttt{i} pulls bucket \texttt{i} from every peer via \texttt{/intermediate}
-    \item \textbf{Collect}: Main fetches \texttt{/result}, merges integer values, sorts, writes final output
-  \end{enumerate}
-
-  \begin{block}{Reducer assignment}
-\begin{lstlisting}
-FNV-32a(key) % N
-\end{lstlisting}
-  \end{block}
-  \note{Timing: 1 minute 15 seconds. The key point is partitioning at map time. During reduce, each worker directly serves the bucket requested by the reducer, avoiding a full scan of all intermediate data during shuffle.}
+\begin{frame}{Protocol and Dataflow}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.50\textwidth}
+      \begin{enumerate}
+        \item \textbf{Load} — Common Crawl URLs via \texttt{POST /load}; workers download WET files to \texttt{/tmp}
+        \item \textbf{Map} — each worker writes $N$ bucket files on local disk (\texttt{/tmp})
+        \item \textbf{Shuffle+Reduce} — reducer $i$ pulls bucket $i$ from every peer via \texttt{GET /intermediate} (P2P, no orchestrator)
+        \item \textbf{Collect} — orchestrator fetches \texttt{/result}, merges, sorts, writes output
+      \end{enumerate}
+    \end{column}
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Partitioning}
+        \texttt{FNV-32a(key) \% N}\\[0.4em]
+        All values for the same key always route to the same reducer. $N$ stays \textbf{fixed} for the job — changing it mid-run would split the value list across two reducers.
+      \end{block}
+      \begin{block}{Bootstrap}
+        Workers start independently. Peers are discovered only when the orchestrator sends \texttt{POST /reduce \{peers:[...]\}}.
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute 20 seconds. Emphasise P2P shuffle — no data flows through the orchestrator. The orchestrator is a coordinator, not a data plane.}
 \end{frame}
 
-\begin{frame}{Fault Tolerance and Operations}
-  \begin{itemize}
-    \item Logical \textbf{slots} stay fixed: \texttt{0..N-1}
-    \item Physical hosts can be replaced by cold spares
-    \item Health watcher polls \texttt{/health} and marks repeated failures dead
-    \item Failed slots replay prerequisites: \texttt{load -> map -> reduce}
-    \item If a peer dies during reduce, coordinator re-runs stale reduces with the new peer list
-    \item Cleanup is idempotent: kill PID if present, remove worker files, tolerate repeated cleanup
-  \end{itemize}
-
-  \begin{block}{Tested behavior}
-    Coordinator replacement, peer reduce failure, cold spare activation, and fallback to a surviving worker.
-  \end{block}
-  \note{Timing: 1 minute. Explain the logical slot idea: hash partitioning depends on N, so N stays stable while the machine behind a slot can change.}
+\begin{frame}{Fault Tolerance}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.50\textwidth}
+      \textbf{Detection}
+      \begin{itemize}
+        \item Health watcher polls \texttt{GET /health} every 5\,s
+        \item Host declared dead after \textbf{2 consecutive failures}
+      \end{itemize}
+      \textbf{Recovery}
+      \begin{itemize}
+        \item Slot $\to$ spare host; slot state reset to \texttt{pending}
+        \item Prerequisites replayed: \texttt{load} $\to$ \texttt{map} $\to$ \texttt{reduce}
+        \item \textbf{Epoch} incremented: any reduce at old epoch is rewound and re-run (peer set changed)
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Atomic writes}
+        WET downloads: \texttt{CreateTemp} + \texttt{os.Rename} (ok)\\
+        Binary deploy: \texttt{mv} on same filesystem (ok)\\
+        Final output: direct write (known gap)
+      \end{block}
+      \begin{block}{Known gaps}
+        No speculative execution for stragglers.\\
+        Orchestrator crash $\Rightarrow$ job must restart (workers survive via \texttt{nohup}).
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 55 seconds. The epoch mechanism is the most interesting part — it guarantees that a reduce whose peer set changed is never silently accepted.}
 \end{frame}
 
 \begin{frame}{Use Cases Beyond Wordcount}
-  \begin{table}
-    \small
-    \begin{tabular}{>{\ttfamily}l p{0.42\linewidth} p{0.27\linewidth}}
-      \toprule
-      Job & What it measures & Example output \\
-      \midrule
-      wordcount & Token frequency & \texttt{the 239298} \\
-      langdetect & Language signal counts & \texttt{lang:en}, \texttt{lang:fr} \\
-      domainpop & Crawled domain popularity & \texttt{doi.org}, \texttt{youtube.com} \\
-      docdensity & Content size and density & \texttt{stat:lines}, \texttt{hist:len.*} \\
-      \bottomrule
-    \end{tabular}
-  \end{table}
-
-  \begin{block}{Framework property}
-    All reducers emit integer values, so the orchestrator can safely merge partial outputs across jobs.
+  \begin{itemize}
+    \item \textbf{langdetect} — stop-word scoring per line (EN/FR/DE/ES/IT); WARC headers skipped; result: language share across the crawl. \textit{Common Crawl is $\approx$60\,\% English.}
+    \item \textbf{domainpop} — reads \texttt{WARC-Target-URI:} header per WET record; counts pages per domain; result: global domain popularity ranking (\textit{youtube.com, wikipedia.org, doi.org} top-ranked). Quality signal: unexpectedly high-ranked spam domains flag filtering needs.
+    \item \textbf{docdensity} — counts chars, alphanumeric ratio, and line-length histogram per content line; result: $\approx$77\,\% alphanumeric, most lines $<$80 chars, very long lines $=$ minified JS/CSS.
+  \end{itemize}
+  \begin{block}{Why Common Crawl matters}
+    One of the primary training data sources for GPT, LLaMA, Mistral and most modern LLMs. These jobs are the kind of analysis that precedes any large-scale dataset curation.
   \end{block}
-  \note{Timing: 1 minute. The extra jobs demonstrate that this is a framework, not only a wordcount script. They reuse the same deployment, shuffle, reduce, and collect path.}
+  \note{Timing: 45 seconds. Stress that all four jobs reuse the same deploy/shuffle/reduce/collect path. Only the map and reduce functions differ.}
 \end{frame}
 
 \begin{frame}{Measurements and Amdahl's Law}
@@ -151,92 +160,73 @@ FNV-32a(key) % N
     \end{column}
     \begin{column}{0.4\textwidth}
       \begin{itemize}
-        \item \texttt{1 node}: 206.95 s, speedup 1.00
-        \item \texttt{16 nodes}: 40.80 s, speedup 5.07
-        \item \texttt{64 nodes}: 39.06 s, speedup 5.30
+        \item Same 8 WET files at every point (correct methodology)
+        \item \texttt{1 node}: 206.95\,s $\Rightarrow$ baseline
+        \item \texttt{16 nodes}: 40.80\,s, speedup 5.07
+        \item \texttt{64 nodes}: 39.06\,s — \emph{regression}
       \end{itemize}
-      \begin{block}{Interpretation}
-        After useful parallelism is exhausted, communication, synchronization, and final merge dominate.
+      \begin{block}{Serial fraction}
+        Plateau $S\!\approx\!5.45$ $\Rightarrow$ $f\!\approx\!18\%$ serial.\\
+        Source: orchestrator collect phase (sequential merge of $N$ results) and $N\!\times\!(N\!-\!1)$ HTTP connections at 64 nodes.
       \end{block}
     \end{column}
   \end{columns}
-  \note{Timing: 1 minute 15 seconds. The curve is a good teaching result: speedup improves, then flattens. At high N the worker mesh and reduce traffic become the bottleneck.}
+  \note{Timing: 1 minute 15 seconds. f=18\% means 82\% of the work is parallelisable. The collect phase grows with N and becomes the ceiling.}
 \end{frame}
 
-\begin{frame}{Batch MapReduce vs Kafka Streams}
+\begin{frame}{Three-Way Comparison}
   \begin{table}
     \small
-    \begin{tabular}{p{0.45\linewidth} p{0.45\linewidth}}
+    \begin{tabular}{l p{0.26\linewidth} p{0.26\linewidth} p{0.26\linewidth}}
       \toprule
-      Custom MapReduce & Kafka Streams \\
+       & \textbf{Our MapReduce} & \textbf{Hadoop} & \textbf{Kafka Streams} \\
       \midrule
-      Batch job with explicit phases & Continuous stream processing model \\
-      Lightweight HTTP + local temp files & Persistent Kafka log and state stores \\
-      Fast on small bounded workloads & More operationally robust at scale \\
-      No HDFS-style replication & Built around durable broker storage \\
+      Model & Batch, 1 stage & Batch, multi-stage & Stream, unbounded \\
+      Storage & \texttt{/tmp}, no replication & HDFS 3$\times$ replication & Replicated broker log \\
+      Data locality & No — HTTP pull & Yes — run where data lives & Broker partitions \\
+      Stragglers & Not handled & Speculative execution & N/A \\
+      8-node wordcount & 0.27\,s & not run & 10.1\,s \\
       \bottomrule
     \end{tabular}
   \end{table}
-
-  \begin{block}{Kafka comparison path}
-    Kafka runs without Docker or root: KRaft deployment in \texttt{/tmp}, Java Streams wordcount, timing by consumer-group lag.
+  \begin{block}{Biggest gaps vs.\ Hadoop}
+    (1) HDFS data locality — we transfer all input at load time.
+    (2) Speculative execution — one slow node blocks the whole phase.
   \end{block}
-  \note{Timing: 50 seconds. Kafka is not just a faster or slower version of our system. It is a different model: it pays persistence and broker overhead, but gains durability and a mature streaming runtime.}
+  \note{Timing: 55 seconds. Kafka difference is model-level (stream vs batch). Hadoop difference is engineering-level (production data locality + scheduling we did not build).}
 \end{frame}
 
-\begin{frame}{What Is Missing and One-Week Plan}
-  \small
-  \begin{tabular}{p{0.43\linewidth} p{0.48\linewidth}}
-    \toprule
-    Gap & One-week fix \\
-    \midrule
-    Exact \texttt{1 SCP to HOME + 100 SSH} rubric mode & Add compatibility deploy mode or document design choice \\
-    Port collision preflight & Remote port check before starting workers \\
-    Standalone MapReduce cleanup script & Add \texttt{clean\_mapreduce.sh} using host file \\
-    \texttt{/cal/commoncrawl} evidence & Add input mode or document direct Amazon path as replacement \\
-    Local storage proof & Save \texttt{df} / \texttt{mount} evidence for lab machines \\
-    Large remote proof & Run and save 100-node / larger-split logs \\
-    Stragglers and atomic final writes & Add speculative task note or implement temp+rename outputs \\
-    \bottomrule
-  \end{tabular}
-
-  \vspace{0.7em}
-  \begin{block}{Presentation stance}
-    The core system works; remaining work is mostly operational hardening and evidence collection.
-  \end{block}
-  \note{Timing: 1 minute 10 seconds. Be honest and calm. These are mostly operational and evidence gaps. The MapReduce protocol, jobs, and recovery model already work and are tested.}
-\end{frame}
-
-\begin{frame}[fragile]{Demo and Discussion Plan}
-  \begin{block}{Live demo path}
-\begin{lstlisting}[language=bash]
-(cd scripts && go test ./...)
-./mapreduce.sh -job scripts/jobs/wordcount \
-  -input test_input.txt -n 4 -output result.txt
-./run_all_commoncrawl_jobs.sh -crawl CC-MAIN-2026-21 \
+\begin{frame}[fragile]{What's Missing + Demo}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.44\textwidth}
+      \textbf{Real remaining gaps}
+      \begin{itemize}
+        \item Atomic final output write (temp+rename)
+        \item Speculative execution for stragglers
+        \item Port collision preflight check
+        \item Multi-chunk scheduling in local-file mode
+        \item Cross-login validation
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Live demo}
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+cd scripts && go test ./...
+./mapreduce.sh \
+  -job scripts/jobs/wordcount \
+  -input test_input.txt \
+  -n 4 -output result.txt
+./run_all_commoncrawl_jobs.sh \
+  -crawl CC-MAIN-2026-21 \
   -files-limit 1 -n 4
 \end{lstlisting}
-  \end{block}
-
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.48\textwidth}
-      \textbf{Backup if machines are unstable}
-      \begin{itemize}
-        \item Passed tests and reference validation
-        \item Checked-in outputs and timing CSVs
-        \item Amdahl plot and bottleneck explanation
-      \end{itemize}
-    \end{column}
-    \begin{column}{0.48\textwidth}
-      \textbf{Suggested speaking split}
-      \begin{itemize}
-        \item Speaker 1: architecture and protocol
-        \item Speaker 2: jobs, results, Kafka
-        \item Speaker 3: fault tolerance, roadmap, Q\&A
-      \end{itemize}
+      \end{block}
+      \begin{block}{Backup if machines are unstable}
+        {\small Passed tests, checked-in wordcount output (24M unique words), Amdahl plot, timing CSVs}
+      \end{block}
     \end{column}
   \end{columns}
-  \note{Timing: 45 seconds. End by inviting questions about tradeoffs: why no HDFS, why direct Common Crawl, why local /tmp, why speedup plateaus, and what we would fix next.}
+  \note{Timing: 1 minute 15 seconds. Be calm about gaps — the protocol, jobs, and recovery all work and are tested. The gaps are operational hardening.}
 \end{frame}
 
 \end{document}
