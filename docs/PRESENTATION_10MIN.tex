@@ -12,6 +12,8 @@
 \usepackage{listings}
 \usepackage{array}
 \usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
 
 \graphicspath{{docs/report/}{report/}}
 
@@ -36,20 +38,13 @@
 }
 
 \title[Distributed MapReduce]{Distributed MapReduce on Lab Machines}
-\subtitle{SLR Project P4}
 \author{Project presentation}
-\date{10-minute discussion}
+\date{}
 
 \begin{document}
 
 \begin{frame}
   \titlepage
-
-  \vspace{-0.5em}
-  \begin{block}{One-sentence summary}
-    A custom Go MapReduce framework running on \texttt{*.enst.fr} workers, with direct Common Crawl input, pluggable jobs, local-disk shuffle, and fault-aware coordination.
-  \end{block}
-  \note{Timing: 30 seconds. Say that the goal is not to reproduce Hadoop completely, but to build and understand a working distributed MapReduce system under lab constraints: shared machines, SSH, no root, no Docker, and pressure on NFS.}
 \end{frame}
 
 \begin{frame}{What We Built}
@@ -61,69 +56,147 @@
     \item Four jobs: \texttt{wordcount}, \texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}
   \end{itemize}
 
-  \begin{block}{Current verification}
-    89 Go tests passed, live 100-host discovery passed, and a small reference wordcount matched exactly.
-  \end{block}
-  \note{Timing: 1 minute. Emphasize that the core distributed computation is real: workers map local input, write reducer buckets, fetch buckets from peers, reduce, and return outputs.}
 \end{frame}
 
 \begin{frame}[fragile]{Architecture}
-\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
-User shell
-  |
-  v
-mapreduce.sh
-  |-- make_hosts -> hosts.txt
-  |
-  v
-Go orchestrator
-  |-- build worker with selected job
-  |-- SCP + SSH start workers
-  |-- health checks and retries
-  |-- load / map / reduce / collect
-  v
-Remote workers on lab machines
-  /health /data /load /map /intermediate /reduce /result
-\end{lstlisting}
+  \begin{center}
+  \begin{tikzpicture}[
+    scale=0.75, transform shape,
+    box/.style={draw, rounded corners, fill=slrblue!20, text width=2cm, align=center, minimum height=1cm},
+    worker/.style={draw, rounded corners, fill=slrgreen!20, text width=2.2cm, align=center, minimum height=0.8cm},
+    ->, >=Latex, thick
+  ]
+    \node[box] (client) {Client \\ (Orchestrator)};
+    
+    \node[worker, right=1.5cm of client, yshift=1.5cm] (m1) {Map Worker 1};
+    \node[worker, right=1.5cm of client, yshift=0cm] (m2) {Map Worker 2};
+    \node[worker, right=1.5cm of client, yshift=-1.5cm] (m3) {Map Worker 3};
+    
+    \node[worker, right=1.5cm of m1, yshift=-0.75cm] (r1) {Reduce Worker 1};
+    \node[worker, right=1.5cm of m2, yshift=-0.75cm] (r2) {Reduce Worker 2};
+    
+    \node[box, right=1.5cm of r1, yshift=-0.75cm] (collect) {Client \\ (Collect)};
+    
+    \draw (client.east) -- (m1.west) node[midway, above, sloped, font=\scriptsize] {Assign splits};
+    \draw (client.east) -- (m2.west);
+    \draw (client.east) -- (m3.west);
+    
+    \draw (m1.east) -- (r1.west) node[midway, above, sloped, font=\scriptsize] {Shuffle};
+    \draw (m1.east) -- (r2.west);
+    \draw (m2.east) -- (r1.west);
+    \draw (m2.east) -- (r2.west);
+    \draw (m3.east) -- (r1.west);
+    \draw (m3.east) -- (r2.west);
+    
+    \draw (r1.east) -- (collect.west) node[midway, above, sloped, font=\scriptsize] {Merge};
+    \draw (r2.east) -- (collect.west);
+  \end{tikzpicture}
+  \end{center}
+\end{frame}
 
-  \vspace{-0.3em}
-  \textbf{Design choice:} the client is the Main. Workers are stateless between jobs except for local temporary files under \texttt{/tmp}.
-  \note{Timing: 1 minute 15 seconds. Explain that there is no permanent cluster service. Each run selects machines, builds the worker with the selected job, starts workers, runs the job, then cleans up.}
+\begin{frame}{Execution Sequence}
+  \begin{center}
+  \begin{tikzpicture}[
+    scale=0.7, transform shape,
+    actor/.style={draw, rounded corners, fill=slrblue!20, text width=1.5cm, align=center, minimum height=0.6cm},
+    action/.style={draw, fill=slrgray, rounded corners, text width=5cm, align=center, minimum height=0.6cm, font=\scriptsize},
+    ->, >=Latex, thick
+  ]
+    \node[actor] (main) at (0,0) {Main};
+    \node[actor] (w1) at (3.5,0) {Worker 1};
+    \node[actor] (w2) at (6.5,0) {Worker 2};
+    \node[font=\Large] (dots) at (8.5,0) {$\dots$};
+    \node[actor] (wn) at (10.5,0) {Worker N};
+    
+    \draw[thick, slrblue] (main.south) -- +(0,-8.3);
+    \draw[thick, slrblue] (w1.south) -- +(0,-8.3);
+    \draw[thick, slrblue] (w2.south) -- +(0,-8.3);
+    \draw[thick, slrblue, loosely dotted] (dots.south) -- +(0,-8.3);
+    \draw[thick, slrblue] (wn.south) -- +(0,-8.3);
+    
+    % Load Request
+    \draw (main.south |- 0,-0.6) -- (w1.south |- 0,-0.6) node[midway, above=-0.05cm, font=\tiny] {\texttt{/load}};
+    \draw (main.south |- 0,-0.8) -- (w2.south |- 0,-0.8);
+    \draw (main.south |- 0,-1.0) -- (wn.south |- 0,-1.0);
+    
+    % Load Response
+    \draw[<-, dashed] (main.south |- 0,-1.2) -- (w1.south |- 0,-1.2) node[midway, above=-0.05cm, font=\tiny] {\texttt{200 OK}};
+    \draw[<-, dashed] (main.south |- 0,-1.4) -- (w2.south |- 0,-1.4);
+    \draw[<-, dashed] (main.south |- 0,-1.6) -- (wn.south |- 0,-1.6);
+    
+    % Map Request
+    \draw (main.south |- 0,-1.9) -- (w1.south |- 0,-1.9) node[midway, above=-0.05cm, font=\tiny] {\texttt{/map}};
+    \draw (main.south |- 0,-2.1) -- (w2.south |- 0,-2.1);
+    \draw (main.south |- 0,-2.3) -- (wn.south |- 0,-2.3);
+    
+    % Map Work
+    \node[action, minimum width=8.5cm] at (7.0,-2.9) {Map Phase: Write N buckets locally};
+    
+    % Map Response
+    \draw[<-, dashed] (main.south |- 0,-3.5) -- (w1.south |- 0,-3.5) node[midway, above=-0.05cm, font=\tiny] {\texttt{200 OK}};
+    \draw[<-, dashed] (main.south |- 0,-3.7) -- (w2.south |- 0,-3.7);
+    \draw[<-, dashed] (main.south |- 0,-3.9) -- (wn.south |- 0,-3.9);
+    
+    % Reduce Request
+    \draw (main.south |- 0,-4.2) -- (w1.south |- 0,-4.2) node[midway, above=-0.05cm, font=\tiny] {\texttt{/reduce}};
+    \draw (main.south |- 0,-4.4) -- (w2.south |- 0,-4.4);
+    \draw (main.south |- 0,-4.6) -- (wn.south |- 0,-4.6);
+    
+    % Reduce Work
+    \node[action, minimum width=8.5cm] at (7.0,-5.2) {Shuffle (fetch peer buckets) \& Reduce};
+    
+    % Reduce Response
+    \draw[<-, dashed] (main.south |- 0,-5.8) -- (w1.south |- 0,-5.8) node[midway, above=-0.05cm, font=\tiny] {\texttt{200 OK}};
+    \draw[<-, dashed] (main.south |- 0,-6.0) -- (w2.south |- 0,-6.0);
+    \draw[<-, dashed] (main.south |- 0,-6.2) -- (wn.south |- 0,-6.2);
+    
+    % Result Request
+    \draw (main.south |- 0,-6.5) -- (w1.south |- 0,-6.5) node[midway, above=-0.05cm, font=\tiny] {\texttt{/result}};
+    \draw (main.south |- 0,-6.7) -- (w2.south |- 0,-6.7);
+    \draw (main.south |- 0,-6.9) -- (wn.south |- 0,-6.9);
+    
+    % Result Response
+    \draw[<-, dashed] (main.south |- 0,-7.1) -- (w1.south |- 0,-7.1) node[midway, above=-0.05cm, font=\tiny] {\texttt{data}};
+    \draw[<-, dashed] (main.south |- 0,-7.3) -- (w2.south |- 0,-7.3);
+    \draw[<-, dashed] (main.south |- 0,-7.5) -- (wn.south |- 0,-7.5);
+    
+    % Collect
+    \node[action, text width=3cm] at (main.south |- 0,-8.0) {Collect \& Merge};
+  \end{tikzpicture}
+  \end{center}
 \end{frame}
 
 \begin{frame}[fragile]{Protocol and Dataflow}
   \begin{enumerate}
-    \item \textbf{Load}: local file chunks via \texttt{/data}, or Common Crawl WET URLs via \texttt{/load}
-    \item \textbf{Map}: each worker writes \texttt{N} bucket files on local disk
-    \item \textbf{Shuffle + reduce}: reducer \texttt{i} pulls bucket \texttt{i} from every peer via \texttt{/intermediate}
-    \item \textbf{Collect}: Main fetches \texttt{/result}, merges integer values, sorts, writes final output
+    \item \textbf{Load:} Send $\le$64MB chunks or WET URLs.
+    \item \textbf{Map:} Write \texttt{N} bucket files locally.
+    \item \textbf{Shuffle+reduce:} Fetch peer buckets via HTTP.
+    \item \textbf{Collect:} Merge \& write result locally.
   \end{enumerate}
-
-  \begin{block}{Reducer assignment}
-\begin{lstlisting}
-FNV-32a(key) % N
-\end{lstlisting}
-  \end{block}
-  \note{Timing: 1 minute 15 seconds. The key point is partitioning at map time. During reduce, each worker directly serves the bucket requested by the reducer, avoiding a full scan of all intermediate data during shuffle.}
+  \vspace{1em}
+  \textbf{Map assignment:} Orchestrator split + \texttt{POST /data}\\
+  \textbf{Reducer assignment:} \texttt{FNV-32a(key) \% N}
 \end{frame}
 
 \begin{frame}{Fault Tolerance and Operations}
+  \textbf{Failure Detection:}
   \begin{itemize}
-    \item Logical \textbf{slots} stay fixed: \texttt{0..N-1}
-    \item Physical hosts can be replaced by cold spares
-    \item Health watcher polls \texttt{/health} and marks repeated failures dead
-    \item Failed slots replay prerequisites: \texttt{load -> map -> reduce}
-    \item If a peer dies during reduce, coordinator re-runs stale reduces with the new peer list
-    \item Cleanup is idempotent: kill PID if present, remove worker files, tolerate repeated cleanup
+    \item A background health watcher polls \texttt{GET /health} every 5 seconds.
+    \item Two consecutive failures mark a host as \textbf{dead}.
   \end{itemize}
-
-  \begin{block}{Tested behavior}
-    Coordinator replacement, peer reduce failure, cold spare activation, and fallback to a surviving worker.
-  \end{block}
-  \note{Timing: 1 minute. Explain the logical slot idea: hash partitioning depends on N, so N stays stable while the machine behind a slot can change.}
+  \vspace{0.5em}
+  
+  \textbf{Recovery Execution (What happens when a node fails):}
+  \begin{itemize}
+    \item The orchestrator pulls a \textbf{spare host} from the \texttt{hosts.txt} pool.
+    \item It deploys a new worker binary over SSH to the spare.
+    \item The system \textbf{replays} the \texttt{/load} and \texttt{/map} phases for the failed slot.
+    \item If no spare host is available, the failed slot is reassigned to an existing healthy worker.
+    \item Logical \textbf{slots} (\texttt{0..N-1}) stay fixed even if the physical host changes.
+  \end{itemize}
 \end{frame}
 
-\begin{frame}{Use Cases Beyond Wordcount}
+\begin{frame}[fragile]{Use Cases Beyond Wordcount}
   \begin{table}
     \small
     \begin{tabular}{>{\ttfamily}l p{0.42\linewidth} p{0.27\linewidth}}
@@ -138,10 +211,15 @@ FNV-32a(key) % N
     \end{tabular}
   \end{table}
 
-  \begin{block}{Framework property}
-    All reducers emit integer values, so the orchestrator can safely merge partial outputs across jobs.
+  \begin{block}{Executing a specific job}
+\begin{lstlisting}[language=bash]
+# The orchestrator injects the selected job into the worker binary
+./mapreduce.sh -job scripts/jobs/langdetect \
+  -commoncrawl \
+  -crawl CC-MAIN-2026-21 \
+  -n 8
+\end{lstlisting}
   \end{block}
-  \note{Timing: 1 minute. The extra jobs demonstrate that this is a framework, not only a wordcount script. They reuse the same deployment, shuffle, reduce, and collect path.}
 \end{frame}
 
 \begin{frame}{Measurements and Amdahl's Law}
@@ -150,93 +228,90 @@ FNV-32a(key) % N
       \includegraphics[width=\linewidth]{amdahl_8.png}
     \end{column}
     \begin{column}{0.4\textwidth}
+      \textbf{Go Source Files (64 files):}
       \begin{itemize}
-        \item \texttt{1 node}: 206.95 s, speedup 1.00
-        \item \texttt{16 nodes}: 40.80 s, speedup 5.07
-        \item \texttt{64 nodes}: 39.06 s, speedup 5.30
+        \item \texttt{1 node}: 0.973 s (1.00x)
+        \item \texttt{2 nodes}: 0.494 s (1.97x)
+        \item \texttt{4 nodes}: 0.383 s (2.54x)
+        \item \texttt{8 nodes}: \textbf{0.266 s} (\textbf{3.66x})
+        \item \texttt{16 nodes}: 1.412 s (0.69x)
+        \item \texttt{64 nodes}: 10.452 s (0.09x)
       \end{itemize}
-      \begin{block}{Interpretation}
-        After useful parallelism is exhausted, communication, synchronization, and final merge dominate.
-      \end{block}
+      \vspace{0.5em}
+      \textbf{Methodology:} Strong-scaling test on 64 Go files, varying active nodes from 1 to 64. Reference baseline is $N=1$.
     \end{column}
   \end{columns}
-  \note{Timing: 1 minute 15 seconds. The curve is a good teaching result: speedup improves, then flattens. At high N the worker mesh and reduce traffic become the bottleneck.}
 \end{frame}
 
-\begin{frame}{Batch MapReduce vs Kafka Streams}
+\begin{frame}{Three-Way Comparison}
   \begin{table}
     \small
-    \begin{tabular}{p{0.45\linewidth} p{0.45\linewidth}}
+    \begin{tabular}{l p{0.26\linewidth} p{0.26\linewidth} p{0.26\linewidth}}
       \toprule
-      Custom MapReduce & Kafka Streams \\
+       & \textbf{Our MapReduce} & \textbf{Hadoop} & \textbf{Kafka Streams} \\
       \midrule
-      Batch job with explicit phases & Continuous stream processing model \\
-      Lightweight HTTP + local temp files & Persistent Kafka log and state stores \\
-      Fast on small bounded workloads & More operationally robust at scale \\
-      No HDFS-style replication & Built around durable broker storage \\
+      Model & Batch, 1 stage & Batch, multi-stage & Stream, unbounded \\
+      Storage & \texttt{/tmp}, no replication & HDFS 3$\times$ replication & Replicated broker log \\
+      Data locality & No — HTTP pull & Yes — run where data lives & Broker partitions \\
+      Stragglers & Not handled & Speculative execution & N/A \\
+      8-node wordcount & 0.27\,s & not run & 10.1\,s \\
       \bottomrule
     \end{tabular}
   \end{table}
-
-  \begin{block}{Kafka comparison path}
-    Kafka runs without Docker or root: KRaft deployment in \texttt{/tmp}, Java Streams wordcount, timing by consumer-group lag.
+  \begin{block}{Biggest gaps vs.\ Hadoop}
+    (1) HDFS data locality — we transfer all input at load time.
+    (2) Speculative execution — one slow node blocks the whole phase.
   \end{block}
-  \note{Timing: 50 seconds. Kafka is not just a faster or slower version of our system. It is a different model: it pays persistence and broker overhead, but gains durability and a mature streaming runtime.}
+  \note{Timing: 55 seconds. Kafka difference is model-level (stream vs batch). Hadoop difference is engineering-level (production data locality + scheduling we did not build).}
 \end{frame}
 
-\begin{frame}{What Is Missing and One-Week Plan}
-  \small
-  \begin{tabular}{p{0.43\linewidth} p{0.48\linewidth}}
-    \toprule
-    Gap & One-week fix \\
-    \midrule
-    Exact \texttt{1 SCP to HOME + 100 SSH} rubric mode & Add compatibility deploy mode or document design choice \\
-    Port collision preflight & Remote port check before starting workers \\
-    Standalone MapReduce cleanup script & Add \texttt{clean\_mapreduce.sh} using host file \\
-    \texttt{/cal/commoncrawl} evidence & Add input mode or document direct Amazon path as replacement \\
-    Local storage proof & Save \texttt{df} / \texttt{mount} evidence for lab machines \\
-    Large remote proof & Run and save 100-node / larger-split logs \\
-    Stragglers and atomic final writes & Add speculative task note or implement temp+rename outputs \\
-    \bottomrule
-  \end{tabular}
+\begin{frame}{Pain Points: What Broke and Why?}
+  During development and testing at scale, we encountered major blockers:
+  \vspace{1em}
+  
+  \begin{enumerate}
+    \vspace{0.5em}
+    \item \textbf{Zombie Processes:} Killed orchestrators left orphan worker processes running on remote lab machines, locking up assigned ports.
+    \begin{itemize}
+      \item \textit{Fix:} Made cleanup idempotent (matching port/process ID) and added health monitoring.
+    \end{itemize}
+  \end{enumerate}
+\end{frame}
 
-  \vspace{0.7em}
-  \begin{block}{Presentation stance}
-    The core system works; remaining work is mostly operational hardening and evidence collection.
-  \end{block}
-  \note{Timing: 1 minute 10 seconds. Be honest and calm. These are mostly operational and evidence gaps. The MapReduce protocol, jobs, and recovery model already work and are tested.}
+\begin{frame}{Optimization and Future Work}
+  \textbf{Performance Optimization \& Profiling}
+  \begin{itemize}
+    \item \textbf{In-Mapper Combiner:} Introduce an aggregation tree or combiner step in the mapper to drastically reduce HTTP requests and intermediate data size.
+    \item \textbf{Streaming IO:} Stream intermediate bucket results instead of keeping maps fully in memory. This prevents OOM crashes observed with large Common Crawl files at N=1 and N=2.
+  \end{itemize}
+  \vspace{0.5em}
+  
+  \textbf{Fault Tolerance Improvements}
+  \begin{itemize}
+    \item \textbf{Durable State:} The current MapReduce state is volatile in \texttt{/tmp}. Implementing replicated bucket storage could provide stronger, Hadoop-like fault tolerance without full phase replays.
+  \end{itemize}
 \end{frame}
 
 \begin{frame}[fragile]{Demo and Discussion Plan}
   \begin{block}{Live demo path}
 \begin{lstlisting}[language=bash]
-(cd scripts && go test ./...)
+# Run word count on a local file (10k words) using 10 nodes
 ./mapreduce.sh -job scripts/jobs/wordcount \
-  -input test_input.txt -n 4 -output result.txt
-./run_all_commoncrawl_jobs.sh -crawl CC-MAIN-2026-21 \
-  -files-limit 1 -n 4
+  -input data/demo_text.txt -n 10 -output data/result.txt
+
+# Fault Tolerance Demonstration:
+# Kill a worker mid-computation to show orchestrator recovery
+ssh tp-1a201-xx "pkill -9 worker"
 \end{lstlisting}
   \end{block}
+\end{frame}
 
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.48\textwidth}
-      \textbf{Backup if machines are unstable}
-      \begin{itemize}
-        \item Passed tests and reference validation
-        \item Checked-in outputs and timing CSVs
-        \item Amdahl plot and bottleneck explanation
-      \end{itemize}
-    \end{column}
-    \begin{column}{0.48\textwidth}
-      \textbf{Suggested speaking split}
-      \begin{itemize}
-        \item Speaker 1: architecture and protocol
-        \item Speaker 2: jobs, results, Kafka
-        \item Speaker 3: fault tolerance, roadmap, Q\&A
-      \end{itemize}
-    \end{column}
-  \end{columns}
-  \note{Timing: 45 seconds. End by inviting questions about tradeoffs: why no HDFS, why direct Common Crawl, why local /tmp, why speedup plateaus, and what we would fix next.}
+\begin{frame}{Team Work Distribution}
+  \begin{itemize}
+    \item \textbf{Guilherme:} Machine discovery, Deployment scripts, Fault tolerance, Amdahl experiments
+    \item \textbf{Daniele:} Architecture, Protocol design
+    \item \textbf{Marcin:} Kafka and comparison experiments
+  \end{itemize}
 \end{frame}
 
 \end{document}

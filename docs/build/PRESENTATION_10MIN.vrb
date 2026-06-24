@@ -1,0 +1,12 @@
+\frametitle{Demo and Discussion Plan}
+\begin{block}{Live demo path}
+\begin{lstlisting}[language=bash]
+# Run word count on a local file (10k words) using 10 nodes
+./mapreduce.sh -job scripts/jobs/wordcount \
+  -input data/demo_text.txt -n 10 -output data/result.txt
+
+# Fault Tolerance Demonstration:
+# Kill a worker mid-computation to show orchestrator recovery
+ssh tp-1a201-xx "pkill -9 worker"
+\end{lstlisting}
+  \end{block}
