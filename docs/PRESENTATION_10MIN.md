@@ -5,19 +5,6 @@ paginate: true
 size: 16:9
 ---
 
-<!--
-10-minute target:
-1. Title and promise: 0:30
-2. Problem/context: 1:00
-3. Architecture: 1:15
-4. Protocol/dataflow: 1:15
-5. Fault tolerance: 1:00
-6. Use cases: 1:00
-7. Results/Amdahl: 1:15
-8. Kafka comparison: 0:50
-9. Missing items and one-week plan: 1:10
-10. Demo/Q&A framing: 0:45
--->
 
 # Distributed MapReduce on Lab Machines
 
@@ -25,9 +12,6 @@ SLR Project P4
 
 Custom Go MapReduce framework running on `*.enst.fr` workers, with direct Common Crawl input, pluggable jobs, local-disk shuffle, and fault-aware coordination.
 
-<!--
-Say: Our goal was not to reproduce Hadoop completely. It was to build and understand a working distributed MapReduce system under lab constraints: shared machines, SSH access, no root, no Docker, and NFS pressure.
--->
 
 ---
 
@@ -41,9 +25,6 @@ Say: Our goal was not to reproduce Hadoop completely. It was to build and unders
 
 **Current verification:** 89 Go tests passed, live 100-host discovery passed, small reference wordcount matched exactly.
 
-<!--
-Say: The most important result is that the core distributed computation is real: workers map local input, write reducer buckets, fetch buckets from peers, reduce, and return outputs.
--->
 
 ---
 
@@ -69,32 +50,68 @@ Remote workers on lab machines
 
 Design choice: the client is the Main. Workers are stateless between jobs except for local temporary files under `/tmp`.
 
-<!--
-Say: This is intentionally simple. There is no permanent cluster service. Each run selects machines, builds the worker with the selected job, starts workers, runs the job, then cleans up.
--->
 
 ---
 
 # Protocol and Dataflow
 
-1. **Load**
-   Local file chunks via `/data`, or Common Crawl WET URLs via `/load`.
-2. **Map**
-   Each worker writes `N` bucket files on local disk.
-3. **Shuffle + reduce**
-   Reducer `i` pulls bucket `i` from every peer via `/intermediate`.
-4. **Collect**
-   Main fetches `/result`, merges integer values, sorts, writes final output.
+1. **Load:** Assign file chunks or WET URLs to workers.
+2. **Map:** Each worker writes `N` bucket files on local disk.
+3. **Shuffle + reduce:** Reducer `i` pulls bucket `i` from peers.
+4. **Collect:** Main fetches, merges, sorts, writes final output.
 
-Reducer assignment:
+**Map assignment:** Orchestrator split + `POST /data`
+**Reducer assignment:** `FNV-32a(key) % N`
 
-```text
-FNV-32a(key) % N
+---
+
+# Execution Sequence
+
+```mermaid
+sequenceDiagram
+    participant M as Main
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant WN as Worker N
+    
+    M->>W1: POST /load (assign splits)
+    M->>W2: POST /load
+    M->>WN: POST /load
+    
+    W1-->>M: 200 OK
+    W2-->>M: 200 OK
+    WN-->>M: 200 OK
+    
+    M->>W1: POST /map
+    M->>W2: POST /map
+    M->>WN: POST /map
+    
+    Note over W1,WN: Map Phase: Write N buckets locally
+    
+    W1-->>M: 200 OK
+    W2-->>M: 200 OK
+    WN-->>M: 200 OK
+    
+    M->>W1: POST /reduce (assign slot)
+    M->>W2: POST /reduce
+    M->>WN: POST /reduce
+    
+    Note over W1,WN: Shuffle: Fetch peer buckets via HTTP & Reduce
+    
+    W1-->>M: 200 OK
+    W2-->>M: 200 OK
+    WN-->>M: 200 OK
+    
+    M->>W1: GET /result
+    M->>W2: GET /result
+    M->>WN: GET /result
+    
+    W1-->>M: Result data
+    W2-->>M: Result data
+    WN-->>M: Result data
+    
+    Note over M: Collect & Merge Output
 ```
-
-<!--
-Say: The key property is that partitioning is done at map time. During reduce, each worker can directly serve the bucket requested by the reducer, so there is no full scan of all intermediate data during shuffle.
--->
 
 ---
 
@@ -109,9 +126,6 @@ Say: The key property is that partitioning is done at map time. During reduce, e
 
 **Tested behavior:** coordinator replacement, peer reduce failure, cold spare activation, fallback to surviving worker.
 
-<!--
-Say: The important idea is separating logical worker slots from physical machines. Hash partitioning depends on N, so N stays stable while the host behind a slot can change.
--->
 
 ---
 
@@ -126,9 +140,12 @@ Say: The important idea is separating logical worker slots from physical machine
 
 All reducers emit integer values so the orchestrator can safely merge partial outputs.
 
-<!--
-Say: The three additional jobs demonstrate that this is a framework, not only a wordcount script. They reuse the same deployment, shuffle, reduce, and collect path.
--->
+**Executing a specific job:**
+```bash
+# The orchestrator injects the selected job into the worker binary
+./mapreduce.sh -job scripts/jobs/langdetect \
+  -commoncrawl -crawl CC-MAIN-2026-21 -n 8
+```
 
 ---
 
@@ -142,11 +159,7 @@ Observed scaling on the fixed Common Crawl workload:
 - `16 nodes`: 40.80 s, speedup 5.07
 - `64 nodes`: 39.06 s, speedup 5.30
 
-Interpretation: after the useful parallelism is exhausted, communication, synchronization, and final merge dominate.
-
-<!--
-Say: The curve is a good teaching result. Speedup improves, then flattens. At high N the worker mesh and reduce traffic become the bottleneck, so simply adding machines does not give linear speedup.
--->
+Interpretation: after the useful parallelism is exhausted, communication, synchronization, and final merge dominate. Based on Amdahl's law, the calculated **incompressible sequential part is roughly 17%** of the execution time, capping theoretical speedup at ~5.8x.
 
 ---
 
@@ -161,9 +174,17 @@ Say: The curve is a good teaching result. Speedup improves, then flattens. At hi
 
 Kafka path is implemented without Docker or root: KRaft deployment in `/tmp`, Java Streams wordcount, timing by consumer-group lag.
 
-<!--
-Say: Kafka is not just a faster or slower version of our system. It is a different model. It pays persistence and broker overhead, but gains durability and a mature streaming runtime.
--->
+
+---
+
+# Pain Points: What Broke and Why?
+
+During development and testing at scale, we encountered major blockers:
+
+1. **NFS Overload:** Reading input splits from `/cal/commoncrawl` via the shared NFS caused massive I/O bottlenecks when many workers started reading simultaneously.
+   *Fix:* Moved to direct download from Amazon (`data.commoncrawl.org`) and enforced local `/tmp` writes for map buckets.
+2. **Zombie Processes:** Killed orchestrators left orphan worker processes running on remote lab machines, locking up assigned ports.
+   *Fix:* Made cleanup idempotent (matching port/process ID) and added health monitoring.
 
 ---
 
@@ -181,9 +202,6 @@ We will present the core system now, then harden evidence and compatibility next
 | Large remote proof | Run and save 100-node / larger-split logs |
 | Stragglers and atomic final writes | Add speculative task note or implementation, temp+rename outputs |
 
-<!--
-Say: These are mostly operational and evidence gaps. The core MapReduce protocol, jobs, and recovery model already work and are tested. We are not hiding the missing items; we are converting them into a concrete next-week work plan.
--->
 
 ---
 
@@ -195,6 +213,13 @@ Say: These are mostly operational and evidence gaps. The core MapReduce protocol
 (cd scripts && go test ./...)
 ./mapreduce.sh -job scripts/jobs/wordcount -input test_input.txt -n 4 -output result.txt
 ./run_all_commoncrawl_jobs.sh -crawl CC-MAIN-2026-21 -files-limit 1 -n 4
+
+# Regular demonstration
+./demo_regular.sh
+
+# Fault tolerance demonstrations
+./demo_fault_tolerance.sh
+./demo_fault_tolerance_no_spares.sh
 ```
 
 **If lab machines are unstable**
@@ -209,6 +234,3 @@ Say: These are mostly operational and evidence gaps. The core MapReduce protocol
 - Speaker 2: jobs, results, Kafka comparison
 - Speaker 3: fault tolerance, missing items, roadmap, Q&A
 
-<!--
-Say: End by inviting questions about the tradeoffs: why no HDFS, why direct Common Crawl, why local /tmp, why speedup plateaus, and what we would fix next.
--->
