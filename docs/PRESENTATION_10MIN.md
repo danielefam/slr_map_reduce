@@ -213,6 +213,13 @@ We will present the core system now, then harden evidence and compatibility next
 (cd scripts && go test ./...)
 ./mapreduce.sh -job scripts/jobs/wordcount -input test_input.txt -n 4 -output result.txt
 ./run_all_commoncrawl_jobs.sh -crawl CC-MAIN-2026-21 -files-limit 1 -n 4
+
+# Regular demonstration
+./demo_regular.sh
+
+# Fault tolerance demonstrations
+./demo_fault_tolerance.sh
+./demo_fault_tolerance_no_spares.sh
 ```
 
 **If lab machines are unstable**

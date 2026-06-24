@@ -1,5 +1,5 @@
 # Fdb version 4
-["pdflatex"] 1782331177.48538 "PRESENTATION_10MIN.tex" "build/PRESENTATION_10MIN.pdf" "PRESENTATION_10MIN" 1782331178.79709 0
+["pdflatex"] 1782332225.9263 "PRESENTATION_10MIN.tex" "build/PRESENTATION_10MIN.pdf" "PRESENTATION_10MIN" 1782332227.26342 0
   "/usr/share/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc" 1775415801 2971 def0b6c1f0b107b3b936def894055589 ""
   "/usr/share/texmf-dist/fonts/tfm/jknappen/ec/ecit0900.tfm" 1775415801 1536 2a581b33e8ae2f16b1d733398b528242 ""
   "/usr/share/texmf-dist/fonts/tfm/jknappen/ec/ecsi0500.tfm" 1775415801 3584 cddc42a948742f3f690b828feeaf2449 ""
@@ -239,11 +239,11 @@
   "/usr/share/texmf-dist/web2c/texmf.cnf" 1775415801 43569 fd570f2fa160877d211e859f687312ba ""
   "/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map" 1776600882 325445 e037c2d0d08ad8cbac81cfa7969967b5 ""
   "/var/lib/texmf/web2c/pdftex/pdflatex.fmt" 1776600881 2328187 d9f7c2497b6127926af9f4c0b2253d4b ""
-  "PRESENTATION_10MIN.tex" 1782331176.82837 12785 2fbd86e2ecdb5eeb712be9610e93888b ""
-  "build/PRESENTATION_10MIN.aux" 1782331178.7054 2109 2979b9e8e4fa267a2557952810574c09 "pdflatex"
-  "build/PRESENTATION_10MIN.nav" 1782331178.7064 1388 37fb167c90003b6656a249083ce3750a "pdflatex"
-  "build/PRESENTATION_10MIN.out" 1782331177.98439 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
-  "build/PRESENTATION_10MIN.vrb" 1782331178.63888 426 fd360b6d1c20e1543bb324a877933bb8 "pdflatex"
+  "PRESENTATION_10MIN.tex" 1782332224.53558 12795 cde5e3be859c13178a51507a005f490b ""
+  "build/PRESENTATION_10MIN.aux" 1782332227.16761 2109 2979b9e8e4fa267a2557952810574c09 "pdflatex"
+  "build/PRESENTATION_10MIN.nav" 1782332227.16961 1388 37fb167c90003b6656a249083ce3750a "pdflatex"
+  "build/PRESENTATION_10MIN.out" 1782332226.4616 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
+  "build/PRESENTATION_10MIN.vrb" 1782332227.10061 436 d4e80b1d8cc48140d02bedec6e515902 "pdflatex"
   "report/amdahl_8.png" 1781986899.86978 44178 ed870d6bfb60be2ad593a9e8abfe49da ""
   (generated)
   "build/PRESENTATION_10MIN.aux"
