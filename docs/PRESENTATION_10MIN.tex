@@ -1,0 +1,242 @@
+\documentclass[aspectratio=169,10pt]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{seahorse}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{caption}[numbered]
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{array}
+\usepackage{xcolor}
+
+\graphicspath{{docs/report/}{report/}}
+
+\definecolor{slrblue}{RGB}{38,84,124}
+\definecolor{slrgreen}{RGB}{47,122,105}
+\definecolor{slrgray}{RGB}{245,247,250}
+
+\setbeamercolor{structure}{fg=slrblue}
+\setbeamercolor{title}{fg=white,bg=slrblue}
+\setbeamercolor{frametitle}{fg=white,bg=slrblue}
+\setbeamercolor{block title}{fg=white,bg=slrgreen}
+\setbeamercolor{block body}{bg=slrgray,fg=black}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{slrgray}
+}
+
+\title[Distributed MapReduce]{Distributed MapReduce on Lab Machines}
+\subtitle{SLR Project P4}
+\author{Project presentation}
+\date{10-minute discussion}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+
+  \vspace{-0.5em}
+  \begin{block}{One-sentence summary}
+    A custom Go MapReduce framework running on \texttt{*.enst.fr} workers, with direct Common Crawl input, pluggable jobs, local-disk shuffle, and fault-aware coordination.
+  \end{block}
+  \note{Timing: 30 seconds. Say that the goal is not to reproduce Hadoop completely, but to build and understand a working distributed MapReduce system under lab constraints: shared machines, SSH, no root, no Docker, and pressure on NFS.}
+\end{frame}
+
+\begin{frame}{What We Built}
+  \begin{itemize}
+    \item Automatic host discovery from \texttt{https://tp.telecom-paris.fr/ajax.php}
+    \item Go orchestrator that builds, deploys, starts, monitors, and cleans workers
+    \item HTTP worker API for \texttt{load -> map -> shuffle -> reduce -> result}
+    \item Direct Common Crawl WET download from \texttt{data.commoncrawl.org}
+    \item Four jobs: \texttt{wordcount}, \texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}
+  \end{itemize}
+
+  \begin{block}{Current verification}
+    89 Go tests passed, live 100-host discovery passed, and a small reference wordcount matched exactly.
+  \end{block}
+  \note{Timing: 1 minute. Emphasize that the core distributed computation is real: workers map local input, write reducer buckets, fetch buckets from peers, reduce, and return outputs.}
+\end{frame}
+
+\begin{frame}[fragile]{Architecture}
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+User shell
+  |
+  v
+mapreduce.sh
+  |-- make_hosts -> hosts.txt
+  |
+  v
+Go orchestrator
+  |-- build worker with selected job
+  |-- SCP + SSH start workers
+  |-- health checks and retries
+  |-- load / map / reduce / collect
+  v
+Remote workers on lab machines
+  /health /data /load /map /intermediate /reduce /result
+\end{lstlisting}
+
+  \vspace{-0.3em}
+  \textbf{Design choice:} the client is the Main. Workers are stateless between jobs except for local temporary files under \texttt{/tmp}.
+  \note{Timing: 1 minute 15 seconds. Explain that there is no permanent cluster service. Each run selects machines, builds the worker with the selected job, starts workers, runs the job, then cleans up.}
+\end{frame}
+
+\begin{frame}[fragile]{Protocol and Dataflow}
+  \begin{enumerate}
+    \item \textbf{Load}: local file chunks via \texttt{/data}, or Common Crawl WET URLs via \texttt{/load}
+    \item \textbf{Map}: each worker writes \texttt{N} bucket files on local disk
+    \item \textbf{Shuffle + reduce}: reducer \texttt{i} pulls bucket \texttt{i} from every peer via \texttt{/intermediate}
+    \item \textbf{Collect}: Main fetches \texttt{/result}, merges integer values, sorts, writes final output
+  \end{enumerate}
+
+  \begin{block}{Reducer assignment}
+\begin{lstlisting}
+FNV-32a(key) % N
+\end{lstlisting}
+  \end{block}
+  \note{Timing: 1 minute 15 seconds. The key point is partitioning at map time. During reduce, each worker directly serves the bucket requested by the reducer, avoiding a full scan of all intermediate data during shuffle.}
+\end{frame}
+
+\begin{frame}{Fault Tolerance and Operations}
+  \begin{itemize}
+    \item Logical \textbf{slots} stay fixed: \texttt{0..N-1}
+    \item Physical hosts can be replaced by cold spares
+    \item Health watcher polls \texttt{/health} and marks repeated failures dead
+    \item Failed slots replay prerequisites: \texttt{load -> map -> reduce}
+    \item If a peer dies during reduce, coordinator re-runs stale reduces with the new peer list
+    \item Cleanup is idempotent: kill PID if present, remove worker files, tolerate repeated cleanup
+  \end{itemize}
+
+  \begin{block}{Tested behavior}
+    Coordinator replacement, peer reduce failure, cold spare activation, and fallback to a surviving worker.
+  \end{block}
+  \note{Timing: 1 minute. Explain the logical slot idea: hash partitioning depends on N, so N stays stable while the machine behind a slot can change.}
+\end{frame}
+
+\begin{frame}{Use Cases Beyond Wordcount}
+  \begin{table}
+    \small
+    \begin{tabular}{>{\ttfamily}l p{0.42\linewidth} p{0.27\linewidth}}
+      \toprule
+      Job & What it measures & Example output \\
+      \midrule
+      wordcount & Token frequency & \texttt{the 239298} \\
+      langdetect & Language signal counts & \texttt{lang:en}, \texttt{lang:fr} \\
+      domainpop & Crawled domain popularity & \texttt{doi.org}, \texttt{youtube.com} \\
+      docdensity & Content size and density & \texttt{stat:lines}, \texttt{hist:len.*} \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \begin{block}{Framework property}
+    All reducers emit integer values, so the orchestrator can safely merge partial outputs across jobs.
+  \end{block}
+  \note{Timing: 1 minute. The extra jobs demonstrate that this is a framework, not only a wordcount script. They reuse the same deployment, shuffle, reduce, and collect path.}
+\end{frame}
+
+\begin{frame}{Measurements and Amdahl's Law}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.57\textwidth}
+      \includegraphics[width=\linewidth]{amdahl_8.png}
+    \end{column}
+    \begin{column}{0.4\textwidth}
+      \begin{itemize}
+        \item \texttt{1 node}: 206.95 s, speedup 1.00
+        \item \texttt{16 nodes}: 40.80 s, speedup 5.07
+        \item \texttt{64 nodes}: 39.06 s, speedup 5.30
+      \end{itemize}
+      \begin{block}{Interpretation}
+        After useful parallelism is exhausted, communication, synchronization, and final merge dominate.
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute 15 seconds. The curve is a good teaching result: speedup improves, then flattens. At high N the worker mesh and reduce traffic become the bottleneck.}
+\end{frame}
+
+\begin{frame}{Batch MapReduce vs Kafka Streams}
+  \begin{table}
+    \small
+    \begin{tabular}{p{0.45\linewidth} p{0.45\linewidth}}
+      \toprule
+      Custom MapReduce & Kafka Streams \\
+      \midrule
+      Batch job with explicit phases & Continuous stream processing model \\
+      Lightweight HTTP + local temp files & Persistent Kafka log and state stores \\
+      Fast on small bounded workloads & More operationally robust at scale \\
+      No HDFS-style replication & Built around durable broker storage \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \begin{block}{Kafka comparison path}
+    Kafka runs without Docker or root: KRaft deployment in \texttt{/tmp}, Java Streams wordcount, timing by consumer-group lag.
+  \end{block}
+  \note{Timing: 50 seconds. Kafka is not just a faster or slower version of our system. It is a different model: it pays persistence and broker overhead, but gains durability and a mature streaming runtime.}
+\end{frame}
+
+\begin{frame}{What Is Missing and One-Week Plan}
+  \small
+  \begin{tabular}{p{0.43\linewidth} p{0.48\linewidth}}
+    \toprule
+    Gap & One-week fix \\
+    \midrule
+    Exact \texttt{1 SCP to HOME + 100 SSH} rubric mode & Add compatibility deploy mode or document design choice \\
+    Port collision preflight & Remote port check before starting workers \\
+    Standalone MapReduce cleanup script & Add \texttt{clean\_mapreduce.sh} using host file \\
+    \texttt{/cal/commoncrawl} evidence & Add input mode or document direct Amazon path as replacement \\
+    Local storage proof & Save \texttt{df} / \texttt{mount} evidence for lab machines \\
+    Large remote proof & Run and save 100-node / larger-split logs \\
+    Stragglers and atomic final writes & Add speculative task note or implement temp+rename outputs \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.7em}
+  \begin{block}{Presentation stance}
+    The core system works; remaining work is mostly operational hardening and evidence collection.
+  \end{block}
+  \note{Timing: 1 minute 10 seconds. Be honest and calm. These are mostly operational and evidence gaps. The MapReduce protocol, jobs, and recovery model already work and are tested.}
+\end{frame}
+
+\begin{frame}[fragile]{Demo and Discussion Plan}
+  \begin{block}{Live demo path}
+\begin{lstlisting}[language=bash]
+(cd scripts && go test ./...)
+./mapreduce.sh -job scripts/jobs/wordcount \
+  -input test_input.txt -n 4 -output result.txt
+./run_all_commoncrawl_jobs.sh -crawl CC-MAIN-2026-21 \
+  -files-limit 1 -n 4
+\end{lstlisting}
+  \end{block}
+
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.48\textwidth}
+      \textbf{Backup if machines are unstable}
+      \begin{itemize}
+        \item Passed tests and reference validation
+        \item Checked-in outputs and timing CSVs
+        \item Amdahl plot and bottleneck explanation
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Suggested speaking split}
+      \begin{itemize}
+        \item Speaker 1: architecture and protocol
+        \item Speaker 2: jobs, results, Kafka
+        \item Speaker 3: fault tolerance, roadmap, Q\&A
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \note{Timing: 45 seconds. End by inviting questions about tradeoffs: why no HDFS, why direct Common Crawl, why local /tmp, why speedup plateaus, and what we would fix next.}
+\end{frame}
+
+\end{document}
