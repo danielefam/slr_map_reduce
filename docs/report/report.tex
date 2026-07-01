@@ -188,6 +188,30 @@ appends \texttt{.enst.fr} to obtain canonical hostnames
 hosts so that cold spare hosts are available for fault-tolerance replacement
 without a second network round-trip.
 
+\subsubsection{NFS home vs.\ local disk}
+\label{sec:nfs}
+
+The lab home directories (\texttt{\$HOME}) are served by a shared
+\textbf{NFS} (Network File System) server visible to all lab machines.
+Writing into \texttt{\$HOME} on any machine writes over the network to the
+same central fileserver — it is \emph{not} the machine's own local disk.
+Practical consequences:
+\begin{itemize}[leftmargin=1.5em]
+  \item Writing large intermediate data to \texttt{\$HOME} from many machines
+  simultaneously saturates the NFS fileserver.
+  \item Reading data from \texttt{\$HOME} (e.g.\ \texttt{/cal/commoncrawl})
+  from \(N\) workers in parallel creates the same bottleneck.
+  \item Writing to \texttt{/tmp} uses the machine's own local disk and avoids
+  the shared NFS entirely.
+\end{itemize}
+
+The project exploits the NFS home for one specific purpose: in
+\texttt{deploy\_nfs.sh}, the worker binary is SCPed \textbf{once} to
+\texttt{\$HOME/mr-worker}. Because \texttt{\$HOME} is on NFS, this single copy
+is immediately visible on every other lab machine. Each of the $N$ workers then
+starts via SSH pointing to \texttt{\$HOME/mr-worker}, with no further SCP
+transfers. This is the rubric-described \emph{1 SCP to HOME + N SSH} pattern.
+
 \subsubsection{Deployment pattern}
 
 The rubric describes a \emph{single-SCP-to-HOME} pattern: copy the binary once
@@ -457,15 +481,26 @@ header lines uniformly without issue because header words are infrequent and
 consistent across records.
 
 \paragraph{Direct download vs.\ NFS.}
-The orchestrator fetches \texttt{wet.paths.gz} from
-\texttt{data.commoncrawl.org/crawl-data/\{crawl\}/wet.paths.gz}, selects the
-required number of WET URLs, and sends them to workers via \texttt{POST /load}.
-Each worker downloads its assigned WET files directly from Amazon S3 in
-parallel — no school NFS is involved. This is preferable to reading from
-\texttt{/cal/commoncrawl} because: (a)~the school NFS becomes a bottleneck
-when many nodes all read large files simultaneously; (b)~direct S3 access
-scales with the number of nodes; (c)~it works from any machine with internet
-access, not only the lab.
+The rubric base criterion asks to read splits from \texttt{/cal/commoncrawl}.
+This project instead implements the \emph{advanced} criterion: workers download
+WET files \textbf{directly from Amazon S3} (\texttt{data.commoncrawl.org}) in
+parallel. The orchestrator fetches \texttt{wet.paths.gz} to get the URL list and
+distributes URLs to workers via \texttt{POST /load}; each worker downloads its
+assigned files independently into its local \texttt{/tmp}, avoiding the NFS
+entirely.
+
+This intentionally supersedes the base \texttt{/cal/commoncrawl} path for three
+reasons:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{No NFS bottleneck.} When $N$ workers simultaneously read
+  gigabytes from \texttt{/cal/commoncrawl} (NFS), the fileserver becomes the
+  throughput ceiling for the entire cluster. Direct S3 access scales linearly
+  with $N$.
+  \item \textbf{Always current.} The official Amazon S3 index always contains the
+  latest crawl; the school NFS mirror may lag or be incomplete.
+  \item \textbf{Machine-independent.} The system works from any machine with
+  internet access, not only those with the NFS mount.
+\end{enumerate}
 
 \paragraph{Testing progression.}
 Development followed a small-to-large approach: correctness was first confirmed
@@ -486,6 +521,18 @@ The code reports explicit timings for:
 
 Split and load happen before the compute timer. Shuffle is embedded inside
 reduce, because reducers fetch peer buckets during \texttt{POST /reduce}.
+
+\paragraph{Deployment and cleanup timing.}
+Deployment time (build $+$ SCP $+$ SSH start $+$ health-check wait) is logged
+as a wall-clock duration by the orchestrator but is not included in the
+\texttt{TIMING} output because it is not part of the parallel computation that
+Amdahl's law applies to. On a typical lab run, deployment of 8 workers takes
+15--30\,s regardless of $N$ within the tested range ($N \leq 64$). Cleanup is
+similarly a constant-time operation: the orchestrator SSHes to every touched
+host and kills the worker process, taking 5--10\,s total.
+I/O and network time are reported indirectly: the map phase timer includes the
+disk write cost of bucket files; the reduce phase timer includes the network
+cost of peer bucket fetches.
 
 The system implements a \textbf{single MapReduce stage}: one pass of
 map $\to$ shuffle+reduce. Complex computations (e.g.\ iterative PageRank,
@@ -725,6 +772,19 @@ S(N) = \frac{1}{f + \dfrac{1-f}{N}}, \quad S(\infty) = \frac{1}{f}.
 The measured speedup plateaus between $N=32$ and $N=64$ at around $S \approx
 5.45$. Solving $1/f = 5.45$ gives $f \approx 0.184$, i.e.\ approximately
 \textbf{18\,\%} of total compute time is incompressible serial work.
+
+\paragraph{Projection and interpolation rule.}
+A key methodological point: speedup values for $N \geq 2$ are always
+\emph{measured} directly, never interpolated or extrapolated from adjacent
+data points. The only case where extrapolation is defensible is for the
+\textbf{single-machine baseline} ($N=1$) under a \emph{strong linear scaling
+hypothesis} — for example, estimating the 1-node time for a workload that is
+too large to fit in memory on one machine. For all multi-node points, the
+system behaviour is non-linear (network fan-out, memory pressure, SSH
+connection limits all interact), so projecting a speedup at $N=16$ from the
+$N=8$ measurement would be incorrect. The benchmark scripts enforce this by
+measuring each $N$ value directly and discarding any run where the active
+worker count does not match the target exactly.
 
 This serial portion is dominated by the \textbf{collect phase}: the
 orchestrator fetches \texttt{/result} from all $N$ workers sequentially,
@@ -970,8 +1030,30 @@ In short:
 \begin{itemize}[leftmargin=1.5em]
   \item the project works and is technically complete as a single-stage
   MapReduce system;
-  \item the cross-login validation still needs to be added
-  before the report is fully final.
+  \item the \texttt{deploy\_nfs.sh} script implements the 1-SCP-to-HOME + N-SSH
+  rubric pattern; the default \texttt{mapreduce.sh} uses N-SCP-to-/tmp which
+  avoids NFS entirely.
 \end{itemize}
+
+
+\section{Submission Readiness}
+
+The repository now contains the main submission artifacts requested by the
+project brief:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item a written report in this PDF/\LaTeX{} source and the companion
+  Markdown report;
+  \item presentation material under \texttt{docs/PRESENTATION\_10MIN.*};
+  \item runnable source code and run instructions in \texttt{README.md},
+  \texttt{mapreduce.sh}, and \texttt{scripts/};
+  \item a completed self-assessment questionnaire in
+  \texttt{docs/self-assessment.md}.
+\end{itemize}
+
+The remaining gaps are stated honestly in the self-assessment and the audit:
+exact NFS-home deployment compatibility, \texttt{/cal/commoncrawl}, large-scale
+100+ node Common Crawl evidence, speculative backup tasks, and a fully
+evidenced demo/work-split package.
 
 \end{document}

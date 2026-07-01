@@ -45,15 +45,12 @@
 
 \begin{frame}
   \titlepage
-<<<<<<< HEAD
 
   \vspace{-0.5em}
   \begin{block}{One-sentence summary}
     A custom Go MapReduce framework running on \texttt{*.enst.fr} workers — direct Common Crawl input, pluggable jobs, local-disk shuffle, fault-aware coordination, no root, no Docker.
   \end{block}
   \note{Timing: 20 seconds. No introduction needed beyond the block.}
-=======
->>>>>>> 5305e4d3c8cc4ec5328484bbda4ec112abb687f1
 \end{frame}
 
 \begin{frame}{What We Built}
@@ -64,7 +61,196 @@
     \item Four pluggable jobs sharing the same framework: \texttt{wordcount}, \texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}
     \item 89 Go tests; reference wordcount matched exactly against sequential implementation
   \end{itemize}
-<<<<<<< HEAD
+  \note{Timing: 45 seconds. The core distributed computation is real — workers map, write buckets, fetch from peers, reduce.}
+\end{frame}
+
+\begin{frame}{Key Design Choices}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.48\textwidth}
+      \textbf{Storage: everything avoids NFS}
+      \begin{itemize}
+        \item Input: streamed directly from \texttt{data.commoncrawl.org} (Amazon S3)
+        \item Intermediate bucket files: \texttt{os.MkdirTemp} $\to$ \texttt{/tmp} on each worker
+        \item Final output: \texttt{CreateTemp} + \texttt{os.Rename} (atomic write)
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Deployment: two modes}
+      \begin{itemize}
+        \item \texttt{mapreduce.sh}: $N$ SCP to \texttt{/tmp} (avoids NFS entirely)
+        \item \texttt{deploy\_nfs.sh}: \textbf{1 SCP to \$HOME} (NFS) \textbf{+ $N$ SSH} (rubric pattern)
+        \item SSH multiplexing (\texttt{ControlMaster}): SCP and start share one TCP connection
+        \item \texttt{BatchMode=yes}, \texttt{StrictHostKeyChecking=no}, \texttt{ConnectTimeout=10}
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute. Two deploy modes: direct-to-tmp (default, avoids NFS) and nfs-deploy (rubric 1-SCP pattern). HOME is on NFS so the 1-SCP binary is visible to all workers.}
+\end{frame}
+
+\begin{frame}{Protocol and Dataflow}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.50\textwidth}
+      \begin{enumerate}
+        \item \textbf{Load} — Common Crawl URLs via \texttt{POST /load}; workers download WET files to \texttt{/tmp}
+        \item \textbf{Map} — each worker writes $N$ bucket files on local disk (\texttt{/tmp})
+        \item \textbf{Shuffle+Reduce} — reducer $i$ pulls bucket $i$ from every peer via \texttt{GET /intermediate} (P2P, no orchestrator)
+        \item \textbf{Collect} — orchestrator fetches \texttt{/result}, merges, sorts, writes output atomically
+      \end{enumerate}
+    \end{column}
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Partitioning}
+        \texttt{FNV-32a(key) \% N}\\[0.4em]
+        All values for the same key always route to the same reducer. $N$ stays \textbf{fixed} for the job — changing it mid-run would split the value list across two reducers.
+      \end{block}
+      \begin{block}{Bootstrap}
+        Workers start independently. Peers are discovered only when the orchestrator sends \texttt{POST /reduce \{peers:[...]\}}.
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute 20 seconds. Emphasise P2P shuffle — no data flows through the orchestrator. The orchestrator is a coordinator, not a data plane.}
+\end{frame}
+
+\begin{frame}{Fault Tolerance}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.50\textwidth}
+      \textbf{Detection}
+      \begin{itemize}
+        \item Health watcher polls \texttt{GET /health} every 5\,s
+        \item Host declared dead after \textbf{2 consecutive failures}
+      \end{itemize}
+      \textbf{Recovery}
+      \begin{itemize}
+        \item Slot $\to$ spare host; slot state reset to \texttt{pending}
+        \item Prerequisites replayed: \texttt{load} $\to$ \texttt{map} $\to$ \texttt{reduce}
+        \item \textbf{Epoch} incremented: any reduce at old epoch is rewound and re-run (peer set changed)
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Atomic writes (implemented)}
+        WET downloads: \texttt{CreateTemp} + \texttt{os.Rename}\\
+        Binary deploy: \texttt{mv} on same filesystem\\
+        Final output: \texttt{writeFileAtomic} (temp+rename)
+      \end{block}
+      \begin{block}{Known remaining gaps}
+        No speculative execution for stragglers.\\
+        Orchestrator crash $\Rightarrow$ job must restart (workers survive via \texttt{nohup}).
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 55 seconds. The epoch mechanism is the most interesting part. Atomic writes are fully implemented for the final output.}
+\end{frame}
+
+\begin{frame}{Use Cases Beyond Wordcount}
+  \begin{itemize}
+    \item \textbf{langdetect} — stop-word scoring per line (EN/FR/DE/ES/IT); WARC headers skipped; result: language share across the crawl. \textit{Common Crawl is $\approx$60\,\% English.}
+    \item \textbf{domainpop} — reads \texttt{WARC-Target-URI:} header per WET record; counts pages per domain; result: global domain popularity ranking (\textit{youtube.com, wikipedia.org, doi.org} top-ranked). Quality signal: unexpectedly high-ranked spam domains flag filtering needs.
+    \item \textbf{docdensity} — counts chars, alphanumeric ratio, and line-length histogram per content line; result: $\approx$77\,\% alphanumeric, most lines $<$80 chars, very long lines $=$ minified JS/CSS.
+  \end{itemize}
+  \begin{block}{Why Common Crawl matters}
+    One of the primary training data sources for GPT, LLaMA, Mistral and most modern LLMs. These jobs are the kind of analysis that precedes any large-scale dataset curation.
+  \end{block}
+  \note{Timing: 45 seconds. Stress that all four jobs reuse the same deploy/shuffle/reduce/collect path. Only the map and reduce functions differ.}
+\end{frame}
+
+\begin{frame}{Measurements and Amdahl's Law}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.57\textwidth}
+      \includegraphics[width=\linewidth]{amdahl_8.png}
+    \end{column}
+    \begin{column}{0.4\textwidth}
+      \textbf{8 WET files, fixed workload:}
+      \begin{itemize}
+        \item Same 8 WET files at every point (correct methodology — never interpolate for $N\geq2$)
+        \item \texttt{1 node}: 206.95\,s $\Rightarrow$ baseline
+        \item \texttt{16 nodes}: 40.80\,s, speedup 5.07
+        \item \texttt{64 nodes}: 39.06\,s — \emph{regression}
+      \end{itemize}
+      \begin{block}{Serial fraction}
+        Plateau $S\!\approx\!5.45$ $\Rightarrow$ $f\!\approx\!18\%$ serial.\\
+        Source: orchestrator collect phase (sequential merge of $N$ results) and $N\!\times\!(N\!-\!1)$ HTTP connections at 64 nodes.
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute 15 seconds. f=18\% means 82\% of the work is parallelisable. The collect phase grows with N and becomes the ceiling. NEVER interpolate for 2+ nodes.}
+\end{frame}
+
+\begin{frame}{Three-Way Comparison}
+  \begin{table}
+    \small
+    \begin{tabular}{l p{0.26\linewidth} p{0.26\linewidth} p{0.26\linewidth}}
+      \toprule
+       & \textbf{Our MapReduce} & \textbf{Hadoop} & \textbf{Kafka Streams} \\
+      \midrule
+      Model & Batch, 1 stage & Batch, multi-stage & Stream, unbounded \\
+      Storage & \texttt{/tmp}, no replication & HDFS 3$\times$ replication & Replicated broker log \\
+      Data locality & No — HTTP pull & Yes — run where data lives & Broker partitions \\
+      Stragglers & Not handled & Speculative execution & N/A \\
+      8-node wordcount & 0.27\,s & not run & 10.1\,s \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \begin{block}{Biggest gaps vs.\ Hadoop}
+    (1) HDFS data locality — we transfer all input at load time.
+    (2) Speculative execution — one slow node blocks the whole phase.
+  \end{block}
+  \note{Timing: 55 seconds. Kafka difference is model-level (stream vs batch). Hadoop difference is engineering-level (production data locality + scheduling we did not build).}
+\end{frame}
+
+\begin{frame}[fragile]{Demo Plan}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.50\textwidth}
+      \textbf{Remaining gaps}
+      \begin{itemize}
+        \item Speculative execution for stragglers
+        \item Multi-chunk scheduling in local-file mode
+        \item 100-node / 1000+ split scale evidence
+      \end{itemize}
+      \textbf{Pain point (biggest)}\\
+      NFS I/O saturation when all workers read \texttt{/cal/commoncrawl} simultaneously.\\
+      \textit{Fix:} moved to direct Amazon S3 download — scales with node count.
+    \end{column}
+    \begin{column}{0.47\textwidth}
+      \begin{block}{Live demo}
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+cd scripts && go test ./...
+./mapreduce.sh \
+  -job scripts/jobs/wordcount \
+  -input test_input.txt \
+  -n 4 -output result.txt
+./run_all_commoncrawl_jobs.sh \
+  -crawl CC-MAIN-2026-21 \
+  -files-limit 1 -n 4
+# Fault tolerance demo:
+./demo_fault_tolerance.sh
+\end{lstlisting}
+      \end{block}
+    \end{column}
+  \end{columns}
+  \note{Timing: 1 minute 15 seconds. Show tests first, then run a job. If machines are unstable fall back to checked-in outputs and Amdahl plot.}
+\end{frame}
+
+\begin{frame}{Team Work Distribution}
+  \begin{itemize}
+    \item \textbf{Guilherme Caporali:} Machine discovery, deployment scripts (\texttt{deploy\_nfs.sh}, \texttt{clean\_mapreduce.sh}), fault tolerance design, Amdahl experiments
+    \item \textbf{Daniele Famà:} Architecture, Go orchestrator and worker, protocol design, unit and integration tests
+    \item \textbf{Marcin Porwisz:} Kafka Streams comparison, \texttt{WordCountJob.java}, Kafka deploy/cleanup scripts, comparison analysis
+  \end{itemize}
+  \vspace{1em}
+  \begin{block}{Q\&A preparation areas}
+    Why NFS avoidance? Why direct Amazon S3 vs \texttt{/cal/commoncrawl}? How does epoch invalidation work? Why does speedup plateau at $N=32$?
+  \end{block}
+\end{frame}
+
+\end{document}
+
+\begin{frame}{What We Built}
+  \begin{itemize}
+    \item Host discovery from \texttt{tp.telecom-paris.fr/ajax.php} — live JSON, canonical \texttt{.enst.fr} names, $2\times N$ pool for cold spares
+    \item Go orchestrator: build worker binary, deploy, coordinate phases, merge results
+    \item HTTP worker API: \texttt{/load} $\to$ \texttt{/map} $\to$ \texttt{/intermediate} $\to$ \texttt{/reduce} $\to$ \texttt{/result}
+    \item Four pluggable jobs sharing the same framework: \texttt{wordcount}, \texttt{langdetect}, \texttt{domainpop}, \texttt{docdensity}
+    \item 89 Go tests; reference wordcount matched exactly against sequential implementation
+  \end{itemize}
   \note{Timing: 45 seconds. The core distributed computation is real — workers map, write buckets, fetch from peers, reduce.}
 \end{frame}
 
@@ -156,173 +342,6 @@
     One of the primary training data sources for GPT, LLaMA, Mistral and most modern LLMs. These jobs are the kind of analysis that precedes any large-scale dataset curation.
   \end{block}
   \note{Timing: 45 seconds. Stress that all four jobs reuse the same deploy/shuffle/reduce/collect path. Only the map and reduce functions differ.}
-=======
-
-\end{frame}
-
-\begin{frame}[fragile]{Architecture}
-  \begin{center}
-  \begin{tikzpicture}[
-    scale=0.75, transform shape,
-    box/.style={draw, rounded corners, fill=slrblue!20, text width=2cm, align=center, minimum height=1cm},
-    worker/.style={draw, rounded corners, fill=slrgreen!20, text width=2.2cm, align=center, minimum height=0.8cm},
-    ->, >=Latex, thick
-  ]
-    \node[box] (client) {Client \\ (Orchestrator)};
-    
-    \node[worker, right=1.5cm of client, yshift=1.5cm] (m1) {Map Worker 1};
-    \node[worker, right=1.5cm of client, yshift=0cm] (m2) {Map Worker 2};
-    \node[worker, right=1.5cm of client, yshift=-1.5cm] (m3) {Map Worker 3};
-    
-    \node[worker, right=1.5cm of m1, yshift=-0.75cm] (r1) {Reduce Worker 1};
-    \node[worker, right=1.5cm of m2, yshift=-0.75cm] (r2) {Reduce Worker 2};
-    
-    \node[box, right=1.5cm of r1, yshift=-0.75cm] (collect) {Client \\ (Collect)};
-    
-    \draw (client.east) -- (m1.west) node[midway, above, sloped, font=\scriptsize] {Assign splits};
-    \draw (client.east) -- (m2.west);
-    \draw (client.east) -- (m3.west);
-    
-    \draw (m1.east) -- (r1.west) node[midway, above, sloped, font=\scriptsize] {Shuffle};
-    \draw (m1.east) -- (r2.west);
-    \draw (m2.east) -- (r1.west);
-    \draw (m2.east) -- (r2.west);
-    \draw (m3.east) -- (r1.west);
-    \draw (m3.east) -- (r2.west);
-    
-    \draw (r1.east) -- (collect.west) node[midway, above, sloped, font=\scriptsize] {Merge};
-    \draw (r2.east) -- (collect.west);
-  \end{tikzpicture}
-  \end{center}
-\end{frame}
-
-\begin{frame}{Execution Sequence}
-  \begin{center}
-  \begin{tikzpicture}[
-    scale=0.7, transform shape,
-    actor/.style={draw, rounded corners, fill=slrblue!20, text width=1.5cm, align=center, minimum height=0.6cm},
-    action/.style={draw, fill=slrgray, rounded corners, text width=5cm, align=center, minimum height=0.6cm, font=\scriptsize},
-    ->, >=Latex, thick
-  ]
-    \node[actor] (main) at (0,0) {Main};
-    \node[actor] (w1) at (3.5,0) {Worker 1};
-    \node[actor] (w2) at (6.5,0) {Worker 2};
-    \node[font=\Large] (dots) at (8.5,0) {$\dots$};
-    \node[actor] (wn) at (10.5,0) {Worker N};
-    
-    \draw[thick, slrblue] (main.south) -- +(0,-8.3);
-    \draw[thick, slrblue] (w1.south) -- +(0,-8.3);
-    \draw[thick, slrblue] (w2.south) -- +(0,-8.3);
-    \draw[thick, slrblue, loosely dotted] (dots.south) -- +(0,-8.3);
-    \draw[thick, slrblue] (wn.south) -- +(0,-8.3);
-    
-    % Load Request
-    \draw (main.south |- 0,-0.6) -- (w1.south |- 0,-0.6) node[midway, above=-0.05cm, font=\tiny] {\texttt{/load}};
-    \draw (main.south |- 0,-0.8) -- (w2.south |- 0,-0.8);
-    \draw (main.south |- 0,-1.0) -- (wn.south |- 0,-1.0);
-    
-    % Load Response
-    \draw[<-, dashed] (main.south |- 0,-1.2) -- (w1.south |- 0,-1.2) node[midway, above=-0.05cm, font=\tiny] {\texttt{200 OK}};
-    \draw[<-, dashed] (main.south |- 0,-1.4) -- (w2.south |- 0,-1.4);
-    \draw[<-, dashed] (main.south |- 0,-1.6) -- (wn.south |- 0,-1.6);
-    
-    % Map Request
-    \draw (main.south |- 0,-1.9) -- (w1.south |- 0,-1.9) node[midway, above=-0.05cm, font=\tiny] {\texttt{/map}};
-    \draw (main.south |- 0,-2.1) -- (w2.south |- 0,-2.1);
-    \draw (main.south |- 0,-2.3) -- (wn.south |- 0,-2.3);
-    
-    % Map Work
-    \node[action, minimum width=8.5cm] at (7.0,-2.9) {Map Phase: Write N buckets locally};
-    
-    % Map Response
-    \draw[<-, dashed] (main.south |- 0,-3.5) -- (w1.south |- 0,-3.5) node[midway, above=-0.05cm, font=\tiny] {\texttt{200 OK}};
-    \draw[<-, dashed] (main.south |- 0,-3.7) -- (w2.south |- 0,-3.7);
-    \draw[<-, dashed] (main.south |- 0,-3.9) -- (wn.south |- 0,-3.9);
-    
-    % Reduce Request
-    \draw (main.south |- 0,-4.2) -- (w1.south |- 0,-4.2) node[midway, above=-0.05cm, font=\tiny] {\texttt{/reduce}};
-    \draw (main.south |- 0,-4.4) -- (w2.south |- 0,-4.4);
-    \draw (main.south |- 0,-4.6) -- (wn.south |- 0,-4.6);
-    
-    % Reduce Work
-    \node[action, minimum width=8.5cm] at (7.0,-5.2) {Shuffle (fetch peer buckets) \& Reduce};
-    
-    % Reduce Response
-    \draw[<-, dashed] (main.south |- 0,-5.8) -- (w1.south |- 0,-5.8) node[midway, above=-0.05cm, font=\tiny] {\texttt{200 OK}};
-    \draw[<-, dashed] (main.south |- 0,-6.0) -- (w2.south |- 0,-6.0);
-    \draw[<-, dashed] (main.south |- 0,-6.2) -- (wn.south |- 0,-6.2);
-    
-    % Result Request
-    \draw (main.south |- 0,-6.5) -- (w1.south |- 0,-6.5) node[midway, above=-0.05cm, font=\tiny] {\texttt{/result}};
-    \draw (main.south |- 0,-6.7) -- (w2.south |- 0,-6.7);
-    \draw (main.south |- 0,-6.9) -- (wn.south |- 0,-6.9);
-    
-    % Result Response
-    \draw[<-, dashed] (main.south |- 0,-7.1) -- (w1.south |- 0,-7.1) node[midway, above=-0.05cm, font=\tiny] {\texttt{data}};
-    \draw[<-, dashed] (main.south |- 0,-7.3) -- (w2.south |- 0,-7.3);
-    \draw[<-, dashed] (main.south |- 0,-7.5) -- (wn.south |- 0,-7.5);
-    
-    % Collect
-    \node[action, text width=3cm] at (main.south |- 0,-8.0) {Collect \& Merge};
-  \end{tikzpicture}
-  \end{center}
-\end{frame}
-
-\begin{frame}[fragile]{Protocol and Dataflow}
-  \begin{enumerate}
-    \item \textbf{Load:} Send $\le$64MB chunks or WET URLs.
-    \item \textbf{Map:} Write \texttt{N} bucket files locally.
-    \item \textbf{Shuffle+reduce:} Fetch peer buckets via HTTP.
-    \item \textbf{Collect:} Merge \& write result locally.
-  \end{enumerate}
-  \vspace{1em}
-  \textbf{Map assignment:} Orchestrator split + \texttt{POST /data}\\
-  \textbf{Reducer assignment:} \texttt{FNV-32a(key) \% N}
-\end{frame}
-
-\begin{frame}{Fault Tolerance and Operations}
-  \textbf{Failure Detection:}
-  \begin{itemize}
-    \item A background health watcher polls \texttt{GET /health} every 5 seconds.
-    \item Two consecutive failures mark a host as \textbf{dead}.
-  \end{itemize}
-  \vspace{0.5em}
-  
-  \textbf{Recovery Execution (What happens when a node fails):}
-  \begin{itemize}
-    \item The orchestrator pulls a \textbf{spare host} from the \texttt{hosts.txt} pool.
-    \item It deploys a new worker binary over SSH to the spare.
-    \item The system \textbf{replays} the \texttt{/load} and \texttt{/map} phases for the failed slot.
-    \item If no spare host is available, the failed slot is reassigned to an existing healthy worker.
-    \item Logical \textbf{slots} (\texttt{0..N-1}) stay fixed even if the physical host changes.
-  \end{itemize}
-\end{frame}
-
-\begin{frame}[fragile]{Use Cases Beyond Wordcount}
-  \begin{table}
-    \small
-    \begin{tabular}{>{\ttfamily}l p{0.42\linewidth} p{0.27\linewidth}}
-      \toprule
-      Job & What it measures & Example output \\
-      \midrule
-      wordcount & Token frequency & \texttt{the 239298} \\
-      langdetect & Language signal counts & \texttt{lang:en}, \texttt{lang:fr} \\
-      domainpop & Crawled domain popularity & \texttt{doi.org}, \texttt{youtube.com} \\
-      docdensity & Content size and density & \texttt{stat:lines}, \texttt{hist:len.*} \\
-      \bottomrule
-    \end{tabular}
-  \end{table}
-
-  \begin{block}{Executing a specific job}
-\begin{lstlisting}[language=bash]
-# The orchestrator injects the selected job into the worker binary
-./mapreduce.sh -job scripts/jobs/langdetect \
-  -commoncrawl \
-  -crawl CC-MAIN-2026-21 \
-  -n 8
-\end{lstlisting}
-  \end{block}
->>>>>>> 5305e4d3c8cc4ec5328484bbda4ec112abb687f1
 \end{frame}
 
 \begin{frame}{Measurements and Amdahl's Law}
@@ -333,7 +352,6 @@
     \begin{column}{0.4\textwidth}
       \textbf{Go Source Files (64 files):}
       \begin{itemize}
-<<<<<<< HEAD
         \item Same 8 WET files at every point (correct methodology)
         \item \texttt{1 node}: 206.95\,s $\Rightarrow$ baseline
         \item \texttt{16 nodes}: 40.80\,s, speedup 5.07
@@ -346,19 +364,6 @@
     \end{column}
   \end{columns}
   \note{Timing: 1 minute 15 seconds. f=18\% means 82\% of the work is parallelisable. The collect phase grows with N and becomes the ceiling.}
-=======
-        \item \texttt{1 node}: 0.973 s (1.00x)
-        \item \texttt{2 nodes}: 0.494 s (1.97x)
-        \item \texttt{4 nodes}: 0.383 s (2.54x)
-        \item \texttt{8 nodes}: \textbf{0.266 s} (\textbf{3.66x})
-        \item \texttt{16 nodes}: 1.412 s (0.69x)
-        \item \texttt{64 nodes}: 10.452 s (0.09x)
-      \end{itemize}
-      \vspace{0.5em}
-      \textbf{Methodology:} Strong-scaling test on 64 Go files, varying active nodes from 1 to 64. Reference baseline is $N=1$.
-    \end{column}
-  \end{columns}
->>>>>>> 5305e4d3c8cc4ec5328484bbda4ec112abb687f1
 \end{frame}
 
 \begin{frame}{Three-Way Comparison}
@@ -383,18 +388,18 @@
   \note{Timing: 55 seconds. Kafka difference is model-level (stream vs batch). Hadoop difference is engineering-level (production data locality + scheduling we did not build).}
 \end{frame}
 
-<<<<<<< HEAD
-\begin{frame}[fragile]{What's Missing + Demo}
+\begin{frame}[fragile]{Demo Plan}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{0.44\textwidth}
-      \textbf{Real remaining gaps}
+      \textbf{Remaining gaps}
       \begin{itemize}
-        \item Atomic final output write (temp+rename)
         \item Speculative execution for stragglers
-        \item Port collision preflight check
         \item Multi-chunk scheduling in local-file mode
-        \item Cross-login validation
+        \item 100-node / 1000+ split scale evidence
       \end{itemize}
+      \textbf{Pain point (biggest)}\\
+      NFS saturation when all nodes read \texttt{/cal/commoncrawl} simultaneously.\\
+      \textit{Fix:} direct Amazon S3 download — scales with node count.
     \end{column}
     \begin{column}{0.52\textwidth}
       \begin{block}{Live demo}
@@ -414,59 +419,19 @@ cd scripts && go test ./...
       \end{block}
     \end{column}
   \end{columns}
-  \note{Timing: 1 minute 15 seconds. Be calm about gaps — the protocol, jobs, and recovery all work and are tested. The gaps are operational hardening.}
-=======
-\begin{frame}{Pain Points: What Broke and Why?}
-  During development and testing at scale, we encountered major blockers:
-  \vspace{1em}
-  
-  \begin{enumerate}
-    \vspace{0.5em}
-    \item \textbf{Zombie Processes:} Killed orchestrators left orphan worker processes running on remote lab machines, locking up assigned ports.
-    \begin{itemize}
-      \item \textit{Fix:} Made cleanup idempotent (matching port/process ID) and added health monitoring.
-    \end{itemize}
-  \end{enumerate}
-\end{frame}
-
-\begin{frame}{Optimization and Future Work}
-  \textbf{Performance Optimization \& Profiling}
-  \begin{itemize}
-    \item \textbf{In-Mapper Combiner:} Introduce an aggregation tree or combiner step in the mapper to drastically reduce HTTP requests and intermediate data size.
-    \item \textbf{Streaming IO:} Stream intermediate bucket results instead of keeping maps fully in memory. This prevents OOM crashes observed with large Common Crawl files at N=1 and N=2.
-  \end{itemize}
-  \vspace{0.5em}
-  
-  \textbf{Fault Tolerance Improvements}
-  \begin{itemize}
-    \item \textbf{Durable State:} The current MapReduce state is volatile in \texttt{/tmp}. Implementing replicated bucket storage could provide stronger, Hadoop-like fault tolerance without full phase replays.
-  \end{itemize}
-\end{frame}
-
-\begin{frame}[fragile]{Demo and Discussion Plan}
-  \begin{block}{Live demo path}
-\begin{lstlisting}[language=bash]
-# Run word count on a local file (10k words) using 10 nodes
-./mapreduce.sh -job scripts/jobs/wordcount \
-  -input data/demo_text.txt -n 10 -output data/result.txt
-
-# Regular Demonstration:
-./demo_regular.sh
-
-# Fault Tolerance Demonstration:
-./demo_fault_tolerance.sh
-./demo_fault_tolerance_no_spares.sh
-\end{lstlisting}
-  \end{block}
+  \note{Timing: 1 minute 15 seconds. Be calm about gaps — the protocol, jobs, and recovery all work and are tested.}
 \end{frame}
 
 \begin{frame}{Team Work Distribution}
   \begin{itemize}
-    \item \textbf{Guilherme:} Machine discovery, Deployment scripts, Fault tolerance, Amdahl experiments
-    \item \textbf{Daniele:} Architecture, Protocol design, Tests
-    \item \textbf{Marcin:} Kafka and comparison experiments
+    \item \textbf{Guilherme Caporali:} Machine discovery, deployment scripts (\texttt{deploy\_nfs.sh}, \texttt{clean\_mapreduce.sh}), fault tolerance design, Amdahl experiments
+    \item \textbf{Daniele Famà:} Architecture, Go orchestrator and worker, protocol design, unit and integration tests
+    \item \textbf{Marcin Porwisz:} Kafka Streams comparison, \texttt{WordCountJob.java}, Kafka deploy/cleanup scripts, comparison analysis
   \end{itemize}
->>>>>>> 5305e4d3c8cc4ec5328484bbda4ec112abb687f1
+  \vspace{1em}
+  \begin{block}{Q\&A preparation areas}
+    Why NFS avoidance? Why direct Amazon S3 vs \texttt{/cal/commoncrawl}? How does epoch invalidation work? Why does speedup plateau at $N=32$?
+  \end{block}
 \end{frame}
 
 \end{document}

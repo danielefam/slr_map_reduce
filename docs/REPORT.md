@@ -2,7 +2,7 @@
 
 **Project:** Custom distributed MapReduce in Go over remote lab machines (`*.enst.fr`)  
 **Repository:** `slr_map_reduce`  
-**Last updated:** 2026-06-19
+**Last updated:** 2026-07-01
 
 ---
 
@@ -414,3 +414,16 @@ The three new jobs were executed successfully via the real worker protocol in th
 - `docdensity`: consistent aggregate counters and derived ratios.
 
 Next high-impact engineering steps are memory/shuffle streaming optimizations and benchmark completion on the full remote lab pool for final Amdahl and Kafka comparison plots.
+
+---
+
+## 12. Submission Readiness
+
+This repository now includes the main artifacts required by the submission guidelines:
+
+- a written report in this file and the PDF/LaTeX report under `docs/report/`;
+- presentation material under `docs/PRESENTATION_10MIN.*`;
+- runnable code and run instructions in `README.md`, `mapreduce.sh`, `scripts/`, and the job packages;
+- a completed self-assessment questionnaire in `docs/self-assessment.md`.
+
+The report is intentionally honest about the remaining gaps that are not yet proven by the repository: exact NFS-home deployment compatibility, `/cal/commoncrawl` input mode, large-scale 100+ node Common Crawl evidence, speculative backup tasks, and a fully evidenced demo/work-split package.

@@ -95,6 +95,7 @@ func run() error {
 	backoffInitial := flag.Duration("backoff-initial", 250*time.Millisecond, "initial retry backoff (doubles up to 5s)")
 	parallel := flag.Int("parallel", remote.DefaultParallelism, "maximum number of concurrent SSH/SCP or readiness-check operations")
 	workerPprof := flag.Bool("worker-pprof", false, "start remote workers with -pprof (exposes /debug/pprof/ for bottleneck analysis)")
+	nfsDeploy := flag.Bool("nfs-deploy", false, "deploy by copying the binary ONCE to HOME (NFS) then starting workers via SSH from that shared path (rubric 1-SCP+N-SSH pattern)")
 	flag.Parse()
 
 	if *cleanupOnly {
@@ -154,7 +155,13 @@ func run() error {
 
 	// ── Step 2: deploy only the initial active workers ─────────────────────
 	log.Printf("deploying up to %d initial worker(s)…", target)
-	activeHosts, activePeers, sparePeers, err := deployInitialWorkers(hosts, *port, workerBuildPath, target, *workerPprof)
+	var activeHosts, activePeers, sparePeers []string
+	if *nfsDeploy {
+		log.Println("[nfs-deploy] using 1-SCP-to-HOME + N-SSH pattern")
+		activeHosts, activePeers, sparePeers, err = deployWorkersNFS(hosts, *port, workerBuildPath, target, *workerPprof)
+	} else {
+		activeHosts, activePeers, sparePeers, err = deployInitialWorkers(hosts, *port, workerBuildPath, target, *workerPprof)
+	}
 	if err != nil {
 		return fmt.Errorf("deploy failed: %w", err)
 	}
@@ -164,9 +171,22 @@ func run() error {
 		len(activePeers), len(sparePeers), *n)
 
 	activateSpare := func(peer string) error {
-		host, _, found := strings.Cut(peer, ":")
+		host, peerPort, found := strings.Cut(peer, ":")
 		if !found {
 			host = peer
+			peerPort = *port
+		}
+		if *nfsDeploy {
+			// In NFS mode the binary is already on the shared HOME; just SSH-start.
+			if err := sshStartNFS(host, peerPort, *workerPprof); err != nil {
+				return err
+			}
+			readyHosts, _, hErr := waitHealthy([]string{host}, []string{peer}, 1)
+			if hErr != nil || len(readyHosts) == 0 {
+				cleanupWorkers([]string{host}, 1)
+				return fmt.Errorf("%s did not become ready (nfs-deploy)", peer)
+			}
+			return nil
 		}
 		return activateWorker(host, peer, workerBuildPath, *workerPprof)
 	}
@@ -359,6 +379,73 @@ func activateWorker(host, peer, workerBuildPath string, withPprof bool) error {
 		return err
 	}
 	return fmt.Errorf("%s did not become ready", peer)
+}
+
+// deployWorkersNFS implements the rubric-preferred 1-SCP-to-HOME + N-SSH pattern:
+// the binary is SCPed ONCE to the first reachable host's HOME directory (which
+// sits on the lab NFS, so every machine can read it at ~/mr-worker), then each
+// of the N hosts is started via SSH without any additional SCP.
+func deployWorkersNFS(hosts []string, port, workerBuildPath string, target int, withPprof bool) ([]string, []string, []string, error) {
+	// Stage 1: SCP the binary once to the first reachable host's NFS home.
+	stagingHost := ""
+	for _, h := range hosts {
+		if err := scpTo(workerBuildPath, h, "~/mr-worker"); err != nil {
+			log.Printf("[nfs-deploy] scp to %s failed: %v — trying next host", h, err)
+			continue
+		}
+		if _, err := sshRun(h, []string{"chmod +x ~/mr-worker"}); err != nil {
+			log.Printf("[nfs-deploy] chmod on %s failed: %v — trying next host", h, err)
+			continue
+		}
+		stagingHost = h
+		break
+	}
+	if stagingHost == "" {
+		return nil, nil, nil, fmt.Errorf("nfs-deploy: could not stage binary to any host's HOME")
+	}
+	log.Printf("[nfs-deploy] binary staged to %s:~/mr-worker (HOME is on NFS, visible to all nodes)", stagingHost)
+
+	// Stage 2: SSH to the first N reachable hosts and start from ~/mr-worker.
+	activeHosts := make([]string, 0, target)
+	activePeers := make([]string, 0, target)
+
+	for i, host := range hosts {
+		if len(activePeers) == target {
+			return activeHosts, activePeers, peersForHosts(hosts[i:], port), nil
+		}
+		peer := host + ":" + port
+		if err := ensureRemotePortFree(host, port); err != nil {
+			log.Printf("[nfs-deploy] port preflight failed on %s: %v — skipping", host, err)
+			continue
+		}
+		if err := sshStartNFS(host, port, withPprof); err != nil {
+			log.Printf("[nfs-deploy] ssh start failed on %s: %v — skipping", host, err)
+			continue
+		}
+		readyHosts, _, err := waitHealthy([]string{host}, []string{peer}, 1)
+		if err != nil || len(readyHosts) == 0 {
+			log.Printf("[nfs-deploy] health check failed on %s — skipping", host)
+			cleanupWorkers([]string{host}, 1)
+			continue
+		}
+		activeHosts = append(activeHosts, host)
+		activePeers = append(activePeers, peer)
+	}
+	if len(activePeers) < target {
+		return nil, nil, nil, fmt.Errorf("nfs-deploy: need at least %d workers but only %d ready", target, len(activePeers))
+	}
+	return activeHosts, activePeers, nil, nil
+}
+
+// sshStartNFS starts the worker from ~/mr-worker (the NFS home copy) without SCP.
+func sshStartNFS(host, port string, withPprof bool) error {
+	startCmd := fmt.Sprintf(
+		"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "+
+			"rm -f /tmp/mr-worker.pid /tmp/mr-worker.log && "+
+			"nohup ~/mr-worker -port %s%s </dev/null >/tmp/mr-worker.log 2>&1 & echo $! > /tmp/mr-worker.pid",
+		port, pprofArg(withPprof))
+	_, err := sshRun(host, []string{startCmd})
+	return err
 }
 
 // deployWorker SCPs the worker binary to one host and starts the HTTP server.
