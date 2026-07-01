@@ -125,9 +125,16 @@ This gives O(1) bucket selection per request and O(N²) total peer requests for 
 
 This prevents stale peer topology from leaking into final reduce outputs.
 
+**Atomic writes status:**
+- WET file downloads: `CreateTemp` + `os.Rename` — implemented ✓
+- Worker binary deploy: `mv` on same filesystem — implemented ✓
+- Final output: written directly to the output file path (no temp+rename). If any worker fails during the final result collection phase, the orchestrator exits with no output at all. [known gap]
+
 ---
 
 ## 5. Implemented Jobs
+
+Because Common Crawl is one of the primary training data sources for large language models (GPT, LLaMA, Mistral, and many others), these jobs represent the kind of analysis that precedes large-scale dataset curation — identifying language composition, domain provenance, and content quality before deciding what to include in a training corpus.
 
 ### 5.1 `langdetect` (`scripts/jobs/langdetect`)
 
@@ -254,15 +261,19 @@ Interpretation: all lines fall in `<80` bucket; dataset is predominantly alphanu
 
 **Experiment Setup**: Fixed workload of 8 WET files, measuring Map+Reduce+Collect. 
 The same dataset was used for all point measurements to properly validate Amdahl's Law.
+The wordcount job on this corpus produced approximately **24 million unique words**.
 
 - **1 node**: 206.95s (Baseline)
 - **16 nodes**: 40.80s (Speedup 5.07x)
-- **64 nodes**: 39.06s (Regression)
+- **32 nodes**: 37.94s (Speedup 5.45x — peak)
+- **64 nodes**: 39.06s (Speedup 5.30x — regression)
+
+The speedup rises from 1 to 32 nodes, peaks at S ≈ 5.45, then regresses slightly at 64 nodes (S ≈ 5.30). This illustrates all three phases of Amdahl's law: strong gains from 1–8 nodes (parallel work dominates), diminishing returns from 8–32 nodes (communication overhead grows), and regression at 64 nodes (synchronization overhead exceeds parallelization gains).
 
 ![Amdahl's Law Graph](amdahl_8.png)
 
 **Serial Fraction Calculation**:
-The speedup plateau $S \approx 5.45$ implies a serial fraction $f \approx 18\%$. This serial portion stems from the orchestrator's collect phase (sequential merge of $N$ results) and the $N \times (N - 1)$ HTTP connections during shuffle at 64 nodes.
+Using the peak value S(32) ≈ 5.45, solving 1/f = 5.45 gives a serial fraction $f \approx 18\%$. This serial portion stems from the orchestrator's collect phase (sequential merge of $N$ results) and the $N \times (N - 1)$ HTTP connections during shuffle at 64 nodes.
 
 ### 7.2 Confirmed code-path bottlenecks
 
@@ -357,6 +368,8 @@ In both paths, input staging/production happens before timer start.
 
 - **NFS I/O Saturation (Biggest Pain Point)**: When all workers tried to read from `/cal/commoncrawl` simultaneously, the NFS became heavily saturated and unresponsive. 
   - *Fix*: We transitioned to streaming data directly from `data.commoncrawl.org` (Amazon S3), which bypasses the NFS and scales linearly with node count.
+- **Zombie Worker Processes**: Killing the orchestrator (e.g. via SIGKILL or a lost SSH session) left orphan worker processes running on remote lab machines, holding their assigned ports. The next run would then fail to start fresh workers on those ports or find stale state.
+  - *Fix*: Cleanup was made **idempotent** — workers are identified by a PID file at `/tmp/mr-worker.pid`; the cleanup step kills via PID and removes all `/tmp/mr-worker*` files, tolerating repeated invocations and missing files gracefully.
 - **Memory Pressure**: Processing large datasets caused OOM or disk-space issues on smaller clusters because intermediate data is heavily buffered in memory before being written to `/tmp`.
 
 ### 9.2 Common issues
