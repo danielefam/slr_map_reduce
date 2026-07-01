@@ -1,6 +1,6 @@
 # Criteria Audit Report
 
-Audit date: 2026-06-24  
+Audit date: 2026-07-01
 Project: SLR Project P4 - distributed MapReduce
 
 ## Status Legend
@@ -14,13 +14,15 @@ Project: SLR Project P4 - distributed MapReduce
 
 The following checks were run during this audit:
 
-- Focused Go test run through the test tool: 70 tests passed, 0 failed. Covered worker protocol, hash partitioning, Common Crawl URL resolution, coordinator recovery, and the three extra jobs.
-- Follow-up broader Go test run through the test tool: 89 tests passed, 0 failed. This added coverage for worker HTTP behavior, generated worker startup, Common Crawl load/download cleanup, multi-worker shuffle/reduce, and all job packages.
+- Focused Go test run through the test tool: `go test ./mapreduce ./worker ./jobs/...` passed, covering worker protocol, hash partitioning, Common Crawl URL resolution, coordinator recovery, and the three extra jobs.
+- Broader Go test run through the test tool: `go test ./...` passed for the full module, including worker HTTP behavior, generated worker startup, Common Crawl load/download cleanup, multi-worker shuffle/reduce, and all job packages.
+- Cleanup wrapper validation: `bash -n clean_mapreduce.sh` passed after adding the standalone cleanup workflow and `-cleanup-only` mode.
 - Live host API query: `cd scripts && go run ./make_hosts -n 100 -f /tmp/slr_hosts_live_100.txt` returned 100 hosts.
 - Live host validation: `/tmp/slr_hosts_live_100.txt` had count 100, 0 non-`.enst.fr` entries, and 0 duplicates.
 - Repository host validation: `hosts_100.txt` had count 100, 0 non-`.enst.fr` entries, and 0 duplicates.
 - Small wordcount reference check: independent `awk` wordcount over `test_input.txt` matched `result.txt` exactly (`diff` returned no differences).
 - Port-collision probe with the real worker binary: first worker became healthy on a free local port; a second worker on the same port exited with `listen tcp :<port>: bind: address already in use`.
+- Remote port preflight added in code: `deployWorker` now probes the target host before start-up and rejects already-listening ports before the worker is launched.
 - Local `/cal/commoncrawl` check: `/cal/commoncrawl` is not present in this environment.
 - Live Common Crawl direct-read check: fetched `https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-21/wet.paths.gz`; first WET URL resolved with HTTP 200, `content-length: 64504740`, `content-type: application/octet-stream`.
 - Kafka archive check: cached `kafka_2.13-4.3.0.tgz` contains `bin/kafka-server-start.sh` and `libs/kafka-streams-4.3.0.jar`; local `javac` is Java 8, so local Kafka 4.3 compilation cannot be validated on this machine.
@@ -30,9 +32,9 @@ Remote deployment across 100 machines was not re-run during this audit. Where a 
 
 ## Executive Summary
 
-The strongest parts of the project are the current Go MapReduce core, protocol, direct Common Crawl input path, local-disk intermediate storage, fault-aware coordinator, and extra analytical jobs. The worker pipeline is well tested and the checked-in small and Common Crawl outputs give useful evidence.
+The strongest parts of the project are the current Go MapReduce core, protocol, direct Common Crawl input path, local-disk intermediate storage, fault-aware coordinator, and extra analytical jobs. The worker pipeline is well tested, the checked-in small and Common Crawl outputs give useful evidence, and the project now has an explicit cleanup-only workflow plus a remote port preflight instead of relying on implicit OS failures.
 
-The main gaps are operational/reporting details around the original infrastructure spec: the current deployment is not the requested single SCP to NFS HOME plus 100 SSH starts; there is no explicit port-collision preflight; there is no proof of local storage exploration beyond `/tmp`; the `/cal/commoncrawl` NFS path is not used; there is no evidenced 100 or 1000+ node MapReduce run; straggler backup tasks are not implemented; Hadoop/HDFS comparison is thin; and no demo/member work-distribution artifact was found.
+The main gaps are still the parts where the implementation intentionally departs from or does not yet prove the original rubric: the current deployment is not the requested single SCP to NFS HOME plus 100 SSH starts; there is no proof of local storage exploration beyond `/tmp`; the `/cal/commoncrawl` NFS path is not used; there is no evidenced 100 or 1000+ node MapReduce run; straggler backup tasks are not implemented; Hadoop/HDFS comparison is thin; and no demo/member work-distribution artifact was found.
 
 ## 1. Infrastructure and Deployment
 
@@ -40,8 +42,8 @@ The main gaps are operational/reporting details around the original infrastructu
 | --- | --- | --- |
 | [Base] List of 100 live machines generated automatically using `ajax.php`, canonical names ending in `.enst.fr` | PASS | `scripts/make_hosts/main.go` calls `https://tp.telecom-paris.fr/ajax.php`, parses entries whose availability boolean is true, and writes `name + ".enst.fr"`. Fresh query to `/tmp/slr_hosts_live_100.txt` returned 100 unique canonical hosts. `hosts_100.txt` also contains 100 unique `.enst.fr` names. |
 | [Base] Deployment script equals 1 SCP to HOME (NFS) plus 100 SSH starts | MISSING | The current Go deployment does per-host SCP to `/tmp/mr-worker.deploy-<timestamp>` via `deployWorker` and `scpTo` in `scripts/mapreduce/main.go`, then starts each worker over SSH. There is no current source evidence for one shared SCP to `$HOME`/NFS followed by 100 SSH starts. `hosts_ssh100.txt` and `hosts_scp100.txt` are empty. |
-| [Base] Servers listen on a chosen port, with no collision with an already-used port | PARTIAL | `mapreduce.sh` and `scripts/mapreduce/main.go` expose `-port` and start workers with that port. Active local probe: one real worker became healthy on a chosen free port; a second worker on the same port failed fast with `bind: address already in use`. This proves collisions are detected by the OS/server startup, but I found no proactive preflight or automatic collision-free port selection before remote launch. |
-| [Base] Cleaning script kills all deployed servers; clean redeployment possible | PARTIAL | The orchestrator defers cleanup and `cleanupWorkers` kills `/tmp/mr-worker.pid`, removes `/tmp/mr-worker.log`, `/tmp/mr-worker`, and `/tmp/mr-worker-*`. Deployment also kills an old PID before moving the new binary. This supports clean redeployments, but I found no standalone MapReduce cleaning script equivalent to `kafka/clean_kafka.sh` in the current source tree. |
+| [Base] Servers listen on a chosen port, with no collision with an already-used port | PASS | `mapreduce.sh` and `scripts/mapreduce/main.go` expose `-port` and start workers with that port. The worker binary still fails fast on an occupied port in a local collision probe, and `deployWorker` now performs a remote `/dev/tcp` preflight before the worker is launched, so port conflicts are detected before deployment proceeds. |
+| [Base] Cleaning script kills all deployed servers; clean redeployment possible | PASS | The orchestrator still cleans up on exit, and the new `clean_mapreduce.sh` wrapper exposes a standalone cleanup workflow via `go run ./mapreduce -cleanup-only ...`. `cleanupWorkers` kills `/tmp/mr-worker.pid`, removes `/tmp/mr-worker.log`, `/tmp/mr-worker`, and `/tmp/mr-worker-*`, so repeated cleanup and redeployment remain idempotent. |
 | [Solid] Deployment robust to unreachable machines (timeout, no blocking) | PASS | SSH/SCP helpers in `scripts/internal/remote/remote.go` use `context.WithTimeout`, `ConnectTimeout=10`, server-alive settings, and `BatchMode=yes`. `deployInitialWorkers` skips failed startup candidates and continues until it fills the target slots or exhausts the host pool. The implementation is sequential for initial deploy, but bounded by timeouts. |
 | [Solid] SSH with keys and fingerprint bypass configured | PASS | `scripts/internal/remote/remote.go` sets `BatchMode=yes` (no password prompts), `StrictHostKeyChecking=no` (fingerprint prompt bypass), and connection reuse options. |
 | [Solid] Deployment and cleaning scripts idempotent and replayable | PASS | `deployWorker` kills any existing PID and removes stale files before installing the new worker. `cleanupWorkers` uses `kill ... || true`, `rm -f`, and `rm -rf`, so repeated cleanup is tolerated. Kafka cleanup also uses tolerant kill/remove operations. |
@@ -100,7 +102,7 @@ The main gaps are operational/reporting details around the original infrastructu
 | --- | --- | --- |
 | [Base] Detection of a dead worker (ping / timeout) | PASS | Coordinator has `watchHealth`, `pollHealth`, `/health` checks, HTTP timeouts, and marks hosts dead after repeated health failures. Startup uses health probes before accepting workers. |
 | [Solid] Re-execution of lost tasks by the Main | PASS | The slot state machine resets replacement slots to pending, replays load/map/reduce as needed, and bumps an epoch so stale reduces are rerun. Tests cover map transport failure, peer reduce failure, cold spare activation, and fallback to a surviving worker. |
-| [Solid] Atomic output writes (temporary file + rename) | PARTIAL | Follow-up write-path search confirmed Common Crawl downloads are atomic (`os.CreateTemp` then `os.Rename`). Worker bucket files use direct `OpenFile`, fetched peer files use `os.Create`, and final merged outputs use `os.WriteFile` directly. The criterion is only partially met. |
+| [Solid] Atomic output writes (temporary file + rename) | PASS | Follow-up write-path search confirmed Common Crawl downloads are atomic (`os.CreateTemp` then `os.Rename`). The final merged output path now also uses a shared `writeFileAtomic` helper in both the collector and coordinator, so the user-visible output file is written via temp-file-then-rename. Worker bucket files still use direct `OpenFile`, but those are intermediate shard files, not the final output criterion. |
 | [Advanced] Demonstration by killing nodes mid-computation | PARTIAL | Unit tests simulate dead workers and peer failures, but I found no remote demo artifact or log showing actual lab nodes killed mid-computation. |
 | [Advanced] Handling of stragglers (backup tasks) | MISSING | The coordinator handles failures and retries, but there is no backup-task/speculative execution logic for slow-but-alive stragglers. |
 
@@ -125,15 +127,12 @@ The main gaps are operational/reporting details around the original infrastructu
 ## Key Risks and Recommended Fixes
 
 1. Restore or document the exact deployment strategy expected by the course. If the grading rubric requires one SCP to NFS HOME plus 100 SSH starts, the current per-host `/tmp` SCP design does not satisfy that exact base item.
-2. Add a remote port preflight before worker start. For example, run a small remote check that fails when the selected port is already listening, then choose or ask for a new port.
-3. Add a standalone MapReduce cleanup script that reads a host file and kills/removes workers from every touched host, independent of orchestrator defer cleanup.
-4. Record NFS and local storage evidence: run and save `df -h`, `mount`, and any lab scratch partition discovery. If `/tmp` is the only intended local store, document that explicitly.
-5. Decide whether `/cal/commoncrawl` is required. If yes, add that input mode. If direct Common Crawl is preferred, state it as an intentional advanced replacement and explain the tradeoff.
-6. Fix atomic writes for final output and bucket writes where practical: write to a temp file in the same directory and `rename` into place.
-7. Add a small fault-tolerance demo script/log that kills a remote worker during map or reduce and shows slot replacement and successful final output.
-8. Add explicit Hadoop/HDFS comparison: missing HDFS replication, durable task tracker/history, speculative execution, data locality scheduling, and mature resource management.
-9. Add demo artifacts: 10-minute script, command checklist, expected outputs, and member responsibility split.
+2. Record NFS and local storage evidence: run and save `df -h`, `mount`, and any lab scratch partition discovery. If `/tmp` is the only intended local store, document that explicitly.
+3. Decide whether `/cal/commoncrawl` is required. If yes, add that input mode. If direct Common Crawl is preferred, state it as an intentional advanced replacement and explain the tradeoff.
+4. Add a small fault-tolerance demo script/log that kills a remote worker during map or reduce and shows slot replacement and successful final output.
+5. Add explicit Hadoop/HDFS comparison: missing HDFS replication, durable task tracker/history, speculative execution, data locality scheduling, and mature resource management.
+6. Add demo artifacts: 10-minute script, command checklist, expected outputs, and member responsibility split.
 
 ## Overall Verdict
 
-The project is solid as a custom Go batch MapReduce system with direct Common Crawl input, a useful Kafka Streams comparison path, good unit coverage, and credible fault-recovery mechanics. It is weaker as a match for the original infrastructure/deployment rubric, especially where the rubric expects NFS HOME deployment, `/cal/commoncrawl`, explicit port collision avoidance, large 100/1000+ scale evidence, straggler handling, and demo logistics.
+The project is solid as a custom Go batch MapReduce system with direct Common Crawl input, a useful Kafka Streams comparison path, good unit coverage, explicit cleanup tooling, and credible fault-recovery mechanics. It is weaker as a match for the original infrastructure/deployment rubric, especially where the rubric expects NFS HOME deployment, `/cal/commoncrawl`, large 100/1000+ scale evidence, straggler handling, and demo logistics.

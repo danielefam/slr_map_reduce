@@ -82,6 +82,7 @@ func run() error {
 	hostsFile := flag.String("hosts", "../hosts.txt", "path to hosts file")
 	inputFile := flag.String("input", "", "path to input data file")
 	commonCrawl := flag.Bool("commoncrawl", false, "read input from the official Common Crawl website instead of a local file")
+	cleanupOnly := flag.Bool("cleanup-only", false, "kill workers on the selected hosts and exit")
 	crawl := flag.String("crawl", "", "Common Crawl ID to use in -commoncrawl mode (default: latest crawl)")
 	outputFile := flag.String("output", "result.txt", "path for merged output file")
 	jobPath := flag.String("job", "", "path to Go package directory that exports NewMapper and NewReducer")
@@ -95,6 +96,15 @@ func run() error {
 	parallel := flag.Int("parallel", remote.DefaultParallelism, "maximum number of concurrent SSH/SCP or readiness-check operations")
 	workerPprof := flag.Bool("worker-pprof", false, "start remote workers with -pprof (exposes /debug/pprof/ for bottleneck analysis)")
 	flag.Parse()
+
+	if *cleanupOnly {
+		hosts, err := readHosts(*hostsFile)
+		if err != nil {
+			return fmt.Errorf("read hosts: %w", err)
+		}
+		cleanupWorkers(hosts, *parallel)
+		return nil
+	}
 
 	switch {
 	case strings.TrimSpace(*jobPath) == "":
@@ -353,13 +363,16 @@ func activateWorker(host, peer, workerBuildPath string, withPprof bool) error {
 
 // deployWorker SCPs the worker binary to one host and starts the HTTP server.
 func deployWorker(host, peer, workerBuildPath string, withPprof bool) error {
-	remoteBinary := fmt.Sprintf("%s.deploy-%d", workerBinary, time.Now().UnixNano())
-	if err := scpTo(workerBuildPath, host, remoteBinary); err != nil {
-		return fmt.Errorf("scp to %s: %w", host, err)
-	}
 	_, port, found := strings.Cut(peer, ":")
 	if !found {
 		return fmt.Errorf("peer %q is missing port", peer)
+	}
+	if err := ensureRemotePortFree(host, port); err != nil {
+		return fmt.Errorf("port %s on %s: %w", port, host, err)
+	}
+	remoteBinary := fmt.Sprintf("%s.deploy-%d", workerBinary, time.Now().UnixNano())
+	if err := scpTo(workerBuildPath, host, remoteBinary); err != nil {
+		return fmt.Errorf("scp to %s: %w", host, err)
 	}
 	startCmd := fmt.Sprintf(
 		"kill $(cat /tmp/mr-worker.pid) 2>/dev/null || true && "+
@@ -370,6 +383,15 @@ func deployWorker(host, peer, workerBuildPath string, withPprof bool) error {
 	if err != nil {
 		_, _ = sshRun(host, []string{"rm -f " + remoteBinary})
 		return fmt.Errorf("ssh start on %s: %w", host, err)
+	}
+	return nil
+}
+
+func ensureRemotePortFree(host, port string) error {
+	cmd := fmt.Sprintf("bash -lc 'if : </dev/tcp/127.0.0.1/%s; then echo port %s already in use >&2; exit 1; fi'", port, port)
+	_, err := sshRun(host, []string{cmd})
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -896,7 +918,36 @@ func collectResults(peers []string, outputFile string) error {
 	for _, e := range entries {
 		fmt.Fprintf(&buf, "%s\t%d\n", e.key, e.count)
 	}
-	return os.WriteFile(outputFile, buf.Bytes(), 0o644)
+	return writeFileAtomic(outputFile, buf.Bytes(), 0o644)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 // fetchResult calls GET /result on a peer and returns parsed KV pairs.

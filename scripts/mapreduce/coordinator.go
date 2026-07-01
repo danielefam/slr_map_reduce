@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -799,5 +798,5 @@ func writeMerged(merged map[string]int, outputFile string) error {
 	for _, e := range entries {
 		fmt.Fprintf(&buf, "%s\t%d\n", e.key, e.count)
 	}
-	return os.WriteFile(outputFile, buf.Bytes(), 0o644)
+	return writeFileAtomic(outputFile, buf.Bytes(), 0o644)
 }
