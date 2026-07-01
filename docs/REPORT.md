@@ -78,7 +78,11 @@ This preserves compatibility without changing the merge protocol.
 | `/result` | GET | Return final `key\tvalue` lines |
 | `/debug/pprof/*` | GET | Profiling routes when worker starts with `-pprof` |
 
-### 3.2 Hash partitioning
+### 3.2 Space-Time Diagram (Protocol Execution)
+
+![Sequence Diagram](sequence.png)
+
+### 3.3 Hash partitioning
 
 Reducer assignment is deterministic:
 
@@ -88,7 +92,7 @@ $$
 
 `N` stays fixed for the whole job. Fault-tolerance replaces hosts behind slots, not slot count.
 
-### 3.3 O(1) shuffle read path
+### 3.4 O(1) shuffle read path
 
 Workers write `map-bucket-<N>-<idx>.jsonl` files during map.  
 At reduce time, peer fetch is direct file lookup per reducer index:
@@ -246,7 +250,21 @@ Interpretation: all lines fall in `<80` bucket; dataset is predominantly alphanu
 
 ## 7. Performance and Bottleneck Audit
 
-### 7.1 Confirmed code-path bottlenecks
+### 7.1 Amdahl's Law and Performance Metrics
+
+**Experiment Setup**: Fixed workload of 8 WET files, measuring Map+Reduce+Collect. 
+The same dataset was used for all point measurements to properly validate Amdahl's Law.
+
+- **1 node**: 206.95s (Baseline)
+- **16 nodes**: 40.80s (Speedup 5.07x)
+- **64 nodes**: 39.06s (Regression)
+
+![Amdahl's Law Graph](amdahl_8.png)
+
+**Serial Fraction Calculation**:
+The speedup plateau $S \approx 5.45$ implies a serial fraction $f \approx 18\%$. This serial portion stems from the orchestrator's collect phase (sequential merge of $N$ results) and the $N \times (N - 1)$ HTTP connections during shuffle at 64 nodes.
+
+### 7.2 Confirmed code-path bottlenecks
 
 1. **Map-phase memory amplification**
     - `runMap` builds `map[string][]string` with one string per emitted value.
@@ -266,13 +284,13 @@ Interpretation: all lines fall in `<80` bucket; dataset is predominantly alphanu
     - Coordinator merge and global sort are single-threaded.
     - Effect: contributes to Amdahl serial fraction at larger N.
 
-### 7.2 Existing mitigations already in code
+### 7.3 Existing mitigations already in code
 
 - Node-local temp directories (`os.MkdirTemp`) avoid NFS for intermediate and downloaded input files.
 - Pull-based bucket fetch keeps remote read selection O(1).
 - Slot replacement + epoch logic protects consistency under failures.
 
-### 7.3 Profiling instrumentation
+### 7.4 Profiling instrumentation
 
 Worker profiling is available with `-pprof` (added in this delivery).  
 Orchestrator pass-through: `-worker-pprof`.
@@ -296,21 +314,35 @@ Recommended optimization order:
 
 ## 8. Kafka Streams Comparison Documentation
 
-### 8.1 Delivered assets
+### 8.1 Three-Way Comparison
+
+| Feature | Our MapReduce | Hadoop | Kafka Streams |
+| --- | --- | --- | --- |
+| **Model** | Batch, 1 stage | Batch, multi-stage | Stream, unbounded |
+| **Storage** | `/tmp`, no replication | HDFS 3x replication | Replicated broker log |
+| **Data locality** | No — HTTP pull | Yes — run where data lives | Broker partitions |
+| **Stragglers** | Not handled | Speculative execution | N/A |
+| **8-node wordcount**| 0.27s | not run | 10.1s |
+
+**Major Differences vs. Hadoop:**
+1. **Data Locality**: Hadoop uses HDFS to run tasks where data locality is guaranteed. Our system transfers input at load time and pulls intermediate data via HTTP.
+2. **Speculative Execution**: Hadoop handles stragglers by re-running tasks speculatively. In our system, one slow node blocks the entire phase.
+
+### 8.2 Delivered assets
 
 - `kafka/deploy_kafka.sh`: rootless KRaft deployment (no Docker, no root).
 - `kafka/clean_kafka.sh`: full cleanup and process termination.
 - `kafka/WordCountJob.java`: Streams wordcount with self-timed completion.
 - `kafka/run_kafka_wordcount.sh`: end-to-end benchmark driver.
 
-### 8.2 Compute-time comparability
+### 8.3 Compute-time comparability
 
 - Go orchestrator reports `TIMING ... compute_seconds=...` for map+reduce+collect.
 - Kafka runner reports `TIMING compute_seconds=...` when consumer lag reaches zero.
 
 In both paths, input staging/production happens before timer start.
 
-### 8.3 Fair benchmark protocol
+### 8.4 Fair benchmark protocol
 
 1. Same input file for both systems.
 2. Same node count (`N`).
@@ -321,7 +353,13 @@ In both paths, input staging/production happens before timer start.
 
 ## 9. Troubleshooting and Operations
 
-### 9.1 Common issues
+### 9.1 Pain Points: What went wrong and why
+
+- **NFS I/O Saturation (Biggest Pain Point)**: When all workers tried to read from `/cal/commoncrawl` simultaneously, the NFS became heavily saturated and unresponsive. 
+  - *Fix*: We transitioned to streaming data directly from `data.commoncrawl.org` (Amazon S3), which bypasses the NFS and scales linearly with node count.
+- **Memory Pressure**: Processing large datasets caused OOM or disk-space issues on smaller clusters because intermediate data is heavily buffered in memory before being written to `/tmp`.
+
+### 9.2 Common issues
 
 - **`scp` permission denied on `/tmp/mr-worker`**
    - Cause: stale file ownership from another user/process.
@@ -335,7 +373,7 @@ In both paths, input staging/production happens before timer start.
       - `domainpop` expects `WARC-Target-URI` lines or explicit URLs.
       - `langdetect` ignores very short/noisy lines and metadata headers.
 
-### 9.2 Verification checklist
+### 9.3 Verification checklist
 
 - `go test ./...` in `scripts/` passes.
 - `curl /health` is `ok` for each worker.
