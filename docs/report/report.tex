@@ -216,10 +216,17 @@ transfers. This is the rubric-described \emph{1 SCP to HOME + N SSH} pattern.
 
 The rubric describes a \emph{single-SCP-to-HOME} pattern: copy the binary once
 to the NFS home, then start it on every node with SSH (avoiding \(N\) large
-file transfers). Our implementation deliberately departs from this: the binary
-is cross-compiled locally (\texttt{GOOS=linux GOARCH=amd64}) and SCPed
-\emph{directly to \texttt{/tmp/mr-worker}} on each node. The trade-off is
-explicit:
+file transfers). The project now supports \textbf{both} deployment strategies:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Rubric mode} (\texttt{deploy\_nfs.sh} or \texttt{-nfs-deploy}):
+  \textbf{1 SCP} to \texttt{\$HOME/mr-worker} and then \(N\) SSH starts from the
+  shared NFS path.
+  \item \textbf{Local-disk mode} (default \texttt{mapreduce.sh}): \(N\) SCP to
+  \texttt{/tmp/mr-worker} + \(N\) SSH starts, which avoids NFS on the hot path.
+\end{itemize}
+
+The trade-off is explicit:
 
 \begin{center}\small
 \begin{tabular}{p{0.44\linewidth} p{0.44\linewidth}}
@@ -513,26 +520,37 @@ of WET files to avoid discovering bugs only at scale.
 
 The code reports explicit timings for:
 \begin{itemize}[leftmargin=1.5em]
+  \item build;
+  \item deployment;
+  \item input preparation;
+  \item load;
   \item map;
   \item reduce;
   \item result collection;
+  \item cleanup;
+  \item category totals: I/O, synchronization/waiting, network, compute;
   \item total compute time.
 \end{itemize}
 
-Split and load happen before the compute timer. Shuffle is embedded inside
-reduce, because reducers fetch peer buckets during \texttt{POST /reduce}.
+Shuffle is embedded inside reduce, because reducers fetch peer buckets during
+\texttt{POST /reduce}. The orchestrator now emits two machine-readable lines:
+\texttt{TIMING} (compute-focused, used for Amdahl plots) and
+\texttt{TIMING\_BREAKDOWN} (full operational breakdown).
 
 \paragraph{Deployment and cleanup timing.}
-Deployment time (build $+$ SCP $+$ SSH start $+$ health-check wait) is logged
-as a wall-clock duration by the orchestrator but is not included in the
-\texttt{TIMING} output because it is not part of the parallel computation that
-Amdahl's law applies to. On a typical lab run, deployment of 8 workers takes
-15--30\,s regardless of $N$ within the tested range ($N \leq 64$). Cleanup is
-similarly a constant-time operation: the orchestrator SSHes to every touched
-host and kills the worker process, taking 5--10\,s total.
-I/O and network time are reported indirectly: the map phase timer includes the
-disk write cost of bucket files; the reduce phase timer includes the network
-cost of peer bucket fetches.
+Deployment time (build $+$ SCP $+$ SSH start $+$ health-check wait) and
+cleanup time are now emitted explicitly as numeric fields
+(\texttt{deployment\_seconds} and \texttt{cleanup\_seconds}). They remain excluded
+from the \texttt{compute\_seconds} value used by Amdahl's law, because Amdahl is
+applied only to the parallel map/reduce/collect computation.
+
+I/O, synchronization/waiting, and network are also reported as explicit
+aggregates:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{io\_seconds = input\_prep + load + collect};
+  \item \texttt{sync\_wait\_seconds = retry backoff + settle waits};
+  \item \texttt{network\_seconds = deployment + remote load/map/reduce/result calls}.
+\end{itemize}
 
 The system implements a \textbf{single MapReduce stage}: one pass of
 map $\to$ shuffle+reduce. Complex computations (e.g.\ iterative PageRank,
@@ -795,10 +813,12 @@ confirms $p \approx 0.816$ (parallelizable fraction), consistent with $f =
 1 - p \approx 0.184$.
 
 \paragraph{Per-phase timing instrumentation.}
-The \texttt{TIMING} log line emitted by the orchestrator captures all three
-compute phases independently:
+The orchestrator emits both compute-focused and full-breakdown timing lines:
 \begin{lstlisting}[style=codeblock]
 TIMING nodes=8 map_seconds=12.4 reduce_seconds=31.5 collect_seconds=6.5 compute_seconds=50.4
+TIMING_BREAKDOWN nodes=8 build_seconds=2.1 deployment_seconds=17.8 ...
+  io_seconds=14.2 sync_wait_seconds=0.6 network_seconds=61.7 ...
+TIMING_CLEANUP hosts=8 cleanup_seconds=6.3
 \end{lstlisting}
 This allows pinpointing the bottleneck per run without guessing. At 8 nodes,
 reduce dominates ($\approx 63\,\%$ of compute time) because each worker must
@@ -811,12 +831,11 @@ demonstrating that the communication overhead in the fully-connected worker
 mesh outweighed any parallel execution gains for an 8-chunk dataset.
 
 \paragraph{Timing what is excluded.}
-The compute timer deliberately excludes deployment and load, because these are
-not part of the parallel work the Amdahl model is applied to. Deployment time
-(build + SCP + SSH start + health check) is roughly constant at 15--30\,s
-regardless of $N$ for the range tested, and WET file download time scales
-inversely with $N$ (more workers, fewer files each). Including either would
-conflate preparation cost with computation cost.
+The \texttt{compute\_seconds} timer deliberately excludes deployment/build and
+cleanup, because these are not part of the parallel work the Amdahl model is
+applied to. These costs are still preserved in \texttt{TIMING\_BREAKDOWN} and
+\texttt{TIMING\_CLEANUP}, so reproducibility and operational accounting are
+maintained without biasing the speedup model.
 
 \begin{figure}[H]
 \centering

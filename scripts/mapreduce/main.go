@@ -122,6 +122,10 @@ func run() error {
 	}
 	nWorkers := len(hosts)
 
+	var buildDur, deployDur, inputPrepDur time.Duration
+	var loadDur, mapDur, reduceDur, collectDur, computeDur time.Duration
+	var cleanupStart time.Time
+
 	var coord *coordinator
 	var deployedHosts []string
 	cancel := func() {}
@@ -131,11 +135,14 @@ func run() error {
 			return
 		}
 		log.Println("cleaning up workers…")
+		cleanupStart = time.Now()
 		hostsForCleanup := append([]string(nil), deployedHosts...)
 		if coord != nil {
 			hostsForCleanup = peerHosts(coord.hostsForCleanup())
 		}
 		cleanupWorkers(hostsForCleanup, *parallel)
+		cleanupDur := time.Since(cleanupStart)
+		log.Printf("TIMING_CLEANUP hosts=%d cleanup_seconds=%.3f", len(hostsForCleanup), cleanupDur.Seconds())
 	}()
 
 	log.Printf("candidate workers: %d (target -n=%d)", nWorkers, *n)
@@ -147,14 +154,17 @@ func run() error {
 
 	// ── Step 1: build worker binary ────────────────────────────────────────
 	log.Println("building worker binary…")
+	buildStart := time.Now()
 	workerBuildPath, err := buildWorker(*jobPath)
 	if err != nil {
 		return fmt.Errorf("build failed: %w", err)
 	}
+	buildDur = time.Since(buildStart)
 	defer os.Remove(workerBuildPath)
 
 	// ── Step 2: deploy only the initial active workers ─────────────────────
 	log.Printf("deploying up to %d initial worker(s)…", target)
+	deployStart := time.Now()
 	var activeHosts, activePeers, sparePeers []string
 	if *nfsDeploy {
 		log.Println("[nfs-deploy] using 1-SCP-to-HOME + N-SSH pattern")
@@ -165,6 +175,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("deploy failed: %w", err)
 	}
+	deployDur = time.Since(deployStart)
 	deployedHosts = append([]string(nil), activeHosts...)
 	log.Printf("%d workers ready", len(activePeers))
 	log.Printf("using %d active slots + %d cold spares (target -n=%d)",
@@ -196,6 +207,7 @@ func run() error {
 
 	// ── Step 4: assign input to slots ───────────────────────────────────────
 	log.Println("preparing slot inputs…")
+	inputPrepStart := time.Now()
 	if *commonCrawl {
 		resolvedCrawl, urls, err := resolveCommonCrawlURLs(*crawl, *filesLimit, *chunksLimit)
 		if err != nil {
@@ -224,6 +236,7 @@ func run() error {
 			s.chunk = chunkForWorker(chunks, i)
 		}
 	}
+	inputPrepDur = time.Since(inputPrepStart)
 
 	// ── Step 5: drive all slots through map → reduce → result ───────────────
 	// Background health watcher cancels in-flight calls on dead hosts.
@@ -234,9 +247,11 @@ func run() error {
 	// Load data onto workers BEFORE the compute timer starts so that the
 	// /data upload (or /load) is excluded from the measured compute time.
 	log.Println("loading data onto workers…")
+	loadStart := time.Now()
 	if err := coord.drive(ctx, sLoaded); err != nil {
 		return fmt.Errorf("load phase: %w", err)
 	}
+	loadDur = time.Since(loadStart)
 	log.Println("load phase done")
 
 	log.Println("starting map phase…")
@@ -245,7 +260,7 @@ func run() error {
 	if err := coord.drive(ctx, sMapped); err != nil {
 		return fmt.Errorf("map phase: %w", err)
 	}
-	mapDur := time.Since(mapStart)
+	mapDur = time.Since(mapStart)
 	log.Println("map phase done")
 
 	log.Println("starting reduce phase…")
@@ -253,7 +268,7 @@ func run() error {
 	if err := coord.drive(ctx, sReduced); err != nil {
 		return fmt.Errorf("reduce phase: %w", err)
 	}
-	reduceDur := time.Since(reduceStart)
+	reduceDur = time.Since(reduceStart)
 	log.Println("reduce phase done")
 
 	log.Println("collecting results…")
@@ -264,13 +279,25 @@ func run() error {
 	if err := coord.mergeResults(*outputFile); err != nil {
 		return fmt.Errorf("merge: %w", err)
 	}
-	collectDur := time.Since(collectStart)
-	computeDur := time.Since(computeStart)
+	collectDur = time.Since(collectStart)
+	computeDur = time.Since(computeStart)
 	log.Printf("results written to %s", *outputFile)
+
+	coordMetrics := coord.metricsSnapshot()
+	ioDur := inputPrepDur + loadDur + collectDur
+	syncWaitDur := coordMetrics.BackoffWait + coordMetrics.SettleWait
+	networkDur := deployDur + coordMetrics.RemoteTotal()
 
 	// Machine-parseable timing line for benchmarking (compute phases only).
 	log.Printf("TIMING nodes=%d map_seconds=%.3f reduce_seconds=%.3f collect_seconds=%.3f compute_seconds=%.3f",
 		len(coord.slots), mapDur.Seconds(), reduceDur.Seconds(), collectDur.Seconds(), computeDur.Seconds())
+	log.Printf("TIMING_BREAKDOWN nodes=%d build_seconds=%.3f deployment_seconds=%.3f input_prep_seconds=%.3f load_seconds=%.3f map_seconds=%.3f reduce_seconds=%.3f collect_seconds=%.3f io_seconds=%.3f sync_wait_seconds=%.3f network_seconds=%.3f remote_load_seconds=%.3f remote_map_seconds=%.3f remote_reduce_seconds=%.3f remote_result_seconds=%.3f compute_seconds=%.3f",
+		len(coord.slots),
+		buildDur.Seconds(), deployDur.Seconds(), inputPrepDur.Seconds(), loadDur.Seconds(),
+		mapDur.Seconds(), reduceDur.Seconds(), collectDur.Seconds(),
+		ioDur.Seconds(), syncWaitDur.Seconds(), networkDur.Seconds(),
+		coordMetrics.RemoteLoad.Seconds(), coordMetrics.RemoteMap.Seconds(), coordMetrics.RemoteReduce.Seconds(), coordMetrics.RemoteResult.Seconds(),
+		computeDur.Seconds())
 
 	// Stop the health watcher before cleanup so it doesn't race with kills.
 	cancel()
