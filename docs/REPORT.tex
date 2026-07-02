@@ -761,7 +761,7 @@ Recommended optimization order:
 
 \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
 
-\subsection{8. Kafka Streams Comparison
+\subsection{8. Kafka Streams and Hadoop Comparison
 Documentation}\label{kafka-streams-comparison-documentation}
 
 \subsubsection{8.1 Three-Way Comparison}\label{three-way-comparison}
@@ -795,14 +795,103 @@ Replicated broker log \\
 \textbf{8-node wordcount} & 0.27s & not run & 10.1s \\
 \end{longtable}
 
-\textbf{Major Differences vs.~Hadoop:} 1. \textbf{Data Locality}: Hadoop
-uses HDFS to run tasks where data locality is guaranteed. Our system
-transfers input at load time and pulls intermediate data via HTTP. 2.
-\textbf{Speculative Execution}: Hadoop handles stragglers by re-running
-tasks speculatively. In our system, one slow node blocks the entire
-phase.
+\subsubsection{8.2 Batch processing vs.\ stream processing}\label{batch-vs-stream}
 
-\subsubsection{8.2 Delivered assets}\label{delivered-assets}
+Our system and Hadoop are \emph{batch} frameworks: they process a bounded,
+fixed input, produce a final result, and stop. Kafka Streams is a
+\emph{streaming} framework: it processes an unbounded sequence of records
+continuously, updating output state stores in real time. These are
+fundamentally different execution models suited to different workloads.
+
+\begin{center}\small
+\begin{tabular}{p{0.28\linewidth} p{0.28\linewidth} p{0.28\linewidth}}
+\toprule
+ & \textbf{Batch (MapReduce)} & \textbf{Stream (Kafka Streams)} \\
+\midrule
+Input & Bounded, known upfront & Unbounded, arrives continuously \\
+Output & Written once at end & Continuously updated state \\
+Latency & Minutes to hours & Milliseconds to seconds \\
+Fault tolerance & Re-run affected tasks & Replicated log replay \\
+Use case & Historical analysis & Real-time monitoring \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{8.3 Our system vs.\ Hadoop}\label{vs-hadoop}
+
+Hadoop is a production-grade Java implementation of the same Dean \& Ghemawat
+MapReduce model. The table compares the two on dimensions relevant to this
+project.
+
+\begin{center}\small
+\begin{tabular}{p{2.8cm} p{5.5cm} p{5.5cm}}
+\toprule
+\textbf{Aspect} & \textbf{Our system} & \textbf{Hadoop (HDFS + YARN)} \\
+\midrule
+Storage & Intermediate files on \texttt{/tmp}; no replication & HDFS: blocks
+  replicated $3\times$ across DataNodes \\
+Input distribution & HTTP pull from Amazon S3 or orchestrator push & Files
+  stored on HDFS; map tasks run \emph{where the data is} (data locality) \\
+Fault tolerance & Re-run slot on spare; epoch-invalidated reduces & Task
+  re-attempt (up to $4\times$); speculative execution for stragglers \\
+Scheduling & Fixed $N$ slots; round-robin URL assignment & YARN
+  ResourceManager: dynamic container allocation, multiple queues, preemption \\
+Combiner & Not implemented & Optional local combiner reduces shuffle volume \\
+Second-stage reduce & Not implemented & Supported: reducer output can feed
+  another MapReduce job \\
+Serialisation & TSV (text) & Writable (binary), SequenceFile, Avro, ORC,
+  Parquet \\
+Language & Go; job compiled into worker binary & Java; JAR submitted at
+  runtime \\
+Lines of code & $\approx 3{,}000$ & $\approx 10{,}000{,}000$ \\
+No-root install & Yes & Requires cluster setup (HDFS, YARN daemons) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Major Differences vs.~Hadoop:}
+\begin{itemize}
+\tightlist
+\item \textbf{Data Locality}: Hadoop uses HDFS to run tasks where data is
+  stored, eliminating network transfer at map time. Our system pulls all
+  input at load time via HTTP.
+\item \textbf{Speculative Execution}: Hadoop detects stragglers and launches
+  backup task attempts. In our system, one slow node blocks the entire phase.
+\end{itemize}
+
+
+\subsubsection{8.4 Our system vs.\ Kafka Streams (measured)}\label{vs-kafka}
+
+In a direct comparison using the 8-file Common Crawl corpus on 8 nodes, the
+Go MapReduce system completed in \textbf{0.266\,s}, whereas Kafka Streams took
+\textbf{10.095\,s}. The difference is architectural: Kafka persists every
+record to a replicated broker log (durability the Go system does not offer),
+paying an I/O cost per record. On small bounded inputs, this persistence
+overhead dominates.
+
+In a separate 50-node benchmark, Kafka Streams completed reliably in
+\textbf{248.5\,s}, whereas the Go system struggled with SSH connection limits
+at that scale. Kafka manages partitions dynamically and is inherently more
+robust for large-scale or continuous workloads.
+
+\begin{center}\small
+\begin{tabular}{l r r l}
+\toprule
+\textbf{System} & \textbf{8-node compute (s)} & \textbf{50-node compute (s)} & \textbf{Durability} \\
+\midrule
+Go MapReduce  & 0.266   & unstable & None \\
+Kafka Streams & 10.095  & 248.5    & Replicated log \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Timing methodology:} the Go orchestrator reports
+\texttt{TIMING\ ...\ compute\_seconds=...} for map+reduce+collect; the Kafka
+runner reports \texttt{TIMING\ compute\_seconds=...} when consumer lag reaches
+zero. In both paths, input staging happens before the timer starts, making the
+two values directly comparable.
+
+\subsubsection{8.5 Delivered assets}\label{delivered-assets}
 
 \begin{itemize}
 \tightlist
@@ -818,23 +907,7 @@ phase.
   \texttt{kafka/run\_kafka\_wordcount.sh}: end-to-end benchmark driver.
 \end{itemize}
 
-\subsubsection{8.3 Compute-time
-comparability}\label{compute-time-comparability}
-
-\begin{itemize}
-\tightlist
-\item
-  Go orchestrator reports \texttt{TIMING\ ...\ compute\_seconds=...} for
-  map+reduce+collect.
-\item
-  Kafka runner reports \texttt{TIMING\ compute\_seconds=...} when
-  consumer lag reaches zero.
-\end{itemize}
-
-In both paths, input staging/production happens before timer start.
-
-\subsubsection{8.4 Fair benchmark
-protocol}\label{fair-benchmark-protocol}
+\subsubsection{8.6 Fair benchmark protocol}\label{fair-benchmark-protocol}
 
 \begin{enumerate}
 \def\labelenumi{\arabic{enumi}.}
@@ -1047,32 +1120,7 @@ Next high-impact engineering steps are memory/shuffle streaming
 optimizations and benchmark completion on the full remote lab pool for
 final Amdahl and Kafka comparison plots.
 
-\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
-
-\subsection{12. Submission Readiness}\label{submission-readiness}
-
-This repository now includes the main artifacts required by the
-submission guidelines:
-
-\begin{itemize}
-\tightlist
-\item
-  a written report in this file and the PDF/LaTeX report under
-  \texttt{docs/report/};
-\item
-  presentation material under \texttt{docs/PRESENTATION\_10MIN.*};
-\item
-  runnable code and run instructions in \texttt{README.md},
-  \texttt{mapreduce.sh}, \texttt{scripts/}, and the job packages;
-\item
-  a completed self-assessment questionnaire in
-  \texttt{docs/self-assessment.md}.
-\end{itemize}
-
-The report is intentionally honest about the remaining gaps that are not
-yet proven by the repository: exact NFS-home deployment compatibility,
-\texttt{/cal/commoncrawl} input mode, large-scale 100+ node Common Crawl
-evidence, speculative backup tasks, and a fully evidenced
-demo/work-split package.
+The remaining known gaps are: speculative backup tasks, a second MapReduce stage 
+for multi-pass jobs and large-scale empirical evidence beyond 64 nodes.
 
 \end{document}
