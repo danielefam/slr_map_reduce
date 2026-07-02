@@ -306,7 +306,7 @@ Execution)}\label{space-time-diagram-protocol-execution}
 Reducer assignment is deterministic:
 
 \[
-    ext{reducer}(key) = \mathrm{FNV32a}(key) \bmod N
+    \text{reducer}(key) = \mathrm{FNV32a}(key) \bmod N
 \]
 
 \texttt{N} stays fixed for the whole job. Fault-tolerance replaces hosts
@@ -502,14 +502,13 @@ content quality before deciding what to include in a training corpus.
 \textbf{Derived metrics}
 
 \[
-    ext{avg line length} = \frac{\text{stat:chars.total}}{\text{stat:lines}},\quad
-    ext{alnum density} = \frac{\text{stat:chars.alnum}}{\text{stat:chars.total}}
+    \text{avg line length} = \frac{\text{stat:chars.total}}{\text{stat:lines}},\quad
+    \text{alnum density} = \frac{\text{stat:chars.alnum}}{\text{stat:chars.total}}
 \]
 
 \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
 
-\subsection{6. Job Execution Results (Executed on
-2026-06-14)}\label{job-execution-results-executed-on-2026-06-14}
+\subsection{6. Job Execution Results}\label{job-execution-results}
 
 \subsubsection{6.1 Execution environment and
 method}\label{execution-environment-and-method}
@@ -624,17 +623,21 @@ Map+Reduce+Collect. The same dataset was used for all point measurements
 to properly validate Amdahl's Law. The wordcount job on this corpus
 produced approximately \textbf{24 million unique words}.
 
-\begin{itemize}
-\tightlist
-\item
-  \textbf{1 node}: 206.95s (Baseline)
-\item
-  \textbf{16 nodes}: 40.80s (Speedup 5.07x)
-\item
-  \textbf{32 nodes}: 37.94s (Speedup 5.45x --- peak)
-\item
-  \textbf{64 nodes}: 39.06s (Speedup 5.30x --- regression)
-\end{itemize}
+\begin{center}\small
+\begin{tabular}{r r r}
+\toprule
+\textbf{Nodes} & \textbf{Compute (s)} & \textbf{Speedup} \\
+\midrule
+1  & 206.95 & 1.00 \\
+2  & 118.24 & 1.75 \\
+4  &  75.35 & 2.75 \\
+8  &  50.38 & 4.11 \\
+16 &  40.80 & 5.07 \\
+32 &  37.94 & 5.45 \\
+64 &  39.06 & 5.30 \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 The speedup rises from 1 to 32 nodes, peaks at \(S \approx 5.45\), then
 regresses slightly at 64 nodes (\(S \approx 5.30\)). This illustrates
@@ -668,26 +671,21 @@ bottlenecks}\label{confirmed-code-path-bottlenecks}
   \tightlist
   \item
     \texttt{runMap} builds \texttt{map{[}string{]}{[}{]}string} with one
-    string per emitted value.
-  \item
-    \texttt{handleMap} then copies into per-reducer
-    \texttt{{[}{]}{[}{]}KeyValue} buckets before writing.
+    string per emitted value before writing bucket files.
   \item
     Effect: high temporary allocations and duplicated resident
-    intermediate data.
+    intermediate data before the first byte hits disk.
   \end{itemize}
 \item
-  \textbf{Shuffle serialization overhead}
+  \textbf{Shuffle read overhead}
 
   \begin{itemize}
   \tightlist
   \item
-    \texttt{/intermediate} reads full JSONL bucket to slice and
-    re-encodes JSON array.
+    \texttt{/intermediate} streams TSV bucket files over HTTP; the
+    reducer accumulates all lines in memory before sorting.
   \item
-    Reducer fetch decodes full array in memory.
-  \item
-    Effect: extra encode/decode CPU and extra memory pressure.
+    Effect: memory pressure scales with bucket size at each reducer.
   \end{itemize}
 \item
   \textbf{Aggressive scanner buffer size}
@@ -695,8 +693,8 @@ bottlenecks}\label{confirmed-code-path-bottlenecks}
   \begin{itemize}
   \tightlist
   \item
-    Scanner buffers are configured to 64MB globally in map/intermediate
-    readers.
+    Scanner buffers are configured to 64\,MB globally in map and
+    intermediate readers.
   \item
     Effect: high baseline memory per concurrent reader.
   \end{itemize}
@@ -708,7 +706,7 @@ bottlenecks}\label{confirmed-code-path-bottlenecks}
   \item
     Coordinator merge and global sort are single-threaded.
   \item
-    Effect: contributes to Amdahl serial fraction at larger N.
+    Effect: contributes to Amdahl serial fraction at larger \(N\).
   \end{itemize}
 \end{enumerate}
 
@@ -749,8 +747,8 @@ Recommended optimization order:
 \def\labelenumi{\arabic{enumi}.}
 \tightlist
 \item
-  Stream intermediate bucket responses (\texttt{io.Copy} JSONL) instead
-  of array re-encode.
+  Stream intermediate bucket responses (\texttt{io.Copy} TSV) instead
+  of accumulating lines in memory before sorting.
 \item
   Introduce combiner/in-mapper aggregation for associative jobs.
 \item
@@ -761,8 +759,8 @@ Recommended optimization order:
 
 \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
 
-\subsection{8. Kafka Streams and Hadoop Comparison
-Documentation}\label{kafka-streams-comparison-documentation}
+\subsection{8. System Comparison: MapReduce, Hadoop, and Kafka
+Streams}\label{kafka-streams-comparison-documentation}
 
 \subsubsection{8.1 Three-Way Comparison}\label{three-way-comparison}
 
@@ -959,10 +957,6 @@ why}\label{pain-points-what-went-wrong-and-why}
     step kills via PID and removes all \texttt{/tmp/mr-worker*} files,
     tolerating repeated invocations and missing files gracefully.
   \end{itemize}
-\item
-  \textbf{Memory Pressure}: Processing large datasets caused OOM or
-  disk-space issues on smaller clusters because intermediate data is
-  heavily buffered in memory before being written to \texttt{/tmp}.
 \end{itemize}
 
 \subsubsection{9.2 Common issues}\label{common-issues}
@@ -1059,9 +1053,8 @@ hosts)}\label{standard-remote-execution-lab-hosts}
 \texttt{hosts.txt} so the orchestrator can keep cold spares available
 while still running with only \texttt{N} active workers.
 
-\subsubsection{10.2 Local single-worker protocol validation (used in
-this
-report)}\label{local-single-worker-protocol-validation-used-in-this-report}
+\subsubsection{10.2 Local single-worker protocol
+validation}\label{local-single-worker-protocol-validation-used-in-this-report}
 
 \begin{Shaded}
 \begin{Highlighting}[]
@@ -1098,29 +1091,34 @@ report)}\label{local-single-worker-protocol-validation-used-in-this-report}
 
 \subsection{11. Conclusion}\label{conclusion}
 
-The project now includes a robust distributed MapReduce framework, three
-additional analytical jobs, profiling hooks, and Kafka comparison
-tooling with reproducible scripts.
+This project implements a complete single-stage distributed MapReduce system
+in Go, running without root or Docker on shared lab machines. The core
+technical achievements are: slot-preserving fault recovery with epoch
+invalidation, pluggable job injection at compile time, direct Common Crawl
+download from Amazon S3, and a full HTTP-based shuffle protocol between workers
+with no data flowing through the orchestrator.
 
-The three new jobs were executed successfully via the real worker
-protocol in this environment, and their outputs match expected
-semantics:
+The strong-scaling experiment on a fixed 8-file Common Crawl corpus
+(\(\approx\)24 million unique words) validated Amdahl's law empirically:
+speedup rose from 1.00$\times$ at 1 node to a peak of \textbf{5.45$\times$}
+at 32 nodes, then regressed to 5.30$\times$ at 64 nodes as
+\(N \times (N-1) = 4{,}032\) shuffle connections saturated the network.
+The implied serial fraction is \(\approx 18\%\), dominated by the
+sequential collect and merge phase.
 
-\begin{itemize}
-\tightlist
-\item
-  \texttt{langdetect}: full-English corpus detection,
-\item
-  \texttt{domainpop}: accurate domain counts from WARC metadata,
-\item
-  \texttt{docdensity}: consistent aggregate counters and derived ratios.
-\end{itemize}
+The three additional jobs (\texttt{langdetect}, \texttt{domainpop},
+\texttt{docdensity}) confirmed that the framework generalises cleanly beyond
+wordcount, each producing semantically correct output on real WET data. The
+Kafka Streams comparison showed a \(\approx 38\times\) compute-time advantage
+for the Go system on small bounded inputs (0.27\,s vs 10.1\,s at 8 nodes),
+with Kafka becoming more robust at large scale due to dynamic partition
+management and durable broker storage.
 
-Next high-impact engineering steps are memory/shuffle streaming
-optimizations and benchmark completion on the full remote lab pool for
-final Amdahl and Kafka comparison plots.
+Next high-impact engineering steps are streaming map output directly to bucket
+files (eliminating the in-memory intermediate pass) and speculative task
+execution for straggler mitigation.
 
-The remaining known gaps are: speculative backup tasks, a second MapReduce stage 
-for multi-pass jobs and large-scale empirical evidence beyond 64 nodes.
+The remaining known gaps are: speculative backup tasks, a second MapReduce
+stage for multi-pass jobs, and large-scale empirical evidence beyond 64 nodes.
 
 \end{document}
