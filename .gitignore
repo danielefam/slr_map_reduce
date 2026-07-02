@@ -24,5 +24,13 @@ vgcore.*
 
 kafka/dist
 *.aux
+*.fdb_latexmk
+*.fls
+*.nav
+*.snm
+*.synctex.gz
+*.toc
+*.vrb
 docs/report/build/
+docs/build/
 experiments/

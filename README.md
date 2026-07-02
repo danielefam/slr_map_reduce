@@ -9,17 +9,25 @@ of remote lab machines (`*.enst.fr`).
 
 ```
 .
-├── hosts.txt           # Auto-generated list of available remote hosts
-├── mapreduce.sh        # Entry point for the MapReduce pipeline
+├── hosts.txt                    # Auto-generated list of available remote hosts
+├── mapreduce.sh                 # Entry point for the MapReduce pipeline
+├── run_all_commoncrawl_jobs.sh  # Run all jobs against Common Crawl, record timings
 ├── scripts/
-    ├── go.mod
-    ├── make_hosts/     # Fetches available hosts from tp.telecom-paris.fr
-    ├── mrjob/          # Shared Mapper / Reducer interfaces for custom jobs
-    ├── jobs/           # Reference and user-provided MapReduce job packages
-    ├── mapreduce/      # Client-side MapReduce orchestrator
-    └── worker/         # HTTP worker server (map / reduce)
+│   ├── go.mod
+│   ├── make_hosts/     # Fetches available hosts from tp.telecom-paris.fr
+│   ├── mrjob/          # Shared Mapper / Reducer interfaces for custom jobs
+│   ├── jobs/           # Reference and user-provided MapReduce job packages
+│   ├── mapreduce/      # Client-side MapReduce orchestrator
+│   └── worker/         # HTTP worker server (map / reduce)
+├── kafka/              # Kafka Streams comparison implementation
+├── demos/              # Demo and utility scripts (fault tolerance, NFS deploy, cleanup)
 └── docs/
-  └── JOBS.md         # Job model and examples beyond word count
+    ├── REPORT.pdf              # Final report
+    ├── PRESENTATION_10MIN.pdf  # Presentation slides
+    ├── JOBS.md                 # Job model and examples beyond word count
+    ├── CRITERIA_AUDIT.md       # Rubric self-assessment
+    ├── report/                 # Report source (REPORT.tex, REPORT.md, images)
+    └── presentation/           # Presentation source (PRESENTATION_10MIN.tex)
 ```
 
 ---

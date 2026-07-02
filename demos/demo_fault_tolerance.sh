@@ -4,7 +4,7 @@ set -uo pipefail
 echo "=== Starting Fault Tolerance Demo ==="
 echo "Launching MapReduce job with Common Crawl data..."
 
-./mapreduce.sh -job scripts/jobs/wordcount -commoncrawl -files-limit 15 -n 4 -output result_fault_demo.txt > fault_demo.log 2>&1 &
+../mapreduce.sh -job scripts/jobs/wordcount -commoncrawl -files-limit 15 -n 4 -output result_fault_demo.txt > fault_demo.log 2>&1 &
 MR_PID=$!
 
 echo "Waiting 20 seconds for workers to deploy and start processing..."
