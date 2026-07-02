@@ -9,7 +9,7 @@ of remote lab machines (`*.enst.fr`).
 
 ```
 .
-├── hosts.txt                    # Auto-generated list of available remote hosts
+├── hosts.txt                    # Auto-generated at runtime by make_hosts (not committed)
 ├── mapreduce.sh                 # Entry point for the MapReduce pipeline
 ├── run_all_commoncrawl_jobs.sh  # Run all jobs against Common Crawl, record timings
 ├── scripts/
